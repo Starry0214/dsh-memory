@@ -18,13 +18,35 @@ DeepSeek Harness（DSH）全局自动记忆插件：会话开始自动注入记�
 
 ## 与 mimocode 的关系
 
-本插件的**设计灵感来自 mimocode 的开源记忆功能**，但两者是独立的项目：
+本插件的**设计灵感来自 mimocode 的开源记忆功能**（[XiaomiMiMo/MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code)，MIT 开源），但两者是独立的项目。
 
-1. **灵感来源**：mimocode（开源 AI 编码助手 MiMo-Code）自带记忆功能——会话经验自动沉淀、跨会话复用。dsh-memory 借鉴了这一理念，把它移植到 DeepSeek Harness（DSH）生态：在 DSH 会话开始时自动注入记忆、提供 memory_search 检索工具。
-2. **实现完全独立**：插件代码、记忆文件格式（`MEMORY-*.md` 知识文件、`global.md` / `index.md` 稳定层、sessions 动态层）、注入机制全部针对 DSH 的 Cordis 插件架构重新设计，不是 mimocode 的代码复用。
-3. **v10 起知识库自包含**：知识库 21 个 `MEMORY-*.md` 文件已复制到 `~/.dsh/memory/knowledge/`，`KNOWLEDGE_ROOT` 指向本地——**备份、检索、注入均不依赖 mimocode 目录**，即使没有 mimocode，插件照常工作。
+### mimocode 的记忆功能是什么
 
-**一句话**：灵感源自 mimocode 的开源记忆功能，为 DSH 生态独立实现，现已完全自包含。
+mimocode 内置**基于 SQLite FTS5 全文搜索的持久化记忆系统**，核心机制：
+
+- **项目记忆 `MEMORY.md`** — 跨会话持久的项目知识、规则、架构决策；
+- **会话检查点 `checkpoint.md`** — 结构化状态快照，由 checkpoint-writer 子智能体自动维护；
+- **记忆自动注入** — 会话恢复时自动注入上下文，agent 无需重新理解项目背景；
+- **预算化注入** — 用 token budget 控制注入大小、按重要性排序；
+- **上下文重建/压缩** — 上下文接近上限时从 checkpoint + 记忆 + 近期消息重建，压缩点可调。
+
+### dsh-memory 借鉴了什么
+
+| mimocode 记忆功能 | dsh-memory 对应实现 |
+|---|---|
+| `MEMORY.md` 项目记忆 + 自动注入 | `global.md` + `index.md` 稳定层 + 21 个 `MEMORY-*.md` 知识文件，会话开始自动注入 |
+| 记忆自动注入上下文 | session-start 注入稳定层 + 最近摘要（零操作自动生效） |
+| 预算化注入（token budget） | 硬字符预算（`CHAR_LIMIT`：3000/2000/1500）+ 软字节阈值双轨治理 |
+| 上下文重建/压缩点 | compact 记忆刷新提示 + 压缩检查点归档（摘要不丢失） |
+| 跨会话记忆沉淀 | sessions 动态层 + 项目层分层记忆，30 天轮转归档 |
+
+### 差异
+
+- **生态**：mimocode 的终端 AI 编程助手；dsh-memory 是 DeepSeek Harness（Cordis 插件架构）宿主插件；
+- **实现**：mimocode 用 SQLite FTS5 全文搜索 + 子智能体维护；dsh-memory 用 Markdown 文件分层 + 零写入提醒制（插件只读，写入由会话模型执行）；
+- **自包含**：知识库完全在 `~/.dsh/memory/` 内，与 mimocode 目录无关，独立运行。
+
+**一句话**：借鉴 mimocode 开源的持久化记忆设计理念（MEMORY.md + 自动注入 + 预算化注入），针对 DSH 生态独立实现，现已完全自包含。
 
 ## 优势
 
@@ -40,9 +62,9 @@ DeepSeek Harness（DSH）全局自动记忆插件：会话开始自动注入记�
 
 ### 相比 mimocode 原生记忆
 
-- 记忆注入到 AI 会话上下文（自动生效）vs. 记忆只存在 mimocode 自己的存储（需手动唤起）。
-- 知识库自包含、备份一键（Copy-Item `~/.dsh/memory/*` 即含全部），不依赖其他工具目录。
-- 跨 DSH 会话/多主会话并发安全（去重 + 全量读后追加）。
+- **检索**：mimocode 靠 SQLite FTS5 全文搜索；dsh-memory 除 memory_search 全文搜索外，还按主题索引（index.md 动态解析）直接命中文件，中文检索更友好。
+- **维护**：mimocode 由内置子智能体自动维护；dsh-memory 用零写入提醒制 + 全量读后追加，多主会话并发安全（去重 + 防覆盖），备份一键（Copy-Item `~/.dsh/memory/*` 即含全部）。
+- **自包含**：知识库完全在 `~/.dsh/memory/` 内，不依赖 mimocode 或其他工具目录。
 
 ## 安装
 
