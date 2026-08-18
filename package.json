@@ -1,0 +1,21 @@
+{
+  "name": "dsh-memory",
+  "version": "11.0.0",
+  "private": false,
+  "type": "module",
+  "description": "DSH 全局自动记忆插件：会话开始注入记忆、memory_search 检索工具、压缩检查点归档提醒（零写入提醒制）。",
+  "main": "index.js",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "cordis",
+    "deepseek-harness"
+  ],
+  "license": "MIT",
+  "author": "Starry0214",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Starry0214/dsh-memory.git"
+  }
+}

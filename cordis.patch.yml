@@ -1,0 +1,9 @@
+# ── dsh-memory: 全局自动记忆插件（insert 语义注册） ──────────────
+# 会话开始注入记忆摘要、注册 memory_search 检索工具。
+# 安装：将本仓库 index.js 放到 <你的 profile>/plugins/memory/index.js，
+#       然后在 <profile>/cordis.patch.yml 追加以下内容（insert 语义）。
+#       注意：id 不存在时 applyEntryPatches 会 warn 跳过，必须用 insert，不能覆盖写。
+- insert:
+    - id: dsh-memory
+      name: ./plugins/memory/index.js
+      config: {}

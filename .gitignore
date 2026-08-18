@@ -1,0 +1,17 @@
+# 个人记忆数据（切勿上传！）
+memory/
+memory_backup/
+knowledge/
+sessions/
+projects/
+tools/
+*.bak.js
+.last
+
+# Node
+node_modules/
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
