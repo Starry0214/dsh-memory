@@ -18,13 +18,13 @@ DeepSeek Harness（DSH）全局自动记忆插件：会话开始自动注入记�
 
 ## 与 mimocode 的关系
 
-本插件**诞生于 mimocode，服务于 DSH**，关系分三层：
+本插件的**设计灵感来自 mimocode 的开源记忆功能**，但两者是独立的项目：
 
-1. **开发渊源**：插件 v5→v10.5 全程在 mimocode（开源 AI 编码助手 MiMo-Code）环境中迭代开发，零写入提醒制、双轨阈值、重入修复等设计都是在这个开发周期里沉淀的；v11 起在 DSH 内维护并开源。
-2. **记忆体系渊源**：记忆文件格式（`MEMORY-*.md` 知识文件、`global.md` / `index.md` 稳定层、sessions 动态层）源自 mimocode 的记忆组织方式，知识库内容最初也在 mimocode 记忆目录（`mimocode/memory/projects/global/`）。
-3. **v10 起完全解耦**：知识库 21 个 `MEMORY-*.md` 文件已复制到 `~/.dsh/memory/knowledge/`，`KNOWLEDGE_ROOT` 指向本地——**备份、检索、注入均不再依赖 mimocode 目录**，即使没有 mimocode 插件照常工作。
+1. **灵感来源**：mimocode（开源 AI 编码助手 MiMo-Code）自带记忆功能——会话经验自动沉淀、跨会话复用。dsh-memory 借鉴了这一理念，把它移植到 DeepSeek Harness（DSH）生态：在 DSH 会话开始时自动注入记忆、提供 memory_search 检索工具。
+2. **实现完全独立**：插件代码、记忆文件格式（`MEMORY-*.md` 知识文件、`global.md` / `index.md` 稳定层、sessions 动态层）、注入机制全部针对 DSH 的 Cordis 插件架构重新设计，不是 mimocode 的代码复用。
+3. **v10 起知识库自包含**：知识库 21 个 `MEMORY-*.md` 文件已复制到 `~/.dsh/memory/knowledge/`，`KNOWLEDGE_ROOT` 指向本地——**备份、检索、注入均不依赖 mimocode 目录**，即使没有 mimocode，插件照常工作。
 
-**一句话**：用 mimocode 开发、为 DSH 服务、知识体系继承 mimocode 但已独立自包含。
+**一句话**：灵感源自 mimocode 的开源记忆功能，为 DSH 生态独立实现，现已完全自包含。
 
 ## 优势
 
@@ -38,7 +38,7 @@ DeepSeek Harness（DSH）全局自动记忆插件：会话开始自动注入记�
 6. **v10.5 重入修复**：修复 `session/event` 处理器内同步 `agent.inject` 触发的 "session append cannot reenter" 异常，所有 inject 推迟到 `setTimeout(0)`（发布窗口之外）执行——确保压缩检查点摘要不再丢失。
 7. **路径可移植（v11）**：无硬编码绝对路径，`homedir()` + 环境变量推导，克隆即用。
 
-### 相比 mimocode 记忆
+### 相比 mimocode 原生记忆
 
 - 记忆注入到 AI 会话上下文（自动生效）vs. 记忆只存在 mimocode 自己的存储（需手动唤起）。
 - 知识库自包含、备份一键（Copy-Item `~/.dsh/memory/*` 即含全部），不依赖其他工具目录。
