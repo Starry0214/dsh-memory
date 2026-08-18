@@ -98,8 +98,8 @@ compact 是上下文重置点，但记忆注入仍是会话开始快照（sessio
 
 ### 健壮性
 
-- v10.5 修复 `session/event` 处理器内同步 `agent.inject` 触发的重入异常，所有 inject 推迟到 `setTimeout(0)`（发布窗口之外）执行，确保压缩检查点摘要不丢失；
-- v11 路径可移植：`homedir()` + 环境变量推导，无硬编码绝对路径，克隆即用。
+- 修复 `session/event` 处理器内同步 `agent.inject` 触发的重入异常，所有 inject 推迟到 `setTimeout(0)`（发布窗口之外）执行，确保压缩检查点摘要不丢失；
+- 路径可移植：`homedir()` + 环境变量推导，无硬编码绝对路径，克隆即用。
 
 ## 记忆库结构
 
@@ -115,23 +115,14 @@ compact 是上下文重置点，但记忆注入仍是会话开始快照（sessio
 
 ## 版本历史
 
-> 当前发布版本 **v1.0.0**（内部迭代编号 v5→v11，下表中 v11 即 1.0.0）。
+### v1.0.0（2026-08-18 · 首个发布）
 
-| 版本 | 内容 |
-|---|---|
-| v5 | 注入（稳定层+摘要）+ memory_search 工具（固定 8 目标） |
-| v6 | 压缩即归档（监听 compaction/summary 直接写 sessions/；v9 起改提醒制） |
-| v7 | sessions 轮转 + 超限预警 |
-| v8 | memory_search 动态解析 index.md 覆盖 21 知识文件 + 全文关键词搜索 + 备份 |
-| v9 | 插件零写入，全部提醒制 |
-| v9.1 | 摘要超限阈值 2048B → 4096B |
-| v10 | 知识库自包含（21 个 MEMORY-*.md 复制到 knowledge/） |
-| v10.1 | index.md 超限阈值 3072B → 4608B |
-| v10.2 | 超限治理提醒注入会话：软字节 + 硬字符双轨报告；截断注记 |
-| v10.3 | 多主会话去重：维护提醒只注入第一个顶层会话；origin 判定 |
-| v10.4 | compact 后轻量记忆刷新提示 |
-| v10.5 | 修复 session/event 重入异常（inject 推迟到 setTimeout(0)） |
-| v11 | 路径可移植化：homedir() + 环境变量，开源分发友好 |
+- 会话开始注入记忆（稳定层 + 最近摘要）；
+- memory_search 检索工具（主题索引 + 全文关键词搜索）；
+- 压缩检查点归档、备份 / 轮转提醒（插件零写入，全部提醒制）；
+- 双轨超限治理（软字节阈值 + 硬字符预算）；
+- 多会话去重、compact 记忆刷新、session/event 重入修复；
+- 路径可移植：homedir() + 环境变量（DSH_HOME / DSH_MEMORY_ROOT / DSH_MEMORY_BACKUP_ROOT）。
 
 ## 许可证
 
