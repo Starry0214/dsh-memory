@@ -84,22 +84,37 @@ mimocode 的记忆功能很好，但它是**终端编程助手内部机制**；d
 
 **一句话**：让 DeepSeek Harness 拥有 mimocode 级别的持久化记忆，且针对 DSH 的沙箱、缓存、多会话、压缩场景做了专门的工程化适配。
 
-## 安装
+## 安装（一行命令）
 
-1. 将本仓库 `index.js` 放到 `~/.dsh/profiles/<profile>/plugins/memory/index.js`；
-2. 在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 追加（insert 语义，不能用覆盖写）：
-   ```yaml
-   - insert:
-       - id: dsh-memory
-         name: ./plugins/memory/index.js
-         config: {}
-   ```
-3. 重启 DSH。启动日志出现以下行即成功：
-   ```
-   [dsh-memory] 已注入稳定层 (N 段)
-   [dsh-memory] 已注入摘要: YYYY-MM-DD.md
-   [dsh-memory] memory_search 工具已注册（ctx.tools）
-   ```
+### Windows（PowerShell）
+
+```powershell
+irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex
+```
+
+### macOS / Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.sh | bash
+```
+
+脚本自动完成：下载插件 → 写入 `<profile>/plugins/memory/index.js` → 在 `cordis.patch.yml` 追加 insert 注册（幂等，重复执行安全）→ 提示重启。
+
+可配置项（环境变量）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DSH_HOME` | `~/.dsh` | DSH 主目录 |
+| `DSH_PROFILE` | `web` | 目标 profile |
+| `DSH_MEMORY_RAW` | GitHub raw | 插件文件下载源（可指向镜像） |
+
+安装完成后**重启 DSH**，启动日志出现以下行即成功：
+
+```
+[dsh-memory] 已注入稳定层 (N 段)
+[dsh-memory] 已注入摘要: YYYY-MM-DD.md
+[dsh-memory] memory_search 工具已注册（ctx.tools）
+```
 
 ## 配置
 
