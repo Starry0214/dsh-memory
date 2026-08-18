@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory",
-  "version": "11.0.0",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
   "description": "DSH 全局自动记忆插件：会话开始注入记忆、memory_search 检索工具、压缩检查点归档提醒（零写入提醒制）。",

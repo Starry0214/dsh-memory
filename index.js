@@ -1,4 +1,4 @@
-// dsh-memory: 全局自动记忆插件 v11（写操作全部移出插件，改提醒制；路径可移植化，开源版）
+// dsh-memory: 全局自动记忆插件 v1.0.0（内部版本 v11；写操作全部移出插件，改提醒制；路径可移植化，开源版）
 // v11 新增：路径可移植化
 //  - 移除硬编码 C:/Users/Starry 绝对路径，改用 homedir() + 环境变量推导：
 //    DSH_HOME 默认 <homedir>/.dsh，可用环境变量 DSH_HOME / DSH_MEMORY_ROOT / DSH_MEMORY_BACKUP_ROOT 覆盖。
