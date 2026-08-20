@@ -1,9 +1,23 @@
 # ── dsh-memory: 全局自动记忆插件（insert 语义注册） ──────────────
 # 会话开始注入记忆摘要、注册 memory_search 检索工具。
 # 安装：将本仓库 index.js 放到 <你的 profile>/plugins/memory/index.js，
+#       将本仓库 client/ 目录复制到 <你的 profile>/plugins/dsh-memory-client/，
+#       并在 <你的 profile>/profiles/node_modules/ 下建 junction 指向它（Windows）：
+#         New-Item -ItemType Junction -Path <profile>/profiles/node_modules/dsh-memory-client -Target <profile>/plugins/dsh-memory-client
 #       然后在 <profile>/cordis.patch.yml 追加以下内容（insert 语义）。
 #       注意：id 不存在时 applyEntryPatches 会 warn 跳过，必须用 insert，不能覆盖写。
+#       可配置项（v1.3.0，也可在设置 → 通用设置 → 记忆 里改，存 settings.yaml）：
+#         staleSessionDays: 漏网会话检测阈值（天），默认 5
+#         staleAction:      漏网处理动作：remind=仅提醒（默认）| silent=静默子代理 | approval=审批后子代理
 - insert:
     - id: dsh-memory
       name: ./plugins/memory/index.js
-      config: {}
+      config:
+        staleSessionDays: 5
+        staleAction: remind
+
+# ── dsh-memory-client: 设置界面半区（可选，提供设置 → 通用设置 → 记忆 配置行） ──
+# 需要上述 junction 已建立；没有它仅失去设置界面入口，功能不受影响。
+- insert:
+    - id: dsh-memory-client
+      name: 'dsh-memory-client'

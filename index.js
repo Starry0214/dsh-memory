@@ -1,4 +1,4 @@
-// dsh-memory: 全局自动记忆插件 v1.2.0（v1.2.0: 压缩检查点 node:fs 直写落盘，不再依赖模型回合；提醒制降级为 fallback）
+// dsh-memory: 全局自动记忆插件 v1.3.0（合并发布版：漏网会话检测 + 设置界面配置 + 自动整合 + 消息流提取/仿真 compact + 控制台时间戳）
 // v1.1.0 新增（原 v12）：memory_search 检索质量升级（参考 mimocode MiMo-Code 记忆模块移植）
 //  - Unicode 分词 + OR 匹配：修复"OA日志" vs "日志填写"、"智检API" vs "REST API/推送"不命中
 //  - loadKnowledgeTargets 正则放宽：收录 tools/*.md（修复 记忆插件.md/dsh.md 永远搜不到）
@@ -63,6 +63,13 @@ import { homedir } from "node:os";
 import path from "node:path";
 // v1.2.0：node:fs 直写压缩检查点（宿主插件真实 Node 环境，绕过 ctx.fs 沙箱，无需审批）
 import fs from "node:fs";
+// v1.8.0：node:zlib 原生 zstd 解压（Node 22.17+/23.3+）——漏网归档改为「提取会话 compaction 摘要」，子代理不读原始大日志
+import zlib from "node:zlib";
+// v1.4.0：官方设置机制（settings.yaml 命名空间，设置 UI 可改；cordis.patch.yml config 作 base 默认层）
+//  - installSettingsSection: 把插件配置注册为 settings 命名空间（用户文档覆盖 base）
+//  - schemastery z: DSH 配置 schema 标准（与 dsh-web-app 同源）
+import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
+import z from "@deepseek-ai/schemastery";
 
 function portable(p) { return String(p).replace(/\\/g, "/"); }
 
@@ -96,9 +103,241 @@ function makeMessage(text) {
   };
 }
 
+// v1.10.1：控制台输出统一时间戳（HH:MM:SS）。本文件内 console 调用已批量替换为 clog/cwarn/cerr。
+const clog = (...a) => globalThis.clog(ts(), ...a);
+const cwarn = (...a) => globalThis.cwarn(ts(), ...a);
+const cerr = (...a) => globalThis.cerr(ts(), ...a);
+function ts() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return "[" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) + "]";
+}
+
+// v1.3.0：漏网会话检测 —— 扫描 ~/.dsh/sessions/ 下久未交互（mtime≥阈值 天）的会话
+// v1.6.0：加 afterTime 界限 —— 插件启用前创建的会话不触发整合（用户要求）；
+//         插件关闭期间产生的会话（创建时间在启用之后）仍会被检测 → 重新启用后"未整合范围扩大"。
+// 判定"漏网"：会话创建于启用之后 + 最后一次写入距今超过阈值 + 未在记忆库落档
+const STALE_NOTIFIED = new Set();  // 本实例内已提醒过的会话 id（防多会话重复提醒）
+const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
+
+function findStaleSessions(maxAgeDays, afterTime) {
+  const stale = [];
+  let wsDirs = [];
+  try { wsDirs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true }); } catch (e) { return stale; }
+  const cutoff = Date.now() - maxAgeDays * 86400000;
+  for (const ws of wsDirs) {
+    if (!ws.isDirectory()) continue;
+    let sdirs = [];
+    try { sdirs = fs.readdirSync(path.join(SESSIONS_ROOT, ws.name), { withFileTypes: true }); } catch (e) { continue; }
+    for (const s of sdirs) {
+      if (!s.isDirectory() || !s.name.startsWith("session-")) continue;
+      const z = path.join(SESSIONS_ROOT, ws.name, s.name, "session.jsonl.zstd");
+      let st;
+      try { st = fs.statSync(z); } catch (e) { continue; }
+      // v1.6.1 修正：启用界限用「会话最后交互时间」（mtime）而非创建时间——
+      // 最后交互在插件最近一次启用之前的会话（含插件关闭期间结束的）不触发整合；
+      // 只有最后交互在启用之后的会话才纳入漏网检测。
+      if (afterTime && st.mtimeMs < afterTime) continue;
+      if (st.mtimeMs < cutoff) {
+        stale.push({ ws: ws.name, id: s.name, mtime: st.mtimeMs, size: st.size });
+      }
+    }
+  }
+  return stale;
+}
+
+// v1.8.0：提取会话日志的 compaction 摘要（根治 token 爆炸）——
+// 解压 session.jsonl.zstd（node:zlib zstd），找 compaction/summary 事件，返回摘要文本（截断防超长）。
+// 子代理只读这个摘要（几千 token），不再读原始大日志（几十 MB → 数百万 token）。
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+function decompressSessionLog(filePath) {
+  try {
+    const buf = fs.readFileSync(filePath);
+    let out = Buffer.alloc(0);
+    let off = 0;
+    while (off < buf.length) {
+      const frame = zlib.zstdDecompressSync(buf.subarray(off));
+      out = Buffer.concat([out, frame]);
+      let next = -1;
+      for (let i = off + 4; i < buf.length - 3; i++) {
+        if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) { next = i; break; }
+      }
+      if (next < 0) break;
+      off = next;
+    }
+    return out.toString("utf8");
+  } catch (e) { return null; }
+}
+// v1.8.0：提取会话「对话消息流」（根治 token 爆炸的正式方案）——
+// 解压日志后提取 user/assistant 消息的文本内容（过滤 system-reminder 注入、工具结果、chunk 噪音），
+// 得到最新、紧凑、不遗漏的对话流（实测 6.37M token 原始日志 → ~12K token 消息流，缩小 ~500 倍）。
+// 子代理只读消息流总结归档，不碰原始日志。每消息截断防单条超长。
+function extractMessageFlow(filePath, maxChars) {
+  const limit = maxChars || 8000;
+  try {
+    const text = decompressSessionLog(filePath);
+    if (!text) return null;
+    const lines = text.split("\n").filter((l) => l.trim());
+    const parts = [];
+    let total = 0;
+    for (const l of lines) {
+      let j;
+      try { j = JSON.parse(l); } catch (e) { continue; }
+      if (j.type === "user/message") {
+        const content = j.data && j.data.content;
+        if (!Array.isArray(content)) continue;
+        const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
+        if (!txt) continue;
+        // 过滤 dsh-memory 注入的 system-reminder（非用户真实交互）
+        if (txt.startsWith("<system-reminder>")) continue;
+        const piece = "[用户] " + txt.slice(0, 800);
+        parts.push(piece); total += piece.length;
+      } else if (j.type === "assistant/message") {
+        const content = j.data && j.data.message && j.data.message.content;
+        if (!Array.isArray(content)) continue;
+        const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
+        if (!txt) continue;
+        const piece = "[助手] " + txt.slice(0, 1000);
+        parts.push(piece); total += piece.length;
+      }
+      if (total > limit) break; // 防超长，截断
+    }
+    if (parts.length === 0) return null;
+    return parts.join("\n").slice(0, limit);
+  } catch (e) { return null; }
+}
+
+// v1.6.1：插件最近启用时间界限（漏网检测过滤用）——
+// 读取状态文件 lastEnabledAt（最近一次 apply 启动时更新）；无则用 installAt，再无则当前时间。
+// 会话「最后交互时间」< lastEnabledAt → 不触发整合（含插件关闭期间结束的会话）。
+// v1.9.0 语义明确：enabledAt = 当前启用周期时间（插件启用时实时获取，关闭时置 null）。
+// 判定：会话最后交互 mtime >= enabledAt → 纳入漏网；< enabledAt（启用前/关闭期间结束）→ 跳过。
+function getEnabledAt() {
+  try {
+    const raw = fs.readFileSync(portable(INTEGRATE_STATE_FILE), "utf8");
+    const st = JSON.parse(raw);
+    if (st) {
+      // enabledAt 为数字（当前启用中）→ 用之
+      if (typeof st.enabledAt === "number" && st.enabledAt > 0) return st.enabledAt;
+      // enabledAt 为 null（上次关闭标记）→ 视为"刚启用"，返回当前时间（本次启用前的会话全部跳过）
+      if (st.enabledAt === null) return Date.now();
+      // 老状态文件无 enabledAt 字段 → 兼容：读 lastEnabledAt/installAt
+      if (typeof st.lastEnabledAt === "number" && st.lastEnabledAt > 0) return st.lastEnabledAt;
+      if (st.installAt) return st.installAt;
+    }
+  } catch (e) { /* 无状态文件 */ }
+  return Date.now();
+}
+
+// v1.10.0 性能优化：sessions/*.md 内容缓存（启动时读一次 + 写入后刷新），
+// 把 sessionMentionedInMemory 从「每会话 × 每文件读盘」O(N×M) 降为「缓存 includes」O(N)。
+let MEMORY_SESSIONS_INDEX = null;
+
+function refreshMemorySessionsIndex() {
+  try {
+    const dir = MEMORY_ROOT + "/sessions";
+    const files = fs.readdirSync(portable(dir));
+    let acc = "";
+    for (const fn of files) {
+      if (!fn.endsWith(".md")) continue;
+      try { acc += fs.readFileSync(portable(dir + "/" + fn), "utf8"); } catch (e) { /* 单文件读失败跳过 */ }
+    }
+    MEMORY_SESSIONS_INDEX = acc;
+    return acc;
+  } catch (e) { MEMORY_SESSIONS_INDEX = ""; return ""; }
+}
+
+// 会话 id 是否已出现在记忆库 sessions/ 文件中（出现过 = 曾被总结/落档，不再视为漏网）
+function sessionMentionedInMemory(sessionId) {
+  if (MEMORY_SESSIONS_INDEX === null) refreshMemorySessionsIndex();
+  const idx = MEMORY_SESSIONS_INDEX || "";
+  const idShort = sessionId.replace(/^session-/, "");
+  return idx.includes(sessionId) || idx.includes(idShort);
+}
+
+// v1.3.0：可配置项（cordis.patch.yml 的 config 字段覆盖；未配置时用默认值）
+//  - staleSessionDays: 漏网会话检测阈值（天），默认 5
+//  - staleAction:      漏网处理动作，remind=仅注入提醒（默认）| silent=后台静默子代理总结 | approval=经用户审批后子代理总结
+// v1.7.1：默认 staleAction=remind（仅提醒，不自动 spawn 子代理——实测漏网归档子代理单会话可烧数百万 token）
+const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7 };
+// v1.6.0：整合/漏网状态文件（模块级，供 getInstallAt 等跨作用域使用）
+const INTEGRATE_STATE_FILE = MEMORY_ROOT + "/.integrate.json";
+let PLUGIN_CFG = { ...DEFAULT_CFG };
+
+// v1.4.0：settings 命名空间 schema（设置 UI 渲染 + 校验；用户文档覆盖 base）
+// schemastery 语法：无 .int()/z.enum —— 整数用 number().min().max()，枚举用 union([const...])
+const SETTINGS_SCHEMA = z.object({
+  staleSessionDays: z.number().min(1).max(90).default(DEFAULT_CFG.staleSessionDays),
+  staleAction: z.union([z.const("remind"), z.const("silent"), z.const("approval")]).default(DEFAULT_CFG.staleAction),
+  // v1.5.0：定期自动整合（对标 mimocode AutoDream）
+  integrateEnabled: z.boolean().default(false),          // 开关：每 integrateDays 天自动整合记忆（默认关闭，避免自动耗 token）
+  integrateDays: z.number().min(1).max(90).default(7),   // 整合间隔（天）
+  // 只读统计：漏网（未整合记忆）会话数量，由宿主在检测后写入；非用户编辑项
+  // schemastery 对象字段默认可选；required(false) 显式标注
+  staleCount: z.number().min(0).required(false)
+});
+// v1.4.0：宿主侧 settings scope（register 返回），用于写只读统计 staleCount
+let HOST_SETTINGS_SCOPE = null;
+
+// 归一化配置：settings 值或 cordis config → 合法 PLUGIN_CFG
+function normalizeCfg(raw) {
+  const cfg = { ...DEFAULT_CFG, ...(raw || {}) };
+  if (cfg.staleAction !== "remind" && cfg.staleAction !== "silent" && cfg.staleAction !== "approval") {
+    cwarn("[dsh-memory] staleAction 非法值 " + cfg.staleAction + "，回退 remind");
+    cfg.staleAction = "remind";
+  }
+  if (!(cfg.staleSessionDays >= 1 && cfg.staleSessionDays <= 90)) cfg.staleSessionDays = DEFAULT_CFG.staleSessionDays;
+  return cfg;
+}
+
 export default {
-  inject: ["fs"],
-  apply(ctx) {
+  inject: ["fs", "timer"],
+  apply(ctx, config) {
+    // v1.4.0：设置机制 —— cordis.patch.yml config 作 base 默认层，settings.yaml 用户文档覆盖。
+    // 手动 register 拿到宿主 scope（写只读统计 staleCount）；无 settings 服务时回退 cordis config。
+    PLUGIN_CFG = normalizeCfg(config);
+    // v1.9.1 修正：enabledAt 与 DSH 启动解耦——
+    // 只在「插件从禁用变启用」时更新（首次安装 / 从 cordis.patch.yml 恢复；dispose 置 null 后重新加载）。
+    // 持续启用期间（多次 DSH 启动）enabledAt 保持不变，漏网检测覆盖整个启用周期。
+    try {
+      const now = Date.now();
+      const st = readIntegrateState() || { installAt: now, lastIntegrateAt: 0 };
+      if (!st.installAt) st.installAt = now;
+      const wasEnabled = typeof st.enabledAt === "number" && st.enabledAt > 0;
+      if (!wasEnabled) {
+        st.enabledAt = now;  // 重新启用（首次或从禁用恢复）
+        clog("[dsh-memory] 插件已启用，enabledAt=" + new Date(st.enabledAt).toISOString().slice(0, 19) + "（启用前会话不触发整合）");
+      } else {
+        clog("[dsh-memory] 插件持续启用中，enabledAt 保持 " + new Date(st.enabledAt).toISOString().slice(0, 19) + "（不随 DSH 启动刷新）");
+      }
+      delete st.lastEnabledAt;  // 旧字段清理
+      writeIntegrateState(st);
+    } catch (e) { /* 状态记录失败不影响功能 */ }
+    // v1.10.0：启动时加载 sessions/*.md 缓存（漏网检测高性能）
+    refreshMemorySessionsIndex();
+    clog("[dsh-memory] sessions 索引已加载（" + (MEMORY_SESSIONS_INDEX || "").length + " 字符）");
+    try {
+      ctx.inject(["settings"], (sctx) => {
+        try {
+          HOST_SETTINGS_SCOPE = sctx.settings.register(settingsNamespace("dsh-memory"), SETTINGS_SCHEMA, {
+            base: config || DEFAULT_CFG
+          });
+          PLUGIN_CFG = normalizeCfg(HOST_SETTINGS_SCOPE.get());
+          HOST_SETTINGS_SCOPE.watch(() => {
+            const next = HOST_SETTINGS_SCOPE.get();
+            PLUGIN_CFG = normalizeCfg(next);
+            clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction);
+          });
+          clog("[dsh-memory] 设置命名空间已注册（settings.yaml 可配置，设置界面可改）");
+        } catch (e) {
+          cwarn("[dsh-memory] settings register 失败，回退 cordis config:", e && e.message ? e.message : String(e));
+        }
+      });
+    } catch (e) {
+      cwarn("[dsh-memory] settings 注入失败，回退 cordis config:", e && e.message ? e.message : String(e));
+    }
+    clog("[dsh-memory] 配置: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction);
+
     // v6：主会话 id（session-start 时记录第一个，用于过滤子代理压缩事件）
     // v10.3：不再用 rootSessionId 判定"主会话"（多主会话场景会误判），改查 session.header.origin；
     // 保留 rootSessionId 仅作兼容兜底，判定主逻辑见 isTopLevelSession()
@@ -121,12 +360,17 @@ export default {
       return rootSessionId === null || (s && s.id === rootSessionId);
     }
 
+    // v1.10.1：#6 readText 双通道 —— 优先 ctx.fs（沙箱），失败时 node:fs 直读兜底（防沙箱限制 ~/.dsh 读导致 memory_search/注入静默失效）
     async function readText(path) {
       try {
         const target = await ctx.fs.resolve(path);
         return await ctx.fs.readText(target);
       } catch (e) {
-        return null;
+        try {
+          return fs.readFileSync(portable(path), "utf8");
+        } catch (e2) {
+          return null;
+        }
       }
     }
 
@@ -247,7 +491,7 @@ export default {
         }
         return old;
       } catch (e) {
-        console.error("[dsh-memory] 轮转检查失败:", e && e.message ? e.message : String(e));
+        cerr("[dsh-memory] 轮转检查失败:", e && e.message ? e.message : String(e));
         return [];
       }
     }
@@ -373,13 +617,110 @@ export default {
         }
         return { due: true, last: last ? new Date(Number(last.trim())) : null };
       } catch (e) {
-        console.error("[dsh-memory] 备份检查失败:", e && e.message ? e.message : String(e));
+        cerr("[dsh-memory] 备份检查失败:", e && e.message ? e.message : String(e));
         return { due: false, last: null };
       }
     }
 
     // v9：组装维护提醒（备份到期 + 轮转到期），有需要时注入
-    async function injectMaintenanceReminder(agent) {
+    async function injectMaintenanceReminder(agent, sessionLabel) {
+      const SESSION_LABEL = sessionLabel || "?";
+
+      // v1.4.0：漏网处理子代理 —— silent 模式插件直接 spawn，完成后控制台输出结果
+      // v1.7.0：① 子代理为 fresh 会话（spawn 不继承父上下文，inheritsParentContext=false，无 seed）——
+      //           无需先 compact，prompt 即全部输入，紧凑省 token；
+      //         ② 按工作空间合并：同 ws 的多个会话交给一个子代理处理（减少子代理数）
+      async function spawnStaleSummary(group) {
+        const subagents = ctx.get("subagents");
+        if (!subagents || typeof subagents.start !== "function") {
+          cwarn("[dsh-memory] subagents 服务不可用，silent 漏网处理降级为提醒");
+          return false;
+        }
+        // group = { ws, sessions: [{id, mtime, size}...] }
+        // v1.8.0 根治方案：插件提取每个会话的「对话消息流」（user/assistant 文本，过滤注入和工具噪音），
+        // 直接内嵌进 prompt —— 子代理不读原始日志（几十 MB → 消息流几 K-tens K token，最新不遗漏）
+        const ws = group.ws;
+        // 提取消息流；提取失败或无内容的会话跳过
+        const flowSessions = [];
+        const skippedNoFlow = [];
+        for (const s of group.sessions) {
+          const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
+          const flow = extractMessageFlow(logPath, 8000);
+          if (flow) {
+            flowSessions.push({ session: s, flow: flow });
+          } else {
+            skippedNoFlow.push(s.id.slice(0, 12));
+          }
+        }
+        if (skippedNoFlow.length > 0) {
+          clog("[dsh-memory] 跳过无消息流会话 " + skippedNoFlow.length + " 个（解压失败或无可提取文本）: " + skippedNoFlow.join(", "));
+          skippedNoFlow.forEach((id) => {
+            const s = group.sessions.find((x) => x.id.startsWith(id));
+            if (s) STALE_NOTIFIED.add(s.id);
+          });
+        }
+        if (flowSessions.length === 0) {
+          clog("[dsh-memory] 工作空间 " + ws + " 无可归档会话（全部无消息流）");
+          return false;
+        }
+        // 组装：每会话的 id + 消息流
+        const flowBlocks = flowSessions.map((f) =>
+          "===== 会话 " + f.session.id + "（最后交互约 " + Math.max(1, Math.round((Date.now() - f.session.mtime) / 86400000)) + " 天前）=====\n" + f.flow
+        ).join("\n\n");
+        // v1.9.0 仿真 compact：消息流 = 对话前缀，压缩指令与 DSH 官方 compact（dsh-compaction-basic）同款
+        const promptText =
+          "你是 dsh-memory 记忆归档子代理，执行「仿真压缩检查点」。你的上下文只含任务清单和已提取的对话消息流（fresh 会话）。\n" +
+          "**不要读取任何原始日志文件**——消息流已足够，读取原始日志会消耗巨额 token（禁止）。\n" +
+          "\n===== 待归档会话的对话消息流（作为对话前缀） =====\n" +
+          flowBlocks + "\n" +
+          "\n===== 压缩指令（与 DSH compact 同款） =====\n" +
+          "你现在充当压缩引擎。将上方对话浓缩为结构化检查点，让后续能无损恢复工作上下文。\n" +
+          "输出 EXACTLY 以下 Markdown 结构（保留每节顺序；空节写 (none)，绝不丢节）：\n" +
+          "## Primary Request and Intent\n- [用户原始及演变目标；逐字引用关键表述]\n" +
+          "## Key Technical Concepts\n- [技术/框架/模式/约定]\n" +
+          "## Files and Code\n- [精确路径：为什么重要、关键改动或片段]\n" +
+          "## Errors and Fixes\n- [错误：如何解决，相关用户反馈]\n" +
+          "## Pending Jobs\n- [明确要求但未完成的工作]\n" +
+          "## Current Work\n- [本检查点时进行中的工作]\n" +
+          "## Next Step\n- [紧接最近请求的下一步动作，或 (none)]\n" +
+          "## Critical Context\n- [决策及理由、约束、用户偏好、开放问题、继续所需数据]\n" +
+          "规则：\n" +
+          "- 简洁工程化；逐字保留精确路径/命令/错误串/标识符/数值/函数签名。\n" +
+          "- 忠实捕获用户反馈和纠正。\n" +
+          "- 不要提及压缩/归档本身。\n" +
+          "- 若对话已有 prior 检查点，不逐字复制：保留仍真的事实，丢弃过时的，合并为单一摘要。\n" +
+          "\n===== 写入目标 =====\n" +
+          "把检查点追加到 " + MEMORY_ROOT + "/sessions/ 下当日文件（如 2026-08-19.md），或按内容归属写入 projects/ 对应文件；小节标题如「归档：<会话主题>」。\n" +
+          "纪律：先读目标文件全量再追加，禁止局部读+整体覆写；无归档价值的会话明确说明。\n" +
+          "完成后逐会话报告：写入的文件、小节、大致字符数；未写入则说明原因。\n" +
+          "只输出检查点文本并执行上述写入，不要调用其他工具或做其他操作。";
+        const label = "dsh-memory-漏网归档-" + (flowSessions.length > 1 ? ws.slice(0, 24) + "-" + flowSessions.length + "会话" : flowSessions[0].session.id);
+        try {
+          const run = await subagents.start("spawn", {
+            label: label,
+            prompt: [{ type: "text", text: promptText }],
+            parent: agent,
+            signal: new AbortController().signal,
+            // v1.10.1：#5 移除 pwsh —— 消息流已由插件提取内嵌，子代理无需执行命令；pwsh 可绕过"禁读原始日志"
+            toolFilter: { allow: ["read", "write", "edit", "grep", "glob"] }
+          });
+          // 完成回调：控制台输出子代理结果（用户要求：漏网处理完成后可见）
+          run.result.then((result) => {
+            const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
+            clog("[dsh-memory] 漏网归档完成: " + label + "（" + flowSessions.length + " 个会话, stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+            if (outText.length > 0 && outText.length <= 800) {
+              clog("[dsh-memory] 归档报告: " + outText.replace(/\n/g, " | "));
+            }
+          }).catch((e) => {
+            cwarn("[dsh-memory] 漏网归档子代理失败: " + label + " - " + (e && e.message ? e.message : String(e)));
+          });
+          clog("[dsh-memory] 已发起漏网归档子代理: " + label + "（" + flowSessions.length + " 个会话, 后台执行中）");
+          return true;
+        } catch (e) {
+          cwarn("[dsh-memory] 漏网子代理启动失败: " + label + " - " + (e && e.message ? e.message : String(e)));
+          return false;
+        }
+      }
       const parts = [];
 
       const backup = await checkBackupDue();
@@ -437,19 +778,94 @@ export default {
         );
       }
 
+      // v1.3.0：漏网会话处理（久未交互且未落档的会话）——v1.4.0 按 staleAction 分派
+      //  silent: 插件直接 spawn 子代理总结（后台，完成后控制台输出）
+      //  remind / approval: 注入提醒（approval 文案带确认引导）
+      try {
+        // v1.6.0：installAt 界限 —— 插件启用前创建的会话不触发整合
+        const staleSessions = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
+          .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
+        if (staleSessions.length > 0) {
+          if (PLUGIN_CFG.staleAction === "silent") {
+            // 静默模式：直接发起子代理（不注入提醒），完成后控制台输出归档结果。
+            // v1.7.0：按工作空间分组（同 ws 会话合并到一个子代理）+ 每批最多 MAX_STALE_GROUPS 组，
+            //         剩余组留待下次（避免一次性 spawn 过多子代理刷爆 token）
+            const MAX_STALE_GROUPS = 3;
+            // 按 ws 分组
+            const groups = new Map();
+            for (const s of staleSessions) {
+              if (!groups.has(s.ws)) groups.set(s.ws, []);
+              groups.get(s.ws).push(s);
+            }
+            const groupList = Array.from(groups.entries()).map(([ws, sess]) => ({ ws, sessions: sess }));
+            const batchGroups = groupList.slice(0, MAX_STALE_GROUPS);
+            const restGroups = groupList.slice(MAX_STALE_GROUPS);
+            const batchSessions = batchGroups.reduce((a, g) => a + g.sessions.length, 0);
+            clog("[dsh-memory] 漏网会话 " + staleSessions.length + " 个（" + groupList.length + " 个工作空间），本批发起 " + batchGroups.length + " 个子代理归档 " + batchSessions + " 个会话" + (restGroups.length > 0 ? "（剩余 " + restGroups.reduce((a, g) => a + g.sessions.length, 0) + " 个留待下次）" : ""));
+            for (const g of batchGroups) {
+              try { await spawnStaleSummary(g); } catch (e) { cwarn("[dsh-memory] 归档发起异常:", e && e.message ? e.message : String(e)); }
+            }
+            batchGroups.forEach((g) => g.sessions.forEach((s) => STALE_NOTIFIED.add(s.id)));
+            // 剩余组不标记 → 下次 session-start/整合检查时再处理
+            if (restGroups.length > 0) {
+              clog("[dsh-memory] 剩余 " + restGroups.reduce((a, g) => a + g.sessions.length, 0) + " 个漏网会话将在下次检查时处理");
+            }
+          } else {
+            const lines = staleSessions.map((s) => {
+              const days = Math.max(1, Math.round((Date.now() - s.mtime) / 86400000));
+              return "- " + s.id + "（工作目录 " + s.ws.slice(0, 40) + "…，最后活动约 " + days + " 天前，日志 " + s.size + "B）";
+            });
+            const actionTxt =
+              PLUGIN_CFG.staleAction === "approval"
+                ? "审批模式：请确认是否对以下会话发起子代理总结并写入 memory/（回复确认后执行）。"
+                : "处理（可选，由你决定）：若其中某个会话有值得归档的内容，可让我 review 其原始日志并总结进 memory/；若无需归档可忽略。";
+            parts.push(
+              "【dsh-memory 漏网会话提醒】检测到 " + staleSessions.length + " 个会话超过 " + PLUGIN_CFG.staleSessionDays + " 天无交互、且其内容未在记忆库 sessions/ 中落档（可能从未被总结）：\n" +
+              lines.join("\n") + "\n" +
+              actionTxt + "\n" +
+              "（原始日志：~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd；同实例内只提示一次）"
+            );
+            staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));
+          }
+          // v1.4.0：更新只读统计（设置界面显示"未整合记忆会话数"）
+          try {
+            if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.set === "function") {
+              const total = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id)).length;
+              HOST_SETTINGS_SCOPE.set("staleCount", total).catch(() => {});
+            }
+          } catch (e) { /* 统计更新失败不影响主流程 */ }
+        }
+      } catch (e) {
+        cwarn("[dsh-memory] 漏网会话检测失败:", e && e.message ? e.message : String(e));
+      }
+
       if (parts.length === 0) return;
       agent.inject(makeMessage(
         "<system-reminder>\n以下为 dsh-memory 维护提醒（写入 ~/.dsh 需要一次审批，频率很低）：\n" + parts.join("\n\n") + "\n</system-reminder>"
       ));
-      console.log("[dsh-memory] 已注入维护提醒（" + parts.length + " 项）");
+      clog("[dsh-memory] 已注入维护提醒（" + parts.length + " 项）[会话: " + SESSION_LABEL + "]");
+    }
+
+    // v1.4.0：会话标识（日志关联用）—— 工作目录最后一段 + session id 前 8 位
+    function sessionLabelOf(agent) {
+      try {
+        const s = agent && agent.session;
+        const id = (s && s.id) || agent.sessionId || "";
+        const short = String(id).replace(/^session-/, "").slice(0, 8);
+        const cwd = (s && s.header && s.header.cwd) || (s && s.cwd) || "";
+        const dir = cwd ? String(cwd).split(/[\\/]/).filter(Boolean).pop() : "";
+        return (dir ? dir + "·" : "") + short;
+      } catch (e) { return "?"; }
     }
 
     ctx.on("agent/session-start", (payload) => {
       const agent = payload.agent;
       if (!agent || typeof agent.inject !== "function") {
-        console.error("[dsh-memory] session-start: agent.inject 不可用");
+        cerr("[dsh-memory] session-start: agent.inject 不可用");
         return;
       }
+      // v1.4.0：本会话标识（所有注入日志关联显示）
+      const SESSION_LABEL = sessionLabelOf(agent);
       // v6：记录主会话 id；v9：记录 sessionId → agent 映射（压缩检查点注入用）
       // v10.3：agentsBySession 只记顶层会话（子代理压缩不归档）；rootSessionId 仅兜底记录第一个
       if (agent.session && agent.session.id) {
@@ -467,10 +883,10 @@ export default {
           const indexMd = stabilize(indexRaw);
           // v7：超限预警（提醒该整理了）
           if (globalRaw && utf8Bytes(globalRaw) > SIZE_WARN["global.md"]) {
-            console.warn("[dsh-memory] global.md 超限 " + utf8Bytes(globalRaw) + "B（阈值 " + SIZE_WARN["global.md"] + "B），建议整理提升");
+            cwarn("[dsh-memory] global.md 超限 " + utf8Bytes(globalRaw) + "B（阈值 " + SIZE_WARN["global.md"] + "B），建议整理提升[会话: " + SESSION_LABEL + "]");
           }
           if (indexRaw && utf8Bytes(indexRaw) > SIZE_WARN["index.md"]) {
-            console.warn("[dsh-memory] index.md 超限 " + utf8Bytes(indexRaw) + "B（阈值 " + SIZE_WARN["index.md"] + "B），建议精简");
+            cwarn("[dsh-memory] index.md 超限 " + utf8Bytes(indexRaw) + "B（阈值 " + SIZE_WARN["index.md"] + "B），建议精简[会话: " + SESSION_LABEL + "]");
           }
           const stableParts = [];
           if (globalMd) {
@@ -485,9 +901,9 @@ export default {
             agent.inject(makeMessage(
               "<system-reminder>\n以下为跨会话持久记忆（dsh-memory 稳定层，自动注入）。按需引用；更具体细节请调用 memory_search 工具。\n" + stableParts.join("\n\n") + "\n</system-reminder>"
             ));
-            console.log("[dsh-memory] 已注入稳定层 (" + stableParts.length + " 段)");
+            clog("[dsh-memory] 已注入稳定层 (" + stableParts.length + " 段)[会话: " + SESSION_LABEL + "]");
           } else {
-            console.warn("[dsh-memory] 稳定层为空（global/index 读取失败）");
+            cwarn("[dsh-memory] 稳定层为空（global/index 读取失败）");
           }
 
           // 消息B：动态层（最近摘要）
@@ -495,7 +911,7 @@ export default {
           if (latest && latest.text) {
             // v7：摘要超限预警
             if (utf8Bytes(latest.text) > SIZE_WARN.summary) {
-              console.warn("[dsh-memory] 摘要 " + latest.file + " 超限 " + utf8Bytes(latest.text) + "B（阈值 " + SIZE_WARN.summary + "B），建议精简");
+              cwarn("[dsh-memory] 摘要 " + latest.file + " 超限 " + utf8Bytes(latest.text) + "B（阈值 " + SIZE_WARN.summary + "B），建议精简[会话: " + SESSION_LABEL + "]");
             }
             const sumText = latest.text.slice(0, CHAR_LIMIT.summary);
             const sumNote = latest.text.length > CHAR_LIMIT.summary
@@ -504,19 +920,19 @@ export default {
             agent.inject(makeMessage(
               "<system-reminder>\n【上次会话摘要】（" + latest.file + "，衔接上次的下一步行动）\n" + sumText + sumNote + "\n</system-reminder>"
             ));
-            console.log("[dsh-memory] 已注入摘要: " + latest.file);
+            clog("[dsh-memory] 已注入摘要: " + latest.file + "[会话: " + SESSION_LABEL + "]");
           } else {
-            console.warn("[dsh-memory] 未找到会话摘要");
+            cwarn("[dsh-memory] 未找到会话摘要");
           }
 
           // 消息C：v9 维护提醒（备份到期 / 轮转到期 / 超限整理，只读检查后注入）
           // v10.3：同实例只对第一个顶层会话注入——避免多个主会话/子代理并发收到整理指令
           if (isTopLevelSession(agent) && !maintenanceInjected) {
             maintenanceInjected = true;
-            await injectMaintenanceReminder(agent);
+            await injectMaintenanceReminder(agent, SESSION_LABEL);
           }
         } catch (e) {
-          console.error("[dsh-memory] 注入异常:", e && e.message ? e.message : String(e));
+          cerr("[dsh-memory] 注入异常:", e && e.message ? e.message : String(e));
         }
       })();
     });
@@ -554,7 +970,7 @@ export default {
           })();
           if (existing.includes(marker)) {
             directWritten = true;
-            console.log("[dsh-memory] 压缩检查点已存在（幂等跳过）sessions/" + fname + " (" + compactionId + ")");
+            clog("[dsh-memory] 整合完成（幂等跳过）sessions/" + fname + "，大小 " + fs.statSync(targetFull).size + "B (" + compactionId + ")");
           } else {
             const beforeLen = nodeFsWriteAppend(
               targetPath,
@@ -562,19 +978,21 @@ export default {
               marker + "\n\n" + text.slice(0, 1500)
             );
             directWritten = true;
-            console.log("[dsh-memory] 压缩检查点已直写落盘 sessions/" + fname + "（" + text.length + " 字符，追加前 " + beforeLen + "B）");
+            clog("[dsh-memory] 完成整合 sessions/" + fname + "，大小 " + fs.statSync(targetFull).size + "B（新增摘要 " + text.slice(0, 1500).length + " 字符，追加前 " + beforeLen + " 字符）");
+            // v1.10.0：直写后刷新 sessions 索引缓存（新摘要立即可见，漏网检测不误判）
+            refreshMemorySessionsIndex();
           }
         } catch (e) {
-          console.warn("[dsh-memory] node:fs 直写失败，回退提醒制:", e && e.message ? e.message : String(e));
+          cwarn("[dsh-memory] node:fs 直写失败，回退提醒制:", e && e.message ? e.message : String(e));
         }
 
         // v9：找到该会话的 agent，注入落盘提醒（仅直写失败时）或刷新提示（直写成功时）
         const agent = agentsBySession.get(session.id);
         if (!agent || typeof agent.inject !== "function") {
           if (directWritten) {
-            console.log("[dsh-memory] 压缩检查点已直写（会话 agent 不可用，无需注入提醒）");
+            clog("[dsh-memory] 压缩检查点已直写（会话 agent 不可用，无需注入提醒）");
           } else {
-            console.warn("[dsh-memory] 压缩检查点：直写失败且未找到会话 agent，摘要未落盘");
+            cwarn("[dsh-memory] 压缩检查点：直写失败且未找到会话 agent，摘要未落盘");
           }
           return;
         }
@@ -605,19 +1023,19 @@ export default {
             if (directWritten) {
               // v1.2.0：已直写，只注入轻量刷新提示（提醒制不再需要）
               targetAgent.inject(makeMessage(refreshNote));
-              console.log("[dsh-memory] 已注入记忆刷新提示（compact 后，检查点已直写）");
+              clog("[dsh-memory] 已注入记忆刷新提示（compact 后，检查点已直写）");
             } else {
               targetAgent.inject(makeMessage(reminder));
-              console.log("[dsh-memory] 已注入压缩检查点提醒（" + text.length + " 字符，目标 sessions/" + fname + "）");
+              clog("[dsh-memory] 已注入压缩检查点提醒（" + text.length + " 字符，目标 sessions/" + fname + "）");
               targetAgent.inject(makeMessage(refreshNote));
-              console.log("[dsh-memory] 已注入记忆刷新提示（compact 后）");
+              clog("[dsh-memory] 已注入记忆刷新提示（compact 后）");
             }
           } catch (e) {
-            console.error("[dsh-memory] 压缩提醒延迟注入失败:", e && e.message ? e.message : String(e));
+            cerr("[dsh-memory] 压缩提醒延迟注入失败:", e && e.message ? e.message : String(e));
           }
         }, 0);
       } catch (e) {
-        console.error("[dsh-memory] session/event 处理异常:", e && e.message ? e.message : String(e));
+        cerr("[dsh-memory] session/event 处理异常:", e && e.message ? e.message : String(e));
       }
     });
 
@@ -727,12 +1145,141 @@ export default {
             return "搜索「" + q + "」命中 " + kept.length + " 个文件（OR 分词 + 相关度排序，Top " + kept.length + "）：\n\n" + body + "\n\n需要全文请用 memory_search 查精确文件名。";
           }
         });
-        console.log("[dsh-memory] memory_search 工具已注册（ctx.tools）");
+        clog("[dsh-memory] memory_search 工具已注册（ctx.tools）");
       } catch (e) {
-        console.error("[dsh-memory] 工具注册异常:", e && e.message ? e.message : String(e));
+        cerr("[dsh-memory] 工具注册异常:", e && e.message ? e.message : String(e));
       }
     } else {
-      console.error("[dsh-memory] tools 服务不可用，memory_search 工具注册跳过（不影响记忆注入）");
+      cerr("[dsh-memory] tools 服务不可用，memory_search 工具注册跳过（不影响记忆注入）");
     }
+
+    // v1.5.0：定期自动整合记忆（对标 mimocode AutoDream 7d）
+    // 宿主常驻进程 + ctx.interval 定时器；安装时记起始时间，每次整合完成刷新，下次再隔 integrateDays 天。
+    // 状态文件：MEMORY_ROOT/.integrate.json（{ installAt, lastIntegrateAt }）——常量见模块级
+
+    function readIntegrateState() {
+      try {
+        const raw = fs.readFileSync(portable(INTEGRATE_STATE_FILE), "utf8");
+        return JSON.parse(raw);
+      } catch (e) { return null; }
+    }
+    function writeIntegrateState(state) {
+      try {
+        fs.mkdirSync(MEMORY_ROOT.replace(/\//g, "/"), { recursive: true });
+        fs.writeFileSync(portable(INTEGRATE_STATE_FILE), JSON.stringify(state, null, 2), "utf8");
+      } catch (e) {
+        cwarn("[dsh-memory] 整合状态写入失败:", e && e.message ? e.message : String(e));
+      }
+    }
+
+    // 发起整合子代理（后台）：整合记忆 = 提升 sessions→projects/global、清理过时、去重、更新 index
+    async function spawnIntegrate(agentForParent, reason) {
+      const subagents = ctx.get("subagents");
+      if (!subagents || typeof subagents.start !== "function") {
+        cwarn("[dsh-memory] 自动整合：subagents 服务不可用，跳过");
+        return false;
+      }
+      let parent = agentForParent || (agentsBySession.size > 0 ? agentsBySession.values().next().value : null);
+      if (!parent || typeof parent !== "object") {
+        // 启动时序：session-start 可能还没触发，agentsBySession 未填充 → 延迟 30 秒重试一次
+        cwarn("[dsh-memory] 自动整合：无可用父 agent，30 秒后重试");
+        setTimeout(() => {
+          try {
+            const p2 = agentForParent || (agentsBySession.size > 0 ? agentsBySession.values().next().value : null);
+            if (p2 && typeof p2 === "object") {
+              spawnIntegrate(p2, reason);
+            } else {
+              cwarn("[dsh-memory] 自动整合：重试后仍无父 agent，本周期跳过");
+            }
+          } catch (e) {
+            cwarn("[dsh-memory] 自动整合重试异常:", e && e.message ? e.message : String(e));
+          }
+        }, 30000);
+        return false;
+      }
+      // v1.6.0：对标 mimocode DREAM_TASK —— 极简任务 + 只读最近信号（不穷举）+ 简报输出（省 token）
+      const promptText =
+        "Run one automatic memory consolidation pass for the current DSH memory library (~/.dsh/memory/).\n" +
+        "Consolidate only durable, verified information. Memory files are the working index.\n" +
+        "\nRules:\n" +
+        "1. Promote: cross-session repeated knowledge in sessions/ → projects/ or global.md (跨项目经验).\n" +
+        "2. Prune: sessions/ 当日文件保持 200-400 字要点+指向；过长的精简，细节归档 knowledge/。\n" +
+        "3. Dedup: merge repeated entries (精确字面量保留，不改写).\n" +
+        "4. Do NOT read every file exhaustively — prefer recent and repeated signals.\n" +
+        "5. Each file: read full content before edit (禁止局部读+整体覆写)；不更新时间戳行；只动 memory 目录。\n" +
+        "\nOutput brief summary only:\n" +
+        "- Consolidated: n entries added\n- Updated: n entries changed\n- Deleted: n entries removed\n- Skipped: reason if nothing changed\n- Health: memory size status";
+      try {
+        const run = await subagents.start("spawn", {
+          label: "dsh-memory-自动整合-" + reason,
+          prompt: [{ type: "text", text: promptText }],
+          parent: parent,
+          signal: new AbortController().signal,
+          toolFilter: { allow: ["read", "write", "edit", "grep", "glob", "memory_search"] }
+        });
+        run.result.then((result) => {
+          const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\\n");
+          clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+          if (outText.length > 0 && outText.length <= 600) {
+            clog("[dsh-memory] 整合报告: " + outText.replace(/\\n/g, " | "));
+          }
+          // 刷新起始时间：无论结果如何都刷新（避免卡在同一周期反复触发）
+          const st = readIntegrateState() || {};
+          st.lastIntegrateAt = Date.now();
+          writeIntegrateState(st);
+          clog("[dsh-memory] 下次自动整合：" + PLUGIN_CFG.integrateDays + " 天后");
+        }).catch((e) => {
+          cwarn("[dsh-memory] 自动整合子代理失败:", e && e.message ? e.message : String(e));
+        });
+        clog("[dsh-memory] 已发起自动整合子代理（" + reason + "，后台执行中）");
+        return true;
+      } catch (e) {
+        cwarn("[dsh-memory] 自动整合启动失败:", e && e.message ? e.message : String(e));
+        return false;
+      }
+    }
+
+    // 整合检查：到点且未整合过 → 发起
+    async function checkIntegrate() {
+      try {
+        const now = Date.now();
+        let st = readIntegrateState();
+        if (!st) {
+          // 首次：记录安装起始时间，不立即整合（给用户适应期，到 integrateDays 天后再触发）
+          st = { installAt: now, lastIntegrateAt: now };
+          writeIntegrateState(st);
+          clog("[dsh-memory] 自动整合已初始化（起始 " + new Date(now).toISOString().slice(0, 10) + "，每 " + PLUGIN_CFG.integrateDays + " 天一次）");
+          return;
+        }
+        if (!PLUGIN_CFG.integrateEnabled) return;
+        const due = now - (st.lastIntegrateAt || st.installAt || 0) >= PLUGIN_CFG.integrateDays * 86400000;
+        if (due) {
+          clog("[dsh-memory] 距上次整合已满 " + PLUGIN_CFG.integrateDays + " 天，触发自动整合");
+          await spawnIntegrate(null, "定期");
+        }
+      } catch (e) {
+        cwarn("[dsh-memory] 整合检查异常:", e && e.message ? e.message : String(e));
+      }
+    }
+
+    // 定时器：每小时检查一次（宿主常驻进程；fiber 清理时自动 dispose）
+    try {
+      checkIntegrate();
+      ctx.interval(() => { checkIntegrate(); }, 3600000);
+      clog("[dsh-memory] 自动整合定时器已启动（每 " + PLUGIN_CFG.integrateDays + " 天整合一次，每小时检查）");
+    } catch (e) {
+      cwarn("[dsh-memory] 自动整合定时器启动失败:", e && e.message ? e.message : String(e));
+    }
+
+    // v1.9.0：dispose 钩子 —— 插件关闭（DSH 退出/插件卸载）时 enabledAt 置 null。
+    // 下次启用重新实时获取；进程被强杀时无法触发，但下次启动覆盖 enabledAt=now 等价。
+    return () => {
+      try {
+        const st = readIntegrateState() || {};
+        st.enabledAt = null;
+        writeIntegrateState(st);
+        clog("[dsh-memory] 插件关闭，enabledAt 已置 null（下次启用重新计时）");
+      } catch (e) { /* 关闭时状态写入失败不影响 */ }
+    };
   }
 };

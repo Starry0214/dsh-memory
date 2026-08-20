@@ -57,6 +57,30 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 | `DSH_PROFILE` | `web` | 目标 profile |
 | `DSH_MEMORY_RAW` | GitHub raw | 插件文件下载源（可指向镜像） |
 
+### 插件可配置项（v1.3.0）
+
+配置优先走 **设置 → 通用设置 → 记忆**（存 `~/.dsh/settings.yaml` 的 `dsh-memory` 命名空间，需安装 client 半区）；
+也可在 `cordis.patch.yml` 的 `config:` 里配（作为默认层 base，settings.yaml 用户配置覆盖它）。
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `staleSessionDays` | `5` | 漏网会话检测阈值（天）：超过该天数无交互且未在记忆库落档的会话触发提醒 |
+| `staleAction` | `remind` | 漏网处理动作：`remind`=仅注入提醒（默认）| `silent`=后台静默子代理总结 | `approval`=经用户审批后子代理总结 |
+
+cordis.patch.yml 示例：
+```yaml
+- insert:
+    - id: dsh-memory
+      name: ./plugins/memory/index.js
+      config:
+        staleSessionDays: 7
+        staleAction: approval
+```
+
+client 半区（设置界面入口）安装：复制 `client/` 到 `<profile>/plugins/dsh-memory-client/`，建 junction
+`<profile>/profiles/node_modules/dsh-memory-client` → 它，并在 cordis.patch.yml 追加
+`- insert: { id: dsh-memory-client, name: 'dsh-memory-client' }`。
+
 安装完成后**重启 DSH**，启动日志出现以下行即成功：
 
 ```
@@ -133,6 +157,16 @@ compact 是上下文重置点，但记忆注入仍是会话开始快照（sessio
 ```
 
 ## 版本历史
+
+### v1.3.0（2026-08-20 · 合并发布：设置界面 + 漏网检测 + 自动整合 + 检索工具链完整版）
+
+- **官方设置机制**：宿主插件 import `@deepseek-ai/dsh-settings` 的 `installSettingsSection`，注册 `dsh-memory` 设置命名空间（schemastery schema）；cordis.patch.yml 的 `config:` 作 base 默认层，`settings.yaml` 用户配置覆盖，`setSource` 实时生效；
+- **client 半区**（`client/` 目录，独立包 `dsh-memory-client`）：声明 `dsh.client` + `exports['./client']`，DSH 前端自动加载手写 bundle（`window.__ModuleLoader__.load`），通过 `ctx.slots.inject('settings.general.item')` 在 **设置 → 通用设置 → 记忆** 注册配置行（漏网检测天数输入 + 动作下拉 remind/silent/approval），`ctx.settingsScope.bind` 读写宿主配置；无 client 半区时功能不受影响；
+- **漏网会话检测**：扫描 ~/.dsh/sessions/ 下久未交互（超过 staleSessionDays 天）且未在记忆库落档的会话，注入提醒供 review 归档——兜住"没压缩 + 没自觉总结 + 已归档"的记忆死角；可配置 staleSessionDays（默认 5 天）+ staleAction（remind 仅提醒 / silent 后台静默子代理 / approval 审批后子代理）；内容导向去重（会话 id 已落档则跳过），同实例只提醒一次；
+- **定期自动整合**（integrateEnabled，默认关闭）：以插件安装时间为起始，每 7 天整合一次全部记忆，触发后刷新缓存；
+- **漏网归档根治 token 爆炸**：不再让子代理读原始大日志，改为插件先提取每个会话的对话消息流（过滤注入/工具噪音，8000 字符截断），再以仿真级 compact（DSH 官方同款 8 节指令）让子代理产出检查点落盘；
+- **启用界限**：会话最后交互时间 < 插件最近启用时间（enabledAt）则跳过；enabledAt 由禁用→启用时刷新（与 DSH 启动解耦）；
+- **性能与可观测**：sessions 索引启动缓存 + 写入后刷新；控制台输出统一时间戳（[HH:MM:SS] [dsh-memory]）。
 
 ### v1.2.0（2026-08-18 · 压缩检查点自动落盘）
 
