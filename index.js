@@ -291,7 +291,7 @@ function normalizeCfg(raw) {
 }
 
 export default {
-  inject: ["fs", "timer"],
+  inject: ["fs", "timer", "commands"],
   apply(ctx, config) {
     // v1.4.0：设置机制 —— cordis.patch.yml config 作 base 默认层，settings.yaml 用户文档覆盖。
     // 手动 register 拿到宿主 scope（写只读统计 staleCount）；无 settings 服务时回退 cordis config。
@@ -1300,6 +1300,30 @@ export default {
       cwarn("[dsh-memory] 自动整合定时器启动失败:", e && e.message ? e.message : String(e));
     }
 
+    // v1.11.0：/dream 手动整合命令 —— 触发一次整合（复用 spawnIntegrate 全部历史整合），
+    // 与 7 天自动整合统一：手动跑完同样刷新 lastIntegrateAt，与自动周期协调不重复整合。
+    let dreamDisposer = null;
+    try {
+      if (ctx.commands && typeof ctx.commands.register === "function") {
+        dreamDisposer = ctx.commands.register({
+          name: "dream",
+          description: "手动触发一次记忆整合（对标 mimocode /dream）：扫描历史会话，把跨会话成立的决策/踩坑/规律归类提升到 global/projects 并精简超限文件。",
+          input: { hint: "/dream 无参数" },
+          handler: async (inv) => {
+            const started = await spawnIntegrate(inv.agent, "手动");
+            return started
+              ? { kind: "success", text: "已发起记忆整合（后台执行，完成后自动刷新下次自动整合时间）。" }
+              : { kind: "error", text: "整合启动失败（无可用父 agent 或 subagents 服务不可用），请稍后重试。" };
+          }
+        });
+        clog("[dsh-memory] /dream 手动整合命令已注册");
+      } else {
+        cwarn("[dsh-memory] commands 服务不可用，/dream 命令未注册");
+      }
+    } catch (e) {
+      cwarn("[dsh-memory] /dream 命令注册失败:", e && e.message ? e.message : String(e));
+    }
+
     // v1.9.0：dispose 钩子 —— 插件关闭（DSH 退出/插件卸载）时 enabledAt 置 null。
     // 下次启用重新实时获取；进程被强杀时无法触发，但下次启动覆盖 enabledAt=now 等价。
     return () => {
@@ -1309,6 +1333,7 @@ export default {
         writeIntegrateState(st);
         clog("[dsh-memory] 插件关闭，enabledAt 已置 null（下次启用重新计时）");
       } catch (e) { /* 关闭时状态写入失败不影响 */ }
+      try { if (dreamDisposer) dreamDisposer(); } catch (e) { /* 命令清理失败不影响 */ }
     };
   }
 };
