@@ -1,4 +1,4 @@
-// dsh-memory: 全局自动记忆插件 v1.3.0（合并发布版：漏网会话检测 + 设置界面配置 + 自动整合 + 消息流提取/仿真 compact + 控制台时间戳）
+// dsh-memory: 全局自动记忆插件 v1.4.0（v1.4.0: 设置界面配置（settings 命名空间 + client 半区）；v1.3.0: 漏网会话检测）
 // v1.1.0 新增（原 v12）：memory_search 检索质量升级（参考 mimocode MiMo-Code 记忆模块移植）
 //  - Unicode 分词 + OR 匹配：修复"OA日志" vs "日志填写"、"智检API" vs "REST API/推送"不命中
 //  - loadKnowledgeTargets 正则放宽：收录 tools/*.md（修复 记忆插件.md/dsh.md 永远搜不到）
@@ -104,9 +104,9 @@ function makeMessage(text) {
 }
 
 // v1.10.1：控制台输出统一时间戳（HH:MM:SS）。本文件内 console 调用已批量替换为 clog/cwarn/cerr。
-const clog = (...a) => globalThis.clog(ts(), ...a);
-const cwarn = (...a) => globalThis.cwarn(ts(), ...a);
-const cerr = (...a) => globalThis.cerr(ts(), ...a);
+const clog = (...a) => console.log(ts(), ...a);
+const cwarn = (...a) => console.warn(ts(), ...a);
+const cerr = (...a) => console.error(ts(), ...a);
 function ts() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
@@ -1197,18 +1197,47 @@ export default {
         }, 30000);
         return false;
       }
-      // v1.6.0：对标 mimocode DREAM_TASK —— 极简任务 + 只读最近信号（不穷举）+ 简报输出（省 token）
+      // v1.11.0：整合升级（对标 mimocode Dream）—— D3 归类分节+来源id、D4 容量上限+修剪、验证后写入
+      // 只读最近信号（不穷举）+ 简报输出（省 token）
       const promptText =
-        "Run one automatic memory consolidation pass for the current DSH memory library (~/.dsh/memory/).\n" +
-        "Consolidate only durable, verified information. Memory files are the working index.\n" +
-        "\nRules:\n" +
-        "1. Promote: cross-session repeated knowledge in sessions/ → projects/ or global.md (跨项目经验).\n" +
-        "2. Prune: sessions/ 当日文件保持 200-400 字要点+指向；过长的精简，细节归档 knowledge/。\n" +
-        "3. Dedup: merge repeated entries (精确字面量保留，不改写).\n" +
-        "4. Do NOT read every file exhaustively — prefer recent and repeated signals.\n" +
-        "5. Each file: read full content before edit (禁止局部读+整体覆写)；不更新时间戳行；只动 memory 目录。\n" +
-        "\nOutput brief summary only:\n" +
-        "- Consolidated: n entries added\n- Updated: n entries changed\n- Deleted: n entries removed\n- Skipped: reason if nothing changed\n- Health: memory size status";
+"Run one automatic memory consolidation pass for the current DSH memory library (~/.dsh/memory/).\n" +
+"Consolidate only durable, VERIFIED information. Memory files (sessions/ summaries) are the working index.\n" +
+"\n" +
+"## Sources\n" +
+"- Primary: sessions/*.md 摘要（尤其最近几天、跨会话反复出现的信号）.\n" +
+"- 只读最近/重复信号，不要穷举每个文件.\n" +
+"\n" +
+"## Consolidate (D3: 跨会话归类 + 保留来源)\n" +
+"把跨会话成立、值得长期保留的条目提升为精确分节，逐条保留来源会话（追加 [ses YYYY-MM-DD] 或 [ses <id>]）：\n" +
+"1. 跨项目通用（用户偏好/踩坑/方法论）→ global.md，按 必守/偏好/踩坑 小节归类.\n" +
+"2. 项目专属事实/决策 → projects/<项目名>.md，分节：\n" +
+"   - ## Rules（用户明示的项目级规则）\n" +
+"   - ## Architecture decisions（决策 + 绝对日期 YYYY-MM-DD + 理由）\n" +
+"   - ## Patterns（反复出现的问题与解决）\n" +
+"   - ## Gotchas（易踩的坑 / 陷阱）\n" +
+"   - ## Discovered durable knowledge（跨会话确证的事实）\n" +
+"3. 每条 1-3 行；合并重复条目（精确字面量：文号/路径/数字/命令逐字保留，绝不改写）；相对日期转 YYYY-MM-DD.\n" +
+"\n" +
+"## Verify (D3)\n" +
+"写提到的文件路径前用 glob、函数/类名前用 grep 核实存在；无法证实但合理的标 [unverified]；被新决定/新代码推翻的条目标记删除或移除.\n" +
+"\n" +
+"## Prune (D4: 容量上限 + 修剪过期)\n" +
+"1. global.md 字符数 < 3000 硬预算、index.md < 2000（软字节阈值以上仅告警，字符硬预算必须达标，否则注入被截断）——超了就精简冗余文字，不丢任何事实.\n" +
+"2. sessions/当日文件保持 200-400 字要点+指向，细节归档 knowledge/ 或对应 project 文件.\n" +
+"3. 移除：被新决定取代的条目、仅与单个会话相关不再成立的细节、与更强记忆重复的低信号条目.\n" +
+"4. 只精简/合并/修剪，不删除仍有价值的事实；删除前 [unverified] 或明确标注.\n" +
+"\n" +
+"## Discipline\n" +
+"- 每个文件 edit 前先 read 全量（禁止局部读+整体覆写）；不更新 global/index 的时间戳行（保前缀缓存）;\n" +
+"- 只动 ~/.dsh/memory/ 目录；不读/不依赖原始大日志;\n" +
+"- 保留 source session 引用便于追溯.\n" +
+"\n" +
+"## Output — brief summary only\n" +
+"- Consolidated: n entries added (按节列出)\n" +
+"- Updated: n entries changed\n" +
+"- Deleted: n entries removed\n" +
+"- Skipped: reason if nothing changed\n" +
+"- Health: global.md 字符/3000、index.md 字符/2000、sessions 每日字数大致范围";
       try {
         const run = await subagents.start("spawn", {
           label: "dsh-memory-自动整合-" + reason,
