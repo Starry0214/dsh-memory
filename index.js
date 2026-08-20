@@ -122,6 +122,8 @@ const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
 
 function findStaleSessions(maxAgeDays, afterTime) {
   const stale = [];
+  // v1.11.0：记忆暂停（active=false，afterTime 为 null）→ 不纳入任何漏网
+  if (afterTime === null) return stale;
   let wsDirs = [];
   try { wsDirs = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true }); } catch (e) { return stale; }
   const cutoff = Date.now() - maxAgeDays * 86400000;
@@ -207,20 +209,20 @@ function extractMessageFlow(filePath, maxChars) {
   } catch (e) { return null; }
 }
 
-// v1.6.1：插件最近启用时间界限（漏网检测过滤用）——
-// 读取状态文件 lastEnabledAt（最近一次 apply 启动时更新）；无则用 installAt，再无则当前时间。
-// 会话「最后交互时间」< lastEnabledAt → 不触发整合（含插件关闭期间结束的会话）。
-// v1.9.0 语义明确：enabledAt = 当前启用周期时间（插件启用时实时获取，关闭时置 null）。
-// 判定：会话最后交互 mtime >= enabledAt → 纳入漏网；< enabledAt（启用前/关闭期间结束）→ 跳过。
+// v1.11.0：记忆活跃界限（漏网检测过滤用）——
+// enabledAt 由记忆活跃开关 active 驱动，与 DSH 进程启停解耦：
+//   - active=true → enabledAt=上次启用周期时间（或安装时间），只整合此后交互的会话
+//   - active=false（用户显式暂停）→ enabledAt=null，不纳入任何漏网
+// 判定：会话最后交互 mtime >= enabledAt → 纳入漏网；< enabledAt → 跳过。
 function getEnabledAt() {
   try {
     const raw = fs.readFileSync(portable(INTEGRATE_STATE_FILE), "utf8");
     const st = JSON.parse(raw);
     if (st) {
-      // enabledAt 为数字（当前启用中）→ 用之
+      // enabledAt 为数字（记忆活跃中）→ 用之
       if (typeof st.enabledAt === "number" && st.enabledAt > 0) return st.enabledAt;
-      // enabledAt 为 null（上次关闭标记）→ 视为"刚启用"，返回当前时间（本次启用前的会话全部跳过）
-      if (st.enabledAt === null) return Date.now();
+      // enabledAt 为 null（记忆暂停，active=false）→ 返回 null：不纳入任何漏网
+      if (st.enabledAt === null) return null;
       // 老状态文件无 enabledAt 字段 → 兼容：读 lastEnabledAt/installAt
       if (typeof st.lastEnabledAt === "number" && st.lastEnabledAt > 0) return st.lastEnabledAt;
       if (st.installAt) return st.installAt;
@@ -259,7 +261,10 @@ function sessionMentionedInMemory(sessionId) {
 //  - staleSessionDays: 漏网会话检测阈值（天），默认 5
 //  - staleAction:      漏网处理动作，remind=仅注入提醒（默认）| silent=后台静默子代理总结 | approval=经用户审批后子代理总结
 // v1.7.1：默认 staleAction=remind（仅提醒，不自动 spawn 子代理——实测漏网归档子代理单会话可烧数百万 token）
-const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7 };
+const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true };
+// v1.11.0：active = 记忆活跃开关（独立于 DSH 进程启停）——
+// 用户显式关掉=记忆整合暂停（enabledAt 置空）；打开=重新启用（enabledAt 刷新为当前时间）。
+// DSH 重启/退出不再影响 enabledAt——「插件启停」与「DSH 进程启停」彻底解耦。
 // v1.6.0：整合/漏网状态文件（模块级，供 getInstallAt 等跨作用域使用）
 const INTEGRATE_STATE_FILE = MEMORY_ROOT + "/.integrate.json";
 let PLUGIN_CFG = { ...DEFAULT_CFG };
@@ -272,6 +277,8 @@ const SETTINGS_SCHEMA = z.object({
   // v1.5.0：定期自动整合（对标 mimocode AutoDream）
   integrateEnabled: z.boolean().default(false),          // 开关：每 integrateDays 天自动整合记忆（默认关闭，避免自动耗 token）
   integrateDays: z.number().min(1).max(90).default(7),   // 整合间隔（天）
+  // v1.11.0：记忆活跃开关（独立于 DSH 进程启停）——用户显式控制；DSH 重启不改变它
+  active: z.boolean().default(true),
   // 只读统计：漏网（未整合记忆）会话数量，由宿主在检测后写入；非用户编辑项
   // schemastery 对象字段默认可选；required(false) 显式标注
   staleCount: z.number().min(0).required(false)
@@ -287,6 +294,7 @@ function normalizeCfg(raw) {
     cfg.staleAction = "remind";
   }
   if (!(cfg.staleSessionDays >= 1 && cfg.staleSessionDays <= 90)) cfg.staleSessionDays = DEFAULT_CFG.staleSessionDays;
+  if (typeof cfg.active !== "boolean") cfg.active = DEFAULT_CFG.active;
   return cfg;
 }
 
@@ -296,19 +304,27 @@ export default {
     // v1.4.0：设置机制 —— cordis.patch.yml config 作 base 默认层，settings.yaml 用户文档覆盖。
     // 手动 register 拿到宿主 scope（写只读统计 staleCount）；无 settings 服务时回退 cordis config。
     PLUGIN_CFG = normalizeCfg(config);
-    // v1.9.1 修正：enabledAt 与 DSH 启动解耦——
-    // 只在「插件从禁用变启用」时更新（首次安装 / 从 cordis.patch.yml 恢复；dispose 置 null 后重新加载）。
-    // 持续启用期间（多次 DSH 启动）enabledAt 保持不变，漏网检测覆盖整个启用周期。
+    // v1.11.0：enabledAt 与 DSH 进程启停彻底解耦——
+    // DSH 重启/退出不再影响 enabledAt（dispose 不再置 null）。
+    // enabledAt 只由「记忆活跃开关 active」驱动：
+    //   - active=true 且已有 enabledAt → 保持（DSH 重启多少次都不动）
+    //   - active=true 且无 enabledAt（首次安装/历史残留）→ 设为 installAt
+    //   - active=false（用户显式暂停记忆）→ enabledAt 置空（不纳入漏网）
     try {
       const now = Date.now();
       const st = readIntegrateState() || { installAt: now, lastIntegrateAt: 0 };
       if (!st.installAt) st.installAt = now;
-      const wasEnabled = typeof st.enabledAt === "number" && st.enabledAt > 0;
-      if (!wasEnabled) {
-        st.enabledAt = now;  // 重新启用（首次或从禁用恢复）
-        clog("[dsh-memory] 插件已启用，enabledAt=" + new Date(st.enabledAt).toISOString().slice(0, 19) + "（启用前会话不触发整合）");
+      // 用户显式暂停记忆：enabledAt 置空，漏网不纳入
+      if (PLUGIN_CFG.active === false) {
+        st.enabledAt = null;
+        clog("[dsh-memory] 记忆活跃开关已关，enabledAt 置空（记忆整合暂停）");
+      } else if (!(typeof st.enabledAt === "number" && st.enabledAt > 0)) {
+        // active=true 且无有效 enabledAt → 设 installAt（首次安装/历史残留），与进程启停无关
+        st.enabledAt = st.installAt;
+        clog("[dsh-memory] 记忆整合启用，enabledAt=安装时间 " + new Date(st.enabledAt).toISOString().slice(0, 19) + "（覆盖安装以来所有会话）");
       } else {
-        clog("[dsh-memory] 插件持续启用中，enabledAt 保持 " + new Date(st.enabledAt).toISOString().slice(0, 19) + "（不随 DSH 启动刷新）");
+        // active=true 且已有 enabledAt → 保持，不随 DSH 启动刷新
+        clog("[dsh-memory] 记忆整合持续启用中，enabledAt 保持 " + new Date(st.enabledAt).toISOString().slice(0, 19) + "（不随 DSH 启动刷新）");
       }
       delete st.lastEnabledAt;  // 旧字段清理
       writeIntegrateState(st);
@@ -325,8 +341,24 @@ export default {
           PLUGIN_CFG = normalizeCfg(HOST_SETTINGS_SCOPE.get());
           HOST_SETTINGS_SCOPE.watch(() => {
             const next = HOST_SETTINGS_SCOPE.get();
+            const prev = { ...PLUGIN_CFG };
             PLUGIN_CFG = normalizeCfg(next);
-            clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction);
+            // v1.11.0：active 开关变化驱动 enabledAt（用户显式，独立于 DSH 启停）
+            try {
+              const st = readIntegrateState() || {};
+              const prevActive = (typeof prev.active === "boolean") ? prev.active : DEFAULT_CFG.active;
+              if (prevActive !== PLUGIN_CFG.active) {
+                if (PLUGIN_CFG.active === false) {
+                  st.enabledAt = null;  // 用户显式暂停记忆
+                  clog("[dsh-memory] 记忆活跃开关已关，enabledAt 置空（记忆整合暂停）");
+                } else {
+                  st.enabledAt = Date.now();  // 用户显式重新启用：刷新界限
+                  clog("[dsh-memory] 记忆活跃开关已开，enabledAt 刷新=" + new Date(st.enabledAt).toISOString().slice(0, 19) + "（此后交互会话纳入漏网）");
+                }
+                writeIntegrateState(st);
+              }
+            } catch (e) { /* 开关切换失败不影响配置 */ }
+            clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction + ", active=" + PLUGIN_CFG.active);
           });
           clog("[dsh-memory] 设置命名空间已注册（settings.yaml 可配置，设置界面可改）");
         } catch (e) {
@@ -1324,15 +1356,11 @@ export default {
       cwarn("[dsh-memory] /dream 命令注册失败:", e && e.message ? e.message : String(e));
     }
 
-    // v1.9.0：dispose 钩子 —— 插件关闭（DSH 退出/插件卸载）时 enabledAt 置 null。
-    // 下次启用重新实时获取；进程被强杀时无法触发，但下次启动覆盖 enabledAt=now 等价。
+    // v1.11.0：dispose 钩子 —— 不再置空 enabledAt！
+    // DSH 退出/重启会触发 dispose，但「插件启停」已与「DSH 进程启停」解耦：
+    // enabledAt 只由记忆活跃开关 active 驱动（settings watch 处理），DSH 退出不改变它。
+    // dispose 只清理 /dream 命令注册，避免重复注册冲突。
     return () => {
-      try {
-        const st = readIntegrateState() || {};
-        st.enabledAt = null;
-        writeIntegrateState(st);
-        clog("[dsh-memory] 插件关闭，enabledAt 已置 null（下次启用重新计时）");
-      } catch (e) { /* 关闭时状态写入失败不影响 */ }
       try { if (dreamDisposer) dreamDisposer(); } catch (e) { /* 命令清理失败不影响 */ }
     };
   }
