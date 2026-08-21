@@ -1,3 +1,4 @@
+// v1.12.4-client: pad hoisted, lineHeight 22px, overflowWrap break-word
 window.__ModuleLoader__.load({
 	id: "dsh-memory-client",
 	factory: (require) => {
@@ -143,9 +144,14 @@ window.__ModuleLoader__.load({
 						onChange: (e) => setMonitorEnabled(e.target.checked)
 					})
 				),
-				// 行：监控统计（只读汇总）
-				itemRow("记忆使用统计",
-					react.createElement("span", { style: { fontSize: "13px", lineHeight: "22px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", overflowWrap: "break-word" } }, monitorSummary || "暂无统计（使用记忆/触发提醒后更新）")
+				// 行：监控统计（只读汇总）—— 垂直布局（label 在上、内容在下），避免横向 flex 挤压重叠
+				react.createElement("div", { style: rowStyle },
+					react.createElement("div", { style: { width: "100%" } },
+						react.createElement("div", { style: labelStyle }, "记忆使用统计"),
+						react.createElement("div", { style: { fontSize: "13px", lineHeight: "22px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", overflowWrap: "break-word", marginTop: "4px" } },
+							monitorSummary || "暂无统计（使用记忆/触发提醒后更新）"
+						)
+					)
 				)
 			);
 		}
