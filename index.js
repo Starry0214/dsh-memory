@@ -245,6 +245,7 @@ let MONITOR_HINT_OPEN_COUNT = 0;   // 提醒后的工具调用计数
 let MONITOR_LAST_SUMMARY = "";     // v1.12.6: 上次推送的汇总串（内容不变不重复推送）
 let MONITOR_LAST_PUSH_AT = 0;      // v1.12.6: 上次推送时间戳（60s 节流，防高频工具调用刷屏）
 let MONITOR_PUSH_TIMER = null;     // v1.12.6: 节流到期补推定时器
+let MONITOR_LAST_LOG_SIG = "";     // v1.12.7: 上次打日志的"有意义变化"签名（不含纯事件数增长）
 
 function defaultMonitorData() {
   return { version: 1, installedAt: Date.now(), updatedAt: Date.now(),
@@ -342,7 +343,12 @@ function updateMonitorSummary() {
     MONITOR_LAST_PUSH_AT = nowMs;
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-      clog("[dsh-memory] 推送监控汇总: " + s.split("\n")[0] + " …");
+      // v1.12.7：仅"有意义变化"（提醒/查询/跟进/领域变化）才打日志，纯事件数增长静默推送；日志输出完整多行内容
+      const logSig = s.split("\n").filter((l) => l.indexOf("累计") !== 0).join(" ⏎ ");
+      if (logSig !== MONITOR_LAST_LOG_SIG) {
+        MONITOR_LAST_LOG_SIG = logSig;
+        clog("[dsh-memory] 推送监控汇总:\n" + s);
+      }
       Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ monitorSummary: s }))
         .then(() => clog("[dsh-memory] 监控汇总推送成功"))
         .catch((err) => cwarn("[dsh-memory] 监控汇总推送失败:", err && err.message ? err.message : String(err)));
@@ -362,10 +368,12 @@ function monitorHintA(domainName) {
   monitorEvent("hintA", { domain: domainName || "?", time: Date.now() });
 }
 
-// B/C 类提醒：记录
+// B/C 类提醒：记录 + 打开跟随判定窗口（v1.12.7：此前只对 A 开窗，跟进率只反映 A 类失真）
 function monitorHintBC(type) {
   const d = readMonitorData();
   d.hints[type] = (d.hints[type] || 0) + 1;
+  MONITOR_HINT_OPEN = { type: type };
+  MONITOR_HINT_OPEN_COUNT = 0;
   monitorEvent("hint" + type, { time: Date.now() });
 }
 
