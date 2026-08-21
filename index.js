@@ -345,13 +345,15 @@ function updateMonitorSummary() {
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
       // v1.12.7：仅"有意义变化"（提醒/查询/跟进/领域变化）才打日志，纯事件数增长静默推送；日志输出完整多行内容
+      let didLog = false;  // v1.12.9：本次是否打了内容日志（成功回执与之同条件）
       const logSig = s.split("\n").filter((l) => l.indexOf("累计") !== 0).join(" ⏎ ");
       if (logSig !== MONITOR_LAST_LOG_SIG) {
         MONITOR_LAST_LOG_SIG = logSig;
+        didLog = true;
         clog("[dsh-memory] 推送监控汇总:\n" + s);
       }
       Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ monitorSummary: s }))
-        .then(() => clog("[dsh-memory] 监控汇总推送成功"))
+        .then(() => { if (didLog) clog("[dsh-memory] 监控汇总推送成功"); })  // v1.12.9：静默推送完全无声
         .catch((err) => cwarn("[dsh-memory] 监控汇总推送失败:", err && err.message ? err.message : String(err)));
     } else {
       clog("[dsh-memory] 监控汇总未推送: scope=" + (HOST_SETTINGS_SCOPE ? String(typeof HOST_SETTINGS_SCOPE.update) : "null"));
