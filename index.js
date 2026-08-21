@@ -317,7 +317,8 @@ function updateMonitorSummary() {
       " 记忆查询:" + d.queries +
       (followRate !== null ? " 跟进率:" + followRate + "%" : "") +
       (topDomains ? " 高频领域:" + topDomains : "") +
-      "（累计事件 " + eventN + " · 更新 " + updTxt + "）";
+      "（累计事件 " + eventN + " · 更新 " + updTxt + "）\n" +
+      "A=命中领域关键词，先查记忆再动手 · B=同一错误第2次，提醒立即查 · C=连续失败3次，强制查记忆+skill";
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
       HOST_SETTINGS_SCOPE.update({ monitorSummary: s }).catch(() => {});
