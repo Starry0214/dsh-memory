@@ -103,12 +103,13 @@ function makeMessage(text) {
 }
 
 // v1.10.1：控制台输出统一时间戳（HH:MM:SS）。本文件内 console 调用已批量替换为 clog/cwarn/cerr。
+// v1.12.4：pad 提升为模块级（原来只在 ts() 内部，updateMonitorSummary 引用时报 pad is not defined，监控统计推送从未生效）
+const pad = (n) => String(n).padStart(2, "0");
 const clog = (...a) => console.log(ts(), ...a);
 const cwarn = (...a) => console.warn(ts(), ...a);
 const cerr = (...a) => console.error(ts(), ...a);
 function ts() {
   const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
   return "[" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) + "]";
 }
 
@@ -321,9 +322,14 @@ function updateMonitorSummary() {
       "A=命中领域关键词，先查记忆再动手 · B=同一错误第2次，提醒立即查 · C=连续失败3次，强制查记忆+skill";
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-      HOST_SETTINGS_SCOPE.update({ monitorSummary: s }).catch(() => {});
+      clog("[dsh-memory] 推送监控汇总: " + s.slice(0, 48) + "…");
+      Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ monitorSummary: s }))
+        .then(() => clog("[dsh-memory] 监控汇总推送成功"))
+        .catch((err) => cwarn("[dsh-memory] 监控汇总推送失败:", err && err.message ? err.message : String(err)));
+    } else {
+      clog("[dsh-memory] 监控汇总未推送: scope=" + (HOST_SETTINGS_SCOPE ? String(typeof HOST_SETTINGS_SCOPE.update) : "null"));
     }
-  } catch (e) { /* 汇总失败忽略 */ }
+  } catch (e) { cwarn("[dsh-memory] updateMonitorSummary 异常:", e && e.message ? e.message : String(e)); }
 }
 
 // A 类提醒：记录 + 打开跟随判定窗口
