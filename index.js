@@ -1040,6 +1040,7 @@ export default {
         "4. 落盘（你是唯一写入者）：目标 ~/.dsh/memory/sessions/<会话归属日期>.md（今天 = " + todayStr + "；归属日期从消息流内容推断，推断不出用最后交互日）或 projects/ 对应文件。纪律：先 read 目标文件全量 → edit 锚定追加，禁止局部读+整体覆写；小节标题「## 漏网会话补档（" + todayStr + " 归档）」内「### <会话短id>（一句话主题）」；每会话 3-6 条要点，精确字面量（文号/路径/命令/参数/报错串/数值）逐字保留绝不概括改写；与已有归档重叠时只记增量并标注。\n" +
         "5. 最终输出归档报告：逐会话一行（写入文件+小节+大致字符数，或跳过原因）。不要复述摘要全文。\n";
       const label = "dsh-memory-漏网归档-" + flowSessions.length + "会话";
+      const startedAt = Date.now();
       try {
         const spawnOpts = {
           label: label,
@@ -1053,6 +1054,11 @@ export default {
         run.result.then((result) => {
           const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
           clog("[dsh-memory] 漏网归档完成: " + label + "（stopReason=" + result.stopReason + "，报告 " + outText.length + " 字符）");
+          const sdir2 = findNewestSpawnedSession(startedAt);
+          if (sdir2) {
+            const u2 = summarizeSubagentUsage(sdir2);
+            if (u2) clog("[dsh-memory] 归档消耗: 输入 " + u2.input + " | 输出 " + u2.output + " | 缓存命中 " + u2.cache + " | 推理 " + u2.reasoning + " tokens | 总时长 " + u2.durMin + " 分钟");
+          }
           if (outText.length > 0 && outText.length <= 1200) {
             clog("[dsh-memory] 归档报告:\n" + outText);
           }
@@ -1630,6 +1636,58 @@ ctx.on("session/event", (session, event) => {
     }
 
     // 发起整合子代理（后台）：整合记忆 = 提升 sessions→projects/global、清理过时、去重、更新 index
+    // v1.12.12：定位窗口期内新创建的子代理会话目录（裸 UUID = spawn 产物）
+    function findNewestSpawnedSession(startedAt) {
+      try {
+        let best = null;
+        for (const ws of fs.readdirSync(SESSIONS_ROOT)) {
+          const wsd = SESSIONS_ROOT + "/" + ws;
+          let sts; try { sts = fs.readdirSync(wsd); } catch (e) { continue; }
+          for (const sid of sts) {
+            if (/^session-/.test(sid)) continue;
+            const dir = wsd + "/" + sid;
+            let st; try { st = fs.statSync(dir); } catch (e) { continue; }
+            if (st.birthtimeMs >= startedAt - 3000 && (!best || st.birthtimeMs > best.bt)) best = { dir: dir, bt: st.birthtimeMs };
+          }
+        }
+        return best ? best.dir : null;
+      } catch (e) { return null; }
+    }
+
+    // v1.12.12：统计子代理会话消耗（多帧解压 jsonl.zstd，累计 usage chunks + turn 时长）
+    function summarizeSubagentUsage(sessionDir) {
+      try {
+        const zpath = sessionDir + "/session.jsonl.zstd";
+        if (!fs.existsSync(zpath)) return null;
+        const buf = fs.readFileSync(zpath);
+        let out = Buffer.alloc(0), off = 0;
+        const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+        while (off < buf.length) {
+          const frame = zlib.zstdDecompressSync(buf.subarray(off));
+          out = Buffer.concat([out, frame]);
+          let next = -1;
+          for (let i = off + 4; i < buf.length - 3; i++) {
+            if (buf[i] === MAGIC[0] && buf[i+1] === MAGIC[1] && buf[i+2] === MAGIC[2] && buf[i+3] === MAGIC[3]) { next = i; break; }
+          }
+          if (next < 0) break;
+          off = next;
+        }
+        let inT = 0, outT = 0, cacheT = 0, reasonT = 0, t0 = 0, t1 = 0;
+        for (const line of out.toString("utf8").split("\n")) {
+          if (line.indexOf("\"usage\"") < 0 && line.indexOf("turn/") < 0) continue;
+          let j; try { j = JSON.parse(line); } catch (e) { continue; }
+          if (j.type === "assistant/chunk" && j.data && j.data.chunk && j.data.chunk.type === "usage") {
+            const u = j.data.chunk.usage || {};
+            inT += u.inputTokens || 0; outT += u.outputTokens || 0;
+            cacheT += u.cacheReadTokens || 0; reasonT += u.reasoningTokens || 0;
+          }
+          if (j.type === "turn/start") t0 = j.time;
+          if (j.type === "turn/end") t1 = j.time;
+        }
+        return { input: inT, output: outT, cache: cacheT, reasoning: reasonT, durMin: t1 > t0 ? Math.round((t1 - t0) / 60000 * 10) / 10 : 0 };
+      } catch (e) { return null; }
+    }
+
     async function spawnIntegrate(agentForParent, reason) {
       const subagents = ctx.get("subagents");
       if (!subagents || typeof subagents.start !== "function") {
@@ -1684,7 +1742,18 @@ ctx.on("session/event", (session, event) => {
 "3. 移除：被新决定取代的条目、仅与单个会话相关不再成立的细节、与更强记忆重复的低信号条目.\n" +
 "4. 只精简/合并/修剪，不删除仍有价值的事实；删除前 [unverified] 或明确标注.\n" +
 "\n" +
-"## Discipline\n" +
+"## Runtime Environment (run_code)\n" +
+"- run_code 是 ESM worker：没有 require、不能写顶层 import 语句；用 `const fsMod = await import('fs'); const fs = fsMod.default || fsMod;`（path 同理).\n" +
+"- `process` 全局可用；process.env 可能受限，不要靠 env 推导路径——记忆库根固定为 ~/.dsh/memory/.\n" +
+"\n" +
+"## Write Path\n" +
+"- write/edit 工具受工作区沙箱限制（~/.dsh 在外）→ 对记忆库的读写一律用 run_code 的 node:fs 直读直写.\n" +
+"- 字符串 replace 补丁前先确认目标尾部有无换行符（无尾换行是最常见失败原因）.\n" +
+"\n" +
+"## Efficiency\n" +
+"- 写入前先在内存拼好完整内容并量字符数（尤其 index.md <2000 上限），一次写对，避免写完再反复修剪.\n" +
+"- 不要花步骤试探运行时能力——本节已给出全部事实.\n" +
+"\n" +
 "- 每个文件 edit 前先 read 全量（禁止局部读+整体覆写）；不更新 global/index 的时间戳行（保前缀缓存）;\n" +
 "- 只动 ~/.dsh/memory/ 目录；不读/不依赖原始大日志;\n" +
 "- 保留 source session 引用便于追溯.\n" +
@@ -1695,6 +1764,7 @@ ctx.on("session/event", (session, event) => {
 "- Deleted: n entries removed\n" +
 "- Skipped: reason if nothing changed\n" +
 "- Health: global.md 字符/3000、index.md 字符/2000、sessions 每日字数大致范围";
+      const startedAt = Date.now();
       try {
         const run = await subagents.start("spawn", {
           label: "dsh-memory-自动整合-" + reason,
@@ -1706,6 +1776,11 @@ ctx.on("session/event", (session, event) => {
         run.result.then((result) => {
           const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\\n");
           clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+          const sdir = findNewestSpawnedSession(startedAt);
+          if (sdir) {
+            const u = summarizeSubagentUsage(sdir);
+            if (u) clog("[dsh-memory] 整合消耗: 输入 " + u.input + " | 输出 " + u.output + " | 缓存命中 " + u.cache + " | 推理 " + u.reasoning + " tokens | 总时长 " + u.durMin + " 分钟");
+          }
           if (outText.length > 0 && outText.length <= 600) {
             clog("[dsh-memory] 整合报告: " + outText.replace(/\\n/g, " | "));
           }
