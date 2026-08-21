@@ -1,4 +1,4 @@
-// dsh-memory: 全局自动记忆插件 v1.4.0（v1.4.0: 设置界面配置（settings 命名空间 + client 半区）；v1.3.0: 漏网会话检测）
+// dsh-memory: 全局自动记忆插件 v1.12.0（v1.12.0: 自动提醒查记忆/查 skill——A/B/C 判据插件化；v1.11.0: /dream 命令 + active 开关 + 整合升级；v1.4.0: 设置界面）
 // v1.1.0 新增（原 v12）：memory_search 检索质量升级（参考 mimocode MiMo-Code 记忆模块移植）
 //  - Unicode 分词 + OR 匹配：修复"OA日志" vs "日志填写"、"智检API" vs "REST API/推送"不命中
 //  - loadKnowledgeTargets 正则放宽：收录 tools/*.md（修复 记忆插件.md/dsh.md 永远搜不到）
@@ -9,7 +9,6 @@
 //  - 移除硬编码 C:/Users/Starry 绝对路径，改用 homedir() + 环境变量推导：
 //    DSH_HOME 默认 <homedir>/.dsh，可用环境变量 DSH_HOME / DSH_MEMORY_ROOT / DSH_MEMORY_BACKUP_ROOT 覆盖。
 //  - 便于开源分发：任何用户克隆后按 README 安装即可，无需改代码。
-// v10.5 修复：session/event 处理器内同步 agent.inject 导致 "session append cannot reenter" 重入异常
 // v10.5 修复：session/event 处理器内同步 agent.inject 导致 "session append cannot reenter" 重入异常
 //  - 根因：compaction/summary 的 session.append 在发布窗口（appending=true）内同步派发 session/event；
 //    而 agent.inject 会经 Inbox.mutate 同步 append 'agent/inbox/spliced'（dsh-agent/types/inbox.js:149）→ 重入冲突抛异常。
@@ -119,6 +118,72 @@ function ts() {
 // 判定"漏网"：会话创建于启用之后 + 最后一次写入距今超过阈值 + 未在记忆库落档
 const STALE_NOTIFIED = new Set();  // 本实例内已提醒过的会话 id（防多会话重复提醒）
 const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
+
+// v1.12.0：自动提醒查记忆/查 skill（判断 A/B/C 插件化）——
+// 不靠模型自觉，插件在 pre-step/request-error 事件里量化判断触发条件，命中才注入提醒。
+// 关键词表从 index.md 自动提取（零维护）：解析 "名称 → 文件.md（描述）" 行 → 名称+描述词 = 匹配关键词。
+let MEMORY_HINT_TABLE = null;            // 懒加载：[{keywords:[...], file:"MEMORY-*.md", domain:"领域名"}]
+let MEMORY_HINT_TABLE_MTIME = 0;         // 缓存 index.md 的 mtime，变化才重建
+const MEMORY_HINT_THROTTLE = new Map();  // sessionId -> 上次 A 类提醒时间（30 分钟节流）
+const MEMORY_HINT_ERRORS = new Map();    // sessionId -> Map<签名, 次数>（B/C 判断）
+
+// 从 index.md 自动提取"领域→记忆文件→关键词"匹配表
+function buildMemoryHintTable() {
+  try {
+    const p = portable(MEMORY_ROOT + "/index.md");
+    const st = fs.statSync(p);
+    if (MEMORY_HINT_TABLE && st.mtimeMs === MEMORY_HINT_TABLE_MTIME) return MEMORY_HINT_TABLE;
+    const text = fs.readFileSync(p, "utf8");
+    const rows = [];
+    for (const line of text.split("\n")) {
+      const m = line.match(/^-\s*(.+?)\s*→\s*(MEMORY-[^\s（(]+|[^\s（(]+\.md)\s*（([^）]*)）?/);
+      if (!m) continue;
+      const name = m[1].trim();
+      const file = m[2].trim();
+      const desc = (m[3] || "").trim();
+      const keywords = new Set();
+      for (const part of [name, ...desc.split(/[/、,，;；\s]+/).filter(Boolean)]) {
+        if (part.length >= 2) keywords.add(part);
+      }
+      rows.push({ keywords, file, name });
+    }
+    MEMORY_HINT_TABLE = rows;
+    MEMORY_HINT_TABLE_MTIME = st.mtimeMs;
+    if (rows.length > 0) clog("[dsh-memory] 记忆提醒关键词表已加载（" + rows.length + " 个记忆文件映射，来源 index.md）");
+    return rows;
+  } catch (e) {
+    return MEMORY_HINT_TABLE || [];
+  }
+}
+
+// 从用户消息文本提取纯文本（ContentBlock[] → string）
+function hintTextOf(messages) {
+  const parts = [];
+  for (const msg of messages || []) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    for (const b of msg.content) {
+      if (b && b.type === "text" && typeof b.text === "string") parts.push(b.text);
+    }
+  }
+  return parts.join("\n").slice(0, 2000);  // 只取前 2000 字符匹配（足够判断领域）
+}
+
+// 匹配：返回命中的记忆映射列表（限 top 3）
+function matchMemoryHints(userText) {
+  if (!userText) return [];
+  const table = buildMemoryHintTable();
+  const hits = [];
+  for (const row of table) {
+    for (const kw of row.keywords) {
+      if (userText.includes(kw)) {
+        hits.push(row);
+        break;
+      }
+    }
+    if (hits.length >= 3) break;
+  }
+  return hits;
+}
 
 function findStaleSessions(maxAgeDays, afterTime) {
   const stale = [];
@@ -299,7 +364,7 @@ function normalizeCfg(raw) {
 }
 
 export default {
-  inject: ["fs", "timer", "commands"],
+  inject: ["fs", "timer", "commands", "skills"],
   apply(ctx, config) {
     // v1.4.0：设置机制 —— cordis.patch.yml config 作 base 默认层，settings.yaml 用户文档覆盖。
     // 手动 register 拿到宿主 scope（写只读统计 staleCount）；无 settings 服务时回退 cordis config。
@@ -969,8 +1034,84 @@ export default {
       })();
     });
 
-        // v6+v9：压缩检查点 —— 捕获 compaction/summary，改为注入提醒由模型落盘（插件零写入）
-    ctx.on("session/event", (session, event) => {
+    // v1.12.0：自动提醒查记忆/查 skill（判断 A）——
+    // agent/pre-step 每轮模型请求前触发，payload 含 messages（用户消息）。命中已知领域 → 注入提醒。
+    // waterfall 语义：必须 await next() 保持链路；判断极轻（内存 Set includes）；节流防刷屏。
+    ctx.on("agent/pre-step", async ({ agent, messages, step, signal }, next) => {
+      try {
+        const decision = await next();
+        // 判断 A：只在每轮第一条用户消息（step 1）做，命中已知领域才提醒
+        if (step !== 1 || !agent || typeof agent.inject !== "function") return decision;
+        const sid = (agent.session && agent.session.id) || "?";
+        // 节流：每会话每 3 次用户输入提醒 1 次（计数器，非时间）
+        const c3 = (MEMORY_HINT_THROTTLE.get(sid) || 0) + 1;
+        MEMORY_HINT_THROTTLE.set(sid, c3);
+        if (c3 % 3 !== 0) return decision;
+        const userText = hintTextOf(messages);
+        if (!userText) return decision;
+        // 记忆命中才继续（不命中不提示、不查 skill）
+        const memHits = matchMemoryHints(userText);
+        if (memHits.length === 0) return decision;
+        // 记忆命中 → 顺便查相关 skill（只在命中记忆时提示，避免误提醒）
+        const skillHits = [];
+        try {
+          const skills = await ctx.skills.list();
+          const words = userText.match(/[A-Za-z]{3,}|[\u4e00-\u9fff]{2,}/g) || [];
+          for (const s of skills || []) {
+            const hay = ((s.name || "") + " " + (s.description || "") + " " + (s.whenToUse || "")).toLowerCase();
+            for (const w of words.slice(0, 12)) {
+              if (w.length >= 2 && hay.includes(w.toLowerCase())) { skillHits.push(s.name); break; }
+            }
+            if (skillHits.length >= 3) break;
+          }
+        } catch (e) { /* skills 服务不可用则只给记忆提示 */ }
+
+        // 组装提醒：记忆命中为必须，skill 命中为附带
+        const memLines = memHits.map(h => "- 记忆: memory_search " + JSON.stringify(h.name) + "（" + h.file + "，踩坑/现成脚本/约定）").join("\n");
+        const skillLines = skillHits.length > 0 ? "\n" + skillHits.map(s => "- skill: 技能目录加载 " + s + "（SKILL.md）").join("\n") : "";
+        const hintText = "<system-reminder>\n【dsh-memory 提示】此任务可能涉及已知领域，建议先查再动手：\n" + memLines + skillLines + "\n（纯读零成本；若无关可忽略本条）\n</system-reminder>";
+        // setTimeout(0) 推迟注入，避免 pre-step 窗口内重入
+        setTimeout(() => { try { agent.inject(makeMessage(hintText)); } catch (e) {} }, 0);
+        return decision;
+      } catch (e) {
+        return next ? await next() : undefined;
+      }
+    });
+ctx.on("tools/result", (exec, result) => {
+      // v1.12.0：判断 B/C —— 工具执行失败（isError=true）时按错误签名计数，触发提醒
+      try {
+        if (!exec || !result || !result.isError) return;
+        const agent = exec.agent;
+        if (!agent || typeof agent.inject !== "function") return;
+        const sid = (agent.session && agent.session.id) || "?";
+        // 错误文本：优先 result.content 文本块，回退 JSON 序列化
+        let raw = "";
+        if (Array.isArray(result.content)) {
+          raw = result.content.filter(b => b && b.type === "text" && typeof b.text === "string").map(b => b.text).join(" ");
+        }
+        if (!raw) { try { raw = JSON.stringify(result.value || result).slice(0, 300); } catch (e) { raw = "tool-error"; } }
+        raw = raw.slice(0, 150);
+        if (!raw.trim()) return;
+        // 错误签名：去数字/时间戳/空格噪音
+        const sig = raw.replace(/\d+/g, "N").replace(/\s+/g, " ").trim();
+        if (!sig) return;
+        let counts = MEMORY_HINT_ERRORS.get(sid);
+        if (!counts) { counts = new Map(); MEMORY_HINT_ERRORS.set(sid, counts); }
+        const c = (counts.get(sig) || 0) + 1;
+        counts.set(sig, c);
+        if (counts.size > 50) { for (const k of counts.keys()) { if (counts.get(k) < c) counts.delete(k); } }
+        if (c === 2) {
+          // 判断 B：同一错误第 2 次 → 建议查
+          const hint = "<system-reminder>\n【dsh-memory 提示】工具报错重复出现（" + raw.slice(0, 80) + "）——大概率是以前踩过的坑。建议先 memory_search 搜该错误串 + 技能目录查相关 skill，再继续。\n</system-reminder>";
+          setTimeout(() => { try { agent.inject(makeMessage(hint)); } catch (e) {} }, 0);
+        } else if (c === 3) {
+          // 判断 C：同一错误第 3 次 → 强制建议查
+          const hint = "<system-reminder>\n【dsh-memory 提示】同一工具错误已连续出现 3 次且未见根因——暂停硬试，强制建议：memory_search 搜该错误串 + 加载相关 skill（记忆里有踩坑记录大概率直接给出解法）。\n</system-reminder>";
+          setTimeout(() => { try { agent.inject(makeMessage(hint)); } catch (e) {} }, 0);
+        }
+      } catch (e) { /* 错误统计失败不影响会话 */ }
+    });
+ctx.on("session/event", (session, event) => {
       try {
         if (!event || event.type !== "compaction/summary") return;
         // 只处理顶层主会话（排除子代理）——v10.3 改查 header.origin，多主会话都归档
