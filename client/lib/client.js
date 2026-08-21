@@ -19,6 +19,8 @@ window.__ModuleLoader__.load({
 					integrateEnabled: false,
 					integrateDays: 7,
 					staleCount: 0,
+					monitorEnabled: true,
+					monitorSummary: "",
 					revision: -1,
 					status: "loading"
 				}),
@@ -30,6 +32,8 @@ window.__ModuleLoader__.load({
 						if (typeof next.integrateEnabled === "boolean") d.integrateEnabled = next.integrateEnabled;
 						if (typeof next.integrateDays === "number") d.integrateDays = next.integrateDays;
 						if (typeof next.staleCount === "number") d.staleCount = next.staleCount;
+						if (typeof next.monitorEnabled === "boolean") d.monitorEnabled = next.monitorEnabled;
+						if (typeof next.monitorSummary === "string") d.monitorSummary = next.monitorSummary;
 						d.status = next.status || "ready";
 						d.revision = revision;
 					}
@@ -55,6 +59,8 @@ window.__ModuleLoader__.load({
 			const integrateEnabled = useStore((s) => s.integrateEnabled);
 			const integrateDays = useStore((s) => s.integrateDays);
 			const staleCount = useStore((s) => s.staleCount);
+			const monitorEnabled = useStore((s) => s.monitorEnabled);
+			const monitorSummary = useStore((s) => s.monitorSummary);
 			const status = useStore((s) => s.status);
 
 			// 每行：水平 flex + 下方分割线（对齐 DSH 原生行）
@@ -127,6 +133,19 @@ window.__ModuleLoader__.load({
 						}),
 						react.createElement("span", { style: { fontSize: "13px", color: "var(--dsw-alias-label-tertiary)" } }, "天/次")
 					)
+				),
+				// 行：使用监控开关
+				itemRow("使用监控",
+					react.createElement("input", {
+						type: "checkbox", checked: !!monitorEnabled,
+						title: "记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总；用于使用一段时间后优化",
+						style: { width: "16px", height: "16px", cursor: "pointer" },
+						onChange: (e) => setMonitorEnabled(e.target.checked)
+					})
+				),
+				// 行：监控统计（只读汇总）
+				itemRow("记忆使用统计",
+					react.createElement("span", { style: { fontSize: "13px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", wordBreak: "break-all" } }, monitorSummary || "暂无统计（使用记忆/触发提醒后更新）")
 				)
 			);
 		}
@@ -162,7 +181,8 @@ window.__ModuleLoader__.load({
 					setStaleSessionDays: (value) => { if (scope) scope.set("staleSessionDays", value); },
 					setStaleAction: (value) => { if (scope) scope.set("staleAction", value); },
 					setIntegrateEnabled: (value) => { if (scope) scope.set("integrateEnabled", value); },
-					setIntegrateDays: (value) => { if (scope) scope.set("integrateDays", value); }
+					setIntegrateDays: (value) => { if (scope) scope.set("integrateDays", value); },
+					setMonitorEnabled: (value) => { if (scope) scope.set("monitorEnabled", value); }
 				};
 			};
 

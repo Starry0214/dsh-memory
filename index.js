@@ -185,6 +185,126 @@ function matchMemoryHints(userText) {
   return hits;
 }
 
+// v1.12.0：使用监控 —— 记录提醒/查询/错误事件，供设置界面展示 + 使用一段时间后优化。
+// 数据存 .monitor.json（全量保留，无窗口限制）；设置界面显示精简汇总（monitorSummary 只读字段）。
+const MONITOR_FILE = MEMORY_ROOT + "/.monitor.json";
+const MONITOR_FOLLOW_WINDOW = 3;   // 提醒后 N 个工具调用内调用 memory_search/skill 视为"跟随"
+let MONITOR_DATA = null;           // 懒加载
+let MONITOR_DOLLAR = false;        // 写入防抖标记（避免高频工具调用频繁写盘）
+let MONITOR_HINT_OPEN = null;      // 当前"待判定"的提醒：{ seq, type, domain, name }，跟随判定用
+let MONITOR_HINT_OPEN_COUNT = 0;   // 提醒后的工具调用计数
+
+function defaultMonitorData() {
+  return { version: 1, installedAt: Date.now(), updatedAt: Date.now(),
+    hints: { A: 0, B: 0, C: 0 },     // 提醒次数（按类型）
+    byDomain: {},                     // A 类提醒按领域统计 { 领域名: 次数 }
+    queries: 0,                       // memory_search 总调用数
+    recentQueries: [],                // 最近查询（最多 20 条 {t, query}）
+    followed: 0, ignored: 0,          // 提醒后是否被跟随（有效/忽略）
+    events: [] };                     // 全量事件 {t, type, detail}（全量保留）
+}
+
+function readMonitorData() {
+  if (MONITOR_DATA) return MONITOR_DATA;
+  try {
+    const raw = fs.readFileSync(portable(MONITOR_FILE), "utf8");
+    MONITOR_DATA = Object.assign(defaultMonitorData(), JSON.parse(raw));
+  } catch (e) {
+    MONITOR_DATA = defaultMonitorData();
+  }
+  return MONITOR_DATA;
+}
+
+// 记录一个监控事件（原子更新 + 防抖写盘）
+function monitorEvent(type, detail) {
+  try {
+    if (PLUGIN_CFG.monitorEnabled === false) return;
+    const d = readMonitorData();
+    d.updatedAt = Date.now();
+    d.events.push({ t: d.updatedAt, type, detail });
+    if (d.events.length > 2000) d.events = d.events.slice(-2000);  // 全量但上限防无限膨胀
+    // 防抖写盘：最后一次调用后 500ms 落盘
+    scheduleMonitorSave();
+  } catch (e) { /* 监控失败不影响主功能 */ }
+}
+
+function scheduleMonitorSave() {
+  if (MONITOR_DOLLAR) return;
+  MONITOR_DOLLAR = true;
+  setTimeout(() => {
+    MONITOR_DOLLAR = false;
+    try {
+      const d = readMonitorData();
+      fs.mkdirSync(MEMORY_ROOT.split("\\").join("/"), { recursive: true });
+      fs.writeFileSync(portable(MONITOR_FILE), JSON.stringify(d));
+      updateMonitorSummary();
+    } catch (e) { /* 写盘失败忽略 */ }
+  }, 500);
+}
+
+// 更新设置界面的只读汇总字段
+function updateMonitorSummary() {
+  try {
+    const d = readMonitorData();
+    const followRate = (d.followed + d.ignored) > 0 ? Math.round((d.followed / (d.followed + d.ignored)) * 100) : null;
+    const topDomains = Object.entries(d.byDomain || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]).join(",");
+    const s = "提醒 A:" + d.hints.A + "/B:" + d.hints.B + "/C:" + d.hints.C +
+      " 记忆查询:" + d.queries +
+      (followRate !== null ? " 跟进率:" + followRate + "%" : "") +
+      (topDomains ? " 高频领域:" + topDomains : "");
+    if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.set === "function") {
+      HOST_SETTINGS_SCOPE.set("monitorSummary", s).catch(() => {});
+    }
+  } catch (e) { /* 汇总失败忽略 */ }
+}
+
+// A 类提醒：记录 + 打开跟随判定窗口
+function monitorHintA(domainName) {
+  const d = readMonitorData();
+  d.hints.A += 1;
+  if (domainName) d.byDomain[domainName] = (d.byDomain[domainName] || 0) + 1;
+  MONITOR_HINT_OPEN = { type: "A", domain: domainName || "?" };
+  MONITOR_HINT_OPEN_COUNT = 0;
+  monitorEvent("hintA", { domain: domainName || "?", time: Date.now() });
+}
+
+// B/C 类提醒：记录
+function monitorHintBC(type) {
+  const d = readMonitorData();
+  d.hints[type] = (d.hints[type] || 0) + 1;
+  monitorEvent("hint" + type, { time: Date.now() });
+}
+
+// 工具调用：记录 memory_search/skill 行为 + 跟随判定
+function monitorToolCall(toolName, ...rest) {
+  try {
+    if (PLUGIN_CFG.monitorEnabled === false) return;
+    const d = readMonitorData();
+    if (toolName === "memory_search") {
+      d.queries += 1;
+      const q = (rest[0] && rest[0].query) || "";
+      d.recentQueries.push({ t: Date.now(), query: String(q).slice(0, 60) });
+      if (d.recentQueries.length > 20) d.recentQueries = d.recentQueries.slice(-20);
+    }
+    if (toolName === "memory_search" || toolName === "skill") {
+      // 跟随判定：若有待判定提醒且在窗口内
+      if (MONITOR_HINT_OPEN && MONITOR_HINT_OPEN_COUNT <= MONITOR_FOLLOW_WINDOW) {
+        d.followed += 1;
+        MONITOR_HINT_OPEN = null;
+      }
+    }
+    // 每次工具调用推进窗口计数；窗口超限且仍有待判定 → 记为忽略
+    if (MONITOR_HINT_OPEN) {
+      MONITOR_HINT_OPEN_COUNT += 1;
+      if (MONITOR_HINT_OPEN_COUNT > MONITOR_FOLLOW_WINDOW) {
+        d.ignored += 1;
+        MONITOR_HINT_OPEN = null;
+      }
+    }
+    monitorEvent("tool", { name: toolName });
+  } catch (e) { /* 忽略 */ }
+}
+
 function findStaleSessions(maxAgeDays, afterTime) {
   const stale = [];
   // v1.11.0：记忆暂停（active=false，afterTime 为 null）→ 不纳入任何漏网
@@ -326,7 +446,7 @@ function sessionMentionedInMemory(sessionId) {
 //  - staleSessionDays: 漏网会话检测阈值（天），默认 5
 //  - staleAction:      漏网处理动作，remind=仅注入提醒（默认）| silent=后台静默子代理总结 | approval=经用户审批后子代理总结
 // v1.7.1：默认 staleAction=remind（仅提醒，不自动 spawn 子代理——实测漏网归档子代理单会话可烧数百万 token）
-const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true };
+const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true, monitorEnabled: true };
 // v1.11.0：active = 记忆活跃开关（独立于 DSH 进程启停）——
 // 用户显式关掉=记忆整合暂停（enabledAt 置空）；打开=重新启用（enabledAt 刷新为当前时间）。
 // DSH 重启/退出不再影响 enabledAt——「插件启停」与「DSH 进程启停」彻底解耦。
@@ -344,6 +464,10 @@ const SETTINGS_SCHEMA = z.object({
   integrateDays: z.number().min(1).max(90).default(7),   // 整合间隔（天）
   // v1.11.0：记忆活跃开关（独立于 DSH 进程启停）——用户显式控制；DSH 重启不改变它
   active: z.boolean().default(true),
+  // v1.12.0：使用监控开关（默认开）——记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总
+  monitorEnabled: z.boolean().default(true),
+  // 只读：监控汇总（客户端展示），宿主写入
+  monitorSummary: z.string().required(false),
   // 只读统计：漏网（未整合记忆）会话数量，由宿主在检测后写入；非用户编辑项
   // schemastery 对象字段默认可选；required(false) 显式标注
   staleCount: z.number().min(0).required(false)
@@ -360,6 +484,7 @@ function normalizeCfg(raw) {
   }
   if (!(cfg.staleSessionDays >= 1 && cfg.staleSessionDays <= 90)) cfg.staleSessionDays = DEFAULT_CFG.staleSessionDays;
   if (typeof cfg.active !== "boolean") cfg.active = DEFAULT_CFG.active;
+  if (typeof cfg.monitorEnabled !== "boolean") cfg.monitorEnabled = DEFAULT_CFG.monitorEnabled;
   return cfg;
 }
 
@@ -1070,6 +1195,8 @@ export default {
         const memLines = memHits.map(h => "- 记忆: memory_search " + JSON.stringify(h.name) + "（" + h.file + "，踩坑/现成脚本/约定）").join("\n");
         const skillLines = skillHits.length > 0 ? "\n" + skillHits.map(s => "- skill: 技能目录加载 " + s + "（SKILL.md）").join("\n") : "";
         const hintText = "<system-reminder>\n【dsh-memory 提示】此任务可能涉及已知领域，建议先查再动手：\n" + memLines + skillLines + "\n（纯读零成本；若无关可忽略本条）\n</system-reminder>";
+        // 监控：记录 A 类提醒（打开跟随判定窗口）
+        monitorHintA(memHits[0] && memHits[0].name ? memHits[0].name : "?");
         // setTimeout(0) 推迟注入，避免 pre-step 窗口内重入
         setTimeout(() => { try { agent.inject(makeMessage(hintText)); } catch (e) {} }, 0);
         return decision;
@@ -1078,13 +1205,24 @@ export default {
       }
     });
 ctx.on("tools/result", (exec, result) => {
-      // v1.12.0：判断 B/C —— 工具执行失败（isError=true）时按错误签名计数，触发提醒
+      // v1.12.0：监控记录 + 判断 B/C
       try {
-        if (!exec || !result || !result.isError) return;
+        if (!exec || !result) return;
+        const toolName = exec.tool || exec.name || "other";
+        // 1) 监控：记录工具调用；memory_search/skill 触发查询统计与跟随判定
+        if (toolName === "memory_search") {
+          const q = (exec.input && (exec.input.query || exec.input.name)) ? String(exec.input.query || exec.input.name) : "";
+          monitorToolCall("memory_search", { query: q });
+        } else if (toolName === "skill") {
+          monitorToolCall("skill");
+        } else {
+          monitorToolCall(toolName);
+        }
+        // 2) 判断 B/C：仅工具执行失败时
+        if (!result.isError) return;
         const agent = exec.agent;
         if (!agent || typeof agent.inject !== "function") return;
         const sid = (agent.session && agent.session.id) || "?";
-        // 错误文本：优先 result.content 文本块，回退 JSON 序列化
         let raw = "";
         if (Array.isArray(result.content)) {
           raw = result.content.filter(b => b && b.type === "text" && typeof b.text === "string").map(b => b.text).join(" ");
@@ -1092,7 +1230,6 @@ ctx.on("tools/result", (exec, result) => {
         if (!raw) { try { raw = JSON.stringify(result.value || result).slice(0, 300); } catch (e) { raw = "tool-error"; } }
         raw = raw.slice(0, 150);
         if (!raw.trim()) return;
-        // 错误签名：去数字/时间戳/空格噪音
         const sig = raw.replace(/\d+/g, "N").replace(/\s+/g, " ").trim();
         if (!sig) return;
         let counts = MEMORY_HINT_ERRORS.get(sid);
@@ -1101,15 +1238,15 @@ ctx.on("tools/result", (exec, result) => {
         counts.set(sig, c);
         if (counts.size > 50) { for (const k of counts.keys()) { if (counts.get(k) < c) counts.delete(k); } }
         if (c === 2) {
-          // 判断 B：同一错误第 2 次 → 建议查
+          monitorHintBC("B");
           const hint = "<system-reminder>\n【dsh-memory 提示】工具报错重复出现（" + raw.slice(0, 80) + "）——大概率是以前踩过的坑。建议先 memory_search 搜该错误串 + 技能目录查相关 skill，再继续。\n</system-reminder>";
           setTimeout(() => { try { agent.inject(makeMessage(hint)); } catch (e) {} }, 0);
         } else if (c === 3) {
-          // 判断 C：同一错误第 3 次 → 强制建议查
+          monitorHintBC("C");
           const hint = "<system-reminder>\n【dsh-memory 提示】同一工具错误已连续出现 3 次且未见根因——暂停硬试，强制建议：memory_search 搜该错误串 + 加载相关 skill（记忆里有踩坑记录大概率直接给出解法）。\n</system-reminder>";
           setTimeout(() => { try { agent.inject(makeMessage(hint)); } catch (e) {} }, 0);
         }
-      } catch (e) { /* 错误统计失败不影响会话 */ }
+      } catch (e) { /* 监控/统计失败不影响会话 */ }
     });
 ctx.on("session/event", (session, event) => {
       try {
