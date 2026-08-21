@@ -599,6 +599,8 @@ export default {
             clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction + ", active=" + PLUGIN_CFG.active);
           });
           clog("[dsh-memory] 设置命名空间已注册（settings.yaml 可配置，设置界面可改）");
+          // v1.12.1：启动时主动推送一次监控汇总（读磁盘历史数据），否则重启后界面一直显示"暂无统计"
+          updateMonitorSummary();
         } catch (e) {
           cwarn("[dsh-memory] settings register 失败，回退 cordis config:", e && e.message ? e.message : String(e));
         }
