@@ -296,10 +296,14 @@ function updateMonitorSummary() {
     const d = readMonitorData();
     const followRate = (d.followed + d.ignored) > 0 ? Math.round((d.followed / (d.followed + d.ignored)) * 100) : null;
     const topDomains = Object.entries(d.byDomain || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]).join(",");
+    const eventN = Array.isArray(d.events) ? d.events.length : 0;
+    const updD = (d.updatedAt > 0) ? new Date(d.updatedAt) : null;
+    const updTxt = updD ? pad(updD.getHours()) + ":" + pad(updD.getMinutes()) : "-";
     const s = "提醒 A:" + d.hints.A + "/B:" + d.hints.B + "/C:" + d.hints.C +
       " 记忆查询:" + d.queries +
       (followRate !== null ? " 跟进率:" + followRate + "%" : "") +
-      (topDomains ? " 高频领域:" + topDomains : "");
+      (topDomains ? " 高频领域:" + topDomains : "") +
+      "（累计事件 " + eventN + " · 更新 " + updTxt + "）";
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
       HOST_SETTINGS_SCOPE.update({ monitorSummary: s }).catch(() => {});
