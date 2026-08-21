@@ -242,6 +242,9 @@ let MONITOR_DATA = null;           // 懒加载
 let MONITOR_DOLLAR = false;        // 写入防抖标记（避免高频工具调用频繁写盘）
 let MONITOR_HINT_OPEN = null;      // 当前"待判定"的提醒：{ seq, type, domain, name }，跟随判定用
 let MONITOR_HINT_OPEN_COUNT = 0;   // 提醒后的工具调用计数
+let MONITOR_LAST_SUMMARY = "";     // v1.12.6: 上次推送的汇总串（内容不变不重复推送）
+let MONITOR_LAST_PUSH_AT = 0;      // v1.12.6: 上次推送时间戳（60s 节流，防高频工具调用刷屏）
+let MONITOR_PUSH_TIMER = null;     // v1.12.6: 节流到期补推定时器
 
 function defaultMonitorData() {
   return { version: 1, installedAt: Date.now(), updatedAt: Date.now(),
@@ -326,6 +329,17 @@ function updateMonitorSummary() {
       "C = 连续失败3次，强制查记忆+skill"
     );
     const s = sumLines.join("\n");
+    // v1.12.6：变化守卫 + 60s 节流 —— 内容没变不推；变了但距上次推送 <60s 先不推（每个工具调用都会产生 tool 事件并刷新 updatedAt/eventN），到期自动补推
+    if (s === MONITOR_LAST_SUMMARY) return;
+    const nowMs = Date.now();
+    if (nowMs - MONITOR_LAST_PUSH_AT < 60000) {
+      if (!MONITOR_PUSH_TIMER) {
+        MONITOR_PUSH_TIMER = setTimeout(() => { MONITOR_PUSH_TIMER = null; updateMonitorSummary(); }, 60000 - (nowMs - MONITOR_LAST_PUSH_AT) + 50);
+      }
+      return;
+    }
+    MONITOR_LAST_SUMMARY = s;
+    MONITOR_LAST_PUSH_AT = nowMs;
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
       clog("[dsh-memory] 推送监控汇总: " + s.split("\n")[0] + " …");
@@ -628,7 +642,10 @@ export default {
                 writeIntegrateState(st);
               }
             } catch (e) { /* 开关切换失败不影响配置 */ }
-            clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction + ", active=" + PLUGIN_CFG.active);
+            // v1.12.6：仅业务配置真变化才打日志（宿主自身 update({monitorSummary}) 触发的 watch 不再刷屏）
+            if (prev.staleSessionDays !== PLUGIN_CFG.staleSessionDays || prev.staleAction !== PLUGIN_CFG.staleAction || prev.active !== PLUGIN_CFG.active) {
+              clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction + ", active=" + PLUGIN_CFG.active);
+            }
           });
           clog("[dsh-memory] 设置命名空间已注册（settings.yaml 可配置，设置界面可改）");
           // v1.12.1：启动时主动推送一次监控汇总（读磁盘历史数据），否则重启后界面一直显示"暂无统计"
