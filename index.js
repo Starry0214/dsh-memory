@@ -144,11 +144,13 @@ function buildMemoryHintTable() {
       const name = m[1].trim();
       const file = m[2].trim();
       const desc = (m[3] || "").trim();
-      const keywords = new Set();
-      for (const part of [name, ...desc.split(/[/、,，;；\s]+/).filter(Boolean)]) {
-        if (part.length >= 2) keywords.add(part);
+      const kws = [];
+      // name 除整串外，按斜杠切子领域（如 "REST API/推送" → 追加 "推送"）——混合词的中文主体可独立命中
+      const nameParts = [name, ...name.split(/[/／]+/).map((s) => s.trim()).filter((s) => s.length >= 2)];
+      for (const part of [...nameParts, ...desc.split(/[/、,，;；\s]+/).filter(Boolean)]) {
+        if (part.length >= 2) kws.push(splitKw(part));
       }
-      rows.push({ keywords, file, name });
+      rows.push({ kws, file, name });
     }
     MEMORY_HINT_TABLE = rows;
     MEMORY_HINT_TABLE_MTIME = st.mtimeMs;
@@ -171,19 +173,57 @@ function hintTextOf(messages) {
   return parts.join("\n").slice(0, 2000);  // 只取前 2000 字符匹配（足够判断领域）
 }
 
-// 匹配：返回命中的记忆映射列表（限 top 3）
+// v1.12.11：关键词预处理（对标 MiMo-Code skill/search.ts tokenize）——
+// 汉字段切相邻两字滑窗 bigram（语序无关），英文/数字段小写整词（≥3 字符）。
+function splitKw(kw) {
+  const lower = kw.toLowerCase();
+  const hanGrams = [];
+  for (const m of lower.matchAll(/[\p{Script=Han}]+/gu)) {
+    const chars = [...m[0]];
+    if (chars.length === 1) { hanGrams.push(m[0]); continue; }
+    for (let i = 0; i < chars.length - 1; i++) hanGrams.push(chars[i] + chars[i + 1]);
+  }
+  const lats = [];
+  for (const m of lower.matchAll(/[a-z0-9][a-z0-9_+\-.]{2,}/gu)) lats.push(m[0]);
+  return { hanGrams: hanGrams, lats: lats };
+}
+
+// 匹配：返回命中的记忆映射列表（限 top 3）。
+// v1.12.11：大小写归一化 + 中文 bigram 交集 ≥ 半数判命中（治语序盲区："压缩一下这个录屏"命中"录屏压缩"）；
+// 性能：hintTextOf 已截 2000 字符 → 文本 bigram Set ≤~2000 条，每关键词几次 Set.has，微秒级。
 function matchMemoryHints(userText) {
   if (!userText) return [];
   const table = buildMemoryHintTable();
+  const textLower = userText.toLowerCase();
+  const textGrams = new Set();
+  for (const m of textLower.matchAll(/[\p{Script=Han}]+/gu)) {
+    const chars = [...m[0]];
+    for (let i = 0; i < chars.length - 1; i++) {
+      if (textGrams.size >= 5000) break;
+      textGrams.add(chars[i] + chars[i + 1]);
+    }
+  }
   const hits = [];
   for (const row of table) {
-    for (const kw of row.keywords) {
-      if (userText.includes(kw)) {
-        hits.push(row);
-        break;
+    let hit = false;
+    for (const kw of row.kws) {
+      // 中文部分：bigram 交集 ≥ 半数（至少 1）
+      let hanHit = kw.hanGrams.length === 0;
+      if (!hanHit) {
+        let c = 0;
+        for (const g of kw.hanGrams) { if (textGrams.has(g)) c++; }
+        hanHit = c >= Math.max(1, Math.ceil(kw.hanGrams.length * 0.5));
       }
+      if (!hanHit) continue;
+      // 英文/数字部分：逐 token 子串（全部满足）
+      let latHit = true;
+      for (const t of kw.lats) { if (!textLower.includes(t)) { latHit = false; break; } }
+      if (latHit) { hit = true; break; }
     }
-    if (hits.length >= 3) break;
+    if (hit) {
+      hits.push(row);
+      if (hits.length >= 3) break;
+    }
   }
   return hits;
 }
