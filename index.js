@@ -185,6 +185,54 @@ function matchMemoryHints(userText) {
   return hits;
 }
 
+// v1.12.0：分区感知注入 —— 对标 mimocode readBudgetedSectionAware（budgeted-read.ts）
+// 解析 Markdown ## 章节：预算内保所有章节标题（结构骨架），正文按章节预算均分截断，
+// 换行处断（不切字）、末尾提示"完整内容用 memory_search 查"。文件再大：骨架可见，信息不黑盒。
+function sectionAwareSlice(text, budgetChars, fileLabel) {
+  if (!text) return { text: "", truncated: false, total: 0 };
+  if (text.length <= budgetChars) return { text, truncated: false, total: text.length };
+  const lines = text.split("\n");
+  const preamble = [];
+  const sections = [];
+  let current = null;
+  for (const line of lines) {
+    if (line.startsWith("## ")) {
+      if (current) sections.push(current);
+      current = { header: line, body: [] };
+    } else if (current) {
+      current.body.push(line);
+    } else {
+      preamble.push(line);
+    }
+  }
+  if (current) sections.push(current);
+  // 骨架：文件头 + 所有章节标题
+  const skeletonParts = [...preamble];
+  for (const s of sections) skeletonParts.push(s.header);
+  const skeleton = skeletonParts.join("\n");
+  const remaining = budgetChars - skeleton.length;
+  if (remaining <= 0) {
+    // 骨架都放不下 → 保开头若干行 + 提示
+    return { text: skeleton.slice(0, budgetChars) + "\n[注：全文 " + text.length + " 字符，骨架已超预算；完整内容用 memory_search 查 " + fileLabel + "]", truncated: true, total: text.length };
+  }
+  const perSection = sections.length > 0 ? Math.floor(remaining / sections.length) : 0;
+  const out = [...preamble];
+  for (const s of sections) {
+    out.push(s.header);
+    const bodyText = s.body.join("\n");
+    if (perSection > 0 && bodyText.length > perSection) {
+      let cut = bodyText.slice(0, perSection);
+      const nl = cut.lastIndexOf("\n");
+      if (nl > 0) cut = cut.slice(0, nl);
+      out.push(cut + "\n…(章节截断)");
+    } else {
+      out.push(bodyText);
+    }
+  }
+  out.push("\n[注：原文 " + text.length + " 字符，已按注入预算截断；完整内容用 memory_search 查 " + fileLabel + "]");
+  return { text: out.join("\n"), truncated: true, total: text.length };
+}
+
 // v1.12.0：使用监控 —— 记录提醒/查询/错误事件，供设置界面展示 + 使用一段时间后优化。
 // 数据存 .monitor.json（全量保留，无窗口限制）；设置界面显示精简汇总（monitorSummary 只读字段）。
 const MONITOR_FILE = MEMORY_ROOT + "/.monitor.json";
@@ -1112,12 +1160,14 @@ export default {
           }
           const stableParts = [];
           if (globalMd) {
-            const g = globalMd.slice(0, CHAR_LIMIT["global.md"]);
-            stableParts.push("【全局记忆·用户画像】\n" + g + (globalMd.length > CHAR_LIMIT["global.md"] ? "\n[注：原文 " + globalMd.length + " 字符，已按注入预算截断；完整内容用 memory_search 查 global]" : ""));
+            // v1.12.0：分区感知注入（保章节骨架+按章截断），不丢结构
+            const g = sectionAwareSlice(globalMd, CHAR_LIMIT["global.md"], "global");
+            stableParts.push("【全局记忆·用户画像】\n" + g.text);
           }
           if (indexMd) {
-            const i = indexMd.slice(0, CHAR_LIMIT["index.md"]);
-            stableParts.push("【记忆索引】\n" + i + (indexMd.length > CHAR_LIMIT["index.md"] ? "\n[注：原文 " + indexMd.length + " 字符，已按注入预算截断；完整内容用 memory_search 查 index]" : ""));
+            // v1.12.0：分区感知注入
+            const i = sectionAwareSlice(indexMd, CHAR_LIMIT["index.md"], "index");
+            stableParts.push("【记忆索引】\n" + i.text);
           }
           if (stableParts.length > 0) {
             agent.inject(makeMessage(
@@ -1532,7 +1582,7 @@ ctx.on("session/event", (session, event) => {
 "写提到的文件路径前用 glob、函数/类名前用 grep 核实存在；无法证实但合理的标 [unverified]；被新决定/新代码推翻的条目标记删除或移除.\n" +
 "\n" +
 "## Prune (D4: 容量上限 + 修剪过期)\n" +
-"1. global.md 字符数 < 3000 硬预算、index.md < 2000（软字节阈值以上仅告警，字符硬预算必须达标，否则注入被截断）——超了就精简冗余文字，不丢任何事实.\n" +
+"1. global.md 字符数 < 3000、index.md < 2000、每节保持精炼（对标 mimocode dream: MEMORY.md <200行/10KB）——超了就精简冗余文字、合并重复、下沉低频细节到 knowledge/，不丢事实；章节用 ## 明确分类（便于分区感知注入保留骨架）.\n" +
 "2. sessions/当日文件保持 200-400 字要点+指向，细节归档 knowledge/ 或对应 project 文件.\n" +
 "3. 移除：被新决定取代的条目、仅与单个会话相关不再成立的细节、与更强记忆重复的低信号条目.\n" +
 "4. 只精简/合并/修剪，不删除仍有价值的事实；删除前 [unverified] 或明确标注.\n" +
