@@ -311,18 +311,24 @@ function updateMonitorSummary() {
       }
     }
     const hhmm = (t) => { const dt = new Date(t); return pad(dt.getHours()) + ":" + pad(dt.getMinutes()); };
-    const hintTxt = "A:" + d.hints.A + (lastHintT.hintA !== void 0 ? "(" + hhmm(lastHintT.hintA) + ")" : "") +
-      "/B:" + d.hints.B + (lastHintT.hintB !== void 0 ? "(" + hhmm(lastHintT.hintB) + ")" : "") +
-      "/C:" + d.hints.C + (lastHintT.hintC !== void 0 ? "(" + hhmm(lastHintT.hintC) + ")" : "");
-    const s = "提醒 " + hintTxt +
-      " 记忆查询:" + d.queries +
-      (followRate !== null ? " 跟进率:" + followRate + "%" : "") +
-      (topDomains ? " 高频领域:" + topDomains : "") +
-      "（累计事件 " + eventN + " · 更新 " + updTxt + "）\n" +
-      "A=命中领域关键词，先查记忆再动手 · B=同一错误第2次，提醒立即查 · C=连续失败3次，强制查记忆+skill";
+    const fmtHint = (label, n, t) => label + ":" + n + (t !== void 0 ? "（" + hhmm(t) + "）" : "");
+    // v1.12.5：统计行改多行分明格式（client 端 pre-wrap 渲染换行）；数组 join 构造，禁止模板字符串写 \n（v1.12.3 教训）
+    const sumLines = [
+      "提醒  " + fmtHint("A", d.hints.A, lastHintT.hintA) + "｜" + fmtHint("B", d.hints.B, lastHintT.hintB) + "｜" + fmtHint("C", d.hints.C, lastHintT.hintC),
+      "查询  记忆查询 " + d.queries + " 次" + (followRate !== null ? " · 跟进率 " + followRate + "%" : "")
+    ];
+    if (topDomains) sumLines.push("领域  " + topDomains.split(",").join("、"));
+    sumLines.push(
+      "累计  " + eventN + " 事件 · 更新 " + updTxt,
+      "",
+      "A = 命中领域关键词，先查记忆再动手",
+      "B = 同一错误第2次，提醒立即查",
+      "C = 连续失败3次，强制查记忆+skill"
+    );
+    const s = sumLines.join("\n");
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-      clog("[dsh-memory] 推送监控汇总: " + s.slice(0, 48) + "…");
+      clog("[dsh-memory] 推送监控汇总: " + s.split("\n")[0] + " …");
       Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ monitorSummary: s }))
         .then(() => clog("[dsh-memory] 监控汇总推送成功"))
         .catch((err) => cwarn("[dsh-memory] 监控汇总推送失败:", err && err.message ? err.message : String(err)));
