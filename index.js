@@ -246,6 +246,7 @@ let MONITOR_LAST_SUMMARY = "";     // v1.12.6: 上次推送的汇总串（内容
 let MONITOR_LAST_PUSH_AT = 0;      // v1.12.6: 上次推送时间戳（60s 节流，防高频工具调用刷屏）
 let MONITOR_PUSH_TIMER = null;     // v1.12.6: 节流到期补推定时器
 let MONITOR_LAST_LOG_SIG = "";     // v1.12.7: 上次打日志的"有意义变化"签名（不含纯事件数增长）
+let LAST_TOP_AGENT = null;         // v1.12.8: 最近顶层会话 agent 句柄（stale_archive 工具 spawn parent 用）
 
 function defaultMonitorData() {
   return { version: 1, installedAt: Date.now(), updatedAt: Date.now(),
@@ -951,105 +952,82 @@ export default {
       }
     }
 
+    // v1.12.8：统一漏网归档入口 —— 单主子代理编排（用户要求"无感"）：
+    //   插件只提取消息流 + spawn 一个主归档子代理；价值判断/拆分/汇总/落盘全由主子代理自主完成，
+    //   消除多子代理并发 append 同一文件的竞态；控制台只有发起/完成两条日志。
+    const MAX_ARCHIVE_SESSIONS = 20;  // 单批上限，超出留待下次
+    async function runStaleArchive(staleSessions) {
+      const subagents = ctx.get("subagents");
+      if (!subagents || typeof subagents.start !== "function") {
+        cwarn("[dsh-memory] subagents 服务不可用，漏网归档降级为提醒");
+        return { ok: false, reason: "subagents 服务不可用" };
+      }
+      // 提取全部消息流（跳过无流的）；超上限的留待下次
+      const batch = staleSessions.slice(0, MAX_ARCHIVE_SESSIONS);
+      const overflow = staleSessions.length - batch.length;
+      const flowSessions = [];
+      const skippedNoFlow = [];
+      for (const s of batch) {
+        const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
+        const flow = extractMessageFlow(logPath, 8000);
+        if (flow) flowSessions.push({ session: s, flow: flow });
+        else skippedNoFlow.push(s.id.slice(0, 12));
+      }
+      skippedNoFlow.forEach((id) => {
+        const s = batch.find((x) => x.id.startsWith(id));
+        if (s) STALE_NOTIFIED.add(s.id);
+      });
+      if (flowSessions.length === 0) {
+        clog("[dsh-memory] 无可归档会话（全部无消息流，跳过 " + skippedNoFlow.length + " 个）");
+        return { ok: false, reason: "全部会话无消息流", overflow: overflow };
+      }
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const flowBlocks = flowSessions.map((f) =>
+        "===== 会话 " + f.session.id + "（工作目录 " + f.session.ws.slice(0, 60) + "，最后交互约 " + Math.max(1, Math.round((Date.now() - f.session.mtime) / 86400000)) + " 天前）=====\n" + f.flow
+      ).join("\n\n");
+      const promptText =
+        "你是 dsh-memory 主归档子代理，独立完成本轮全部漏网会话的记忆归档（fresh 会话，上下文只含本任务说明与已提取的对话消息流）。\n" +
+        "**禁止读取任何原始日志文件**——消息流已足够，读原始日志会消耗巨额 token。\n" +
+        "\n===== 待归档会话的对话消息流 =====\n" + flowBlocks + "\n" +
+        "\n===== 你的职权（完全自主决策） =====\n" +
+        "1. 逐会话判断归档价值：无实质内容（寒暄/空会话/记忆库已覆盖）→ 跳过并在报告说明理由。\n" +
+        "2. 内容少 → 你直接总结全部。\n" +
+        "3. 会话多或部分内容重 → 若你的工具集中有发起子代理的能力（如 subagent 工具），可自行拆分并发处理；**二级子代理只让它返回摘要文本，落盘统一由你执行**（防并发写冲突）；若无该能力则自己串行完成全部。\n" +
+        "4. 落盘（你是唯一写入者）：目标 ~/.dsh/memory/sessions/<会话归属日期>.md（今天 = " + todayStr + "；归属日期从消息流内容推断，推断不出用最后交互日）或 projects/ 对应文件。纪律：先 read 目标文件全量 → edit 锚定追加，禁止局部读+整体覆写；小节标题「## 漏网会话补档（" + todayStr + " 归档）」内「### <会话短id>（一句话主题）」；每会话 3-6 条要点，精确字面量（文号/路径/命令/参数/报错串/数值）逐字保留绝不概括改写；与已有归档重叠时只记增量并标注。\n" +
+        "5. 最终输出归档报告：逐会话一行（写入文件+小节+大致字符数，或跳过原因）。不要复述摘要全文。\n";
+      const label = "dsh-memory-漏网归档-" + flowSessions.length + "会话";
+      try {
+        const spawnOpts = {
+          label: label,
+          prompt: [{ type: "text", text: promptText }],
+          signal: new AbortController().signal,
+          // v1.12.8：放开 subagent —— 授权主子代理按需自行发起二级子代理（无此能力则优雅降级为自己完成）
+          toolFilter: { allow: ["read", "write", "edit", "grep", "glob", "memory_search", "subagent"] }
+        };
+        if (LAST_TOP_AGENT) spawnOpts.parent = LAST_TOP_AGENT;
+        const run = await subagents.start("spawn", spawnOpts);
+        run.result.then((result) => {
+          const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
+          clog("[dsh-memory] 漏网归档完成: " + label + "（stopReason=" + result.stopReason + "，报告 " + outText.length + " 字符）");
+          if (outText.length > 0 && outText.length <= 1200) {
+            clog("[dsh-memory] 归档报告:\n" + outText);
+          }
+        }).catch((e) => {
+          cwarn("[dsh-memory] 漏网归档主子代理失败: " + label + " - " + (e && e.message ? e.message : String(e)));
+        });
+        clog("[dsh-memory] 已发起漏网归档主子代理: " + label + "（后台执行中，完成后输出报告）");
+        return { ok: true, count: flowSessions.length, overflow: overflow };
+      } catch (e) {
+        cwarn("[dsh-memory] 漏网归档主子代理启动失败: " + label + " - " + (e && e.message ? e.message : String(e)));
+        return { ok: false, reason: e && e.message ? e.message : String(e), overflow: overflow };
+      }
+    }
+
     // v9：组装维护提醒（备份到期 + 轮转到期），有需要时注入
     async function injectMaintenanceReminder(agent, sessionLabel) {
+      LAST_TOP_AGENT = agent;  // v1.12.8: 记录最近顶层会话句柄
       const SESSION_LABEL = sessionLabel || "?";
 
-      // v1.4.0：漏网处理子代理 —— silent 模式插件直接 spawn，完成后控制台输出结果
-      // v1.7.0：① 子代理为 fresh 会话（spawn 不继承父上下文，inheritsParentContext=false，无 seed）——
-      //           无需先 compact，prompt 即全部输入，紧凑省 token；
-      //         ② 按工作空间合并：同 ws 的多个会话交给一个子代理处理（减少子代理数）
-      async function spawnStaleSummary(group) {
-        const subagents = ctx.get("subagents");
-        if (!subagents || typeof subagents.start !== "function") {
-          cwarn("[dsh-memory] subagents 服务不可用，silent 漏网处理降级为提醒");
-          return false;
-        }
-        // group = { ws, sessions: [{id, mtime, size}...] }
-        // v1.8.0 根治方案：插件提取每个会话的「对话消息流」（user/assistant 文本，过滤注入和工具噪音），
-        // 直接内嵌进 prompt —— 子代理不读原始日志（几十 MB → 消息流几 K-tens K token，最新不遗漏）
-        const ws = group.ws;
-        // 提取消息流；提取失败或无内容的会话跳过
-        const flowSessions = [];
-        const skippedNoFlow = [];
-        for (const s of group.sessions) {
-          const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
-          const flow = extractMessageFlow(logPath, 8000);
-          if (flow) {
-            flowSessions.push({ session: s, flow: flow });
-          } else {
-            skippedNoFlow.push(s.id.slice(0, 12));
-          }
-        }
-        if (skippedNoFlow.length > 0) {
-          clog("[dsh-memory] 跳过无消息流会话 " + skippedNoFlow.length + " 个（解压失败或无可提取文本）: " + skippedNoFlow.join(", "));
-          skippedNoFlow.forEach((id) => {
-            const s = group.sessions.find((x) => x.id.startsWith(id));
-            if (s) STALE_NOTIFIED.add(s.id);
-          });
-        }
-        if (flowSessions.length === 0) {
-          clog("[dsh-memory] 工作空间 " + ws + " 无可归档会话（全部无消息流）");
-          return false;
-        }
-        // 组装：每会话的 id + 消息流
-        const flowBlocks = flowSessions.map((f) =>
-          "===== 会话 " + f.session.id + "（最后交互约 " + Math.max(1, Math.round((Date.now() - f.session.mtime) / 86400000)) + " 天前）=====\n" + f.flow
-        ).join("\n\n");
-        // v1.9.0 仿真 compact：消息流 = 对话前缀，压缩指令与 DSH 官方 compact（dsh-compaction-basic）同款
-        const promptText =
-          "你是 dsh-memory 记忆归档子代理，执行「仿真压缩检查点」。你的上下文只含任务清单和已提取的对话消息流（fresh 会话）。\n" +
-          "**不要读取任何原始日志文件**——消息流已足够，读取原始日志会消耗巨额 token（禁止）。\n" +
-          "\n===== 待归档会话的对话消息流（作为对话前缀） =====\n" +
-          flowBlocks + "\n" +
-          "\n===== 压缩指令（与 DSH compact 同款） =====\n" +
-          "你现在充当压缩引擎。将上方对话浓缩为结构化检查点，让后续能无损恢复工作上下文。\n" +
-          "输出 EXACTLY 以下 Markdown 结构（保留每节顺序；空节写 (none)，绝不丢节）：\n" +
-          "## Primary Request and Intent\n- [用户原始及演变目标；逐字引用关键表述]\n" +
-          "## Key Technical Concepts\n- [技术/框架/模式/约定]\n" +
-          "## Files and Code\n- [精确路径：为什么重要、关键改动或片段]\n" +
-          "## Errors and Fixes\n- [错误：如何解决，相关用户反馈]\n" +
-          "## Pending Jobs\n- [明确要求但未完成的工作]\n" +
-          "## Current Work\n- [本检查点时进行中的工作]\n" +
-          "## Next Step\n- [紧接最近请求的下一步动作，或 (none)]\n" +
-          "## Critical Context\n- [决策及理由、约束、用户偏好、开放问题、继续所需数据]\n" +
-          "规则：\n" +
-          "- 简洁工程化；逐字保留精确路径/命令/错误串/标识符/数值/函数签名。\n" +
-          "- 忠实捕获用户反馈和纠正。\n" +
-          "- 不要提及压缩/归档本身。\n" +
-          "- 若对话已有 prior 检查点，不逐字复制：保留仍真的事实，丢弃过时的，合并为单一摘要。\n" +
-          "\n===== 写入目标 =====\n" +
-          "把检查点追加到 " + MEMORY_ROOT + "/sessions/ 下当日文件（如 2026-08-19.md），或按内容归属写入 projects/ 对应文件；小节标题如「归档：<会话主题>」。\n" +
-          "纪律：先读目标文件全量再追加，禁止局部读+整体覆写；无归档价值的会话明确说明。\n" +
-          "完成后逐会话报告：写入的文件、小节、大致字符数；未写入则说明原因。\n" +
-          "只输出检查点文本并执行上述写入，不要调用其他工具或做其他操作。";
-        const label = "dsh-memory-漏网归档-" + (flowSessions.length > 1 ? ws.slice(0, 24) + "-" + flowSessions.length + "会话" : flowSessions[0].session.id);
-        try {
-          const run = await subagents.start("spawn", {
-            label: label,
-            prompt: [{ type: "text", text: promptText }],
-            parent: agent,
-            signal: new AbortController().signal,
-            // v1.10.1：#5 移除 pwsh —— 消息流已由插件提取内嵌，子代理无需执行命令；pwsh 可绕过"禁读原始日志"
-            toolFilter: { allow: ["read", "write", "edit", "grep", "glob"] }
-          });
-          // 完成回调：控制台输出子代理结果（用户要求：漏网处理完成后可见）
-          run.result.then((result) => {
-            const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
-            clog("[dsh-memory] 漏网归档完成: " + label + "（" + flowSessions.length + " 个会话, stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
-            if (outText.length > 0 && outText.length <= 800) {
-              clog("[dsh-memory] 归档报告: " + outText.replace(/\n/g, " | "));
-            }
-          }).catch((e) => {
-            cwarn("[dsh-memory] 漏网归档子代理失败: " + label + " - " + (e && e.message ? e.message : String(e)));
-          });
-          clog("[dsh-memory] 已发起漏网归档子代理: " + label + "（" + flowSessions.length + " 个会话, 后台执行中）");
-          return true;
-        } catch (e) {
-          cwarn("[dsh-memory] 漏网子代理启动失败: " + label + " - " + (e && e.message ? e.message : String(e)));
-          return false;
-        }
-      }
       const parts = [];
 
       const backup = await checkBackupDue();
@@ -1116,37 +1094,20 @@ export default {
           .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
         if (staleSessions.length > 0) {
           if (PLUGIN_CFG.staleAction === "silent") {
-            // 静默模式：直接发起子代理（不注入提醒），完成后控制台输出归档结果。
-            // v1.7.0：按工作空间分组（同 ws 会话合并到一个子代理）+ 每批最多 MAX_STALE_GROUPS 组，
-            //         剩余组留待下次（避免一次性 spawn 过多子代理刷爆 token）
-            const MAX_STALE_GROUPS = 3;
-            // 按 ws 分组
-            const groups = new Map();
-            for (const s of staleSessions) {
-              if (!groups.has(s.ws)) groups.set(s.ws, []);
-              groups.get(s.ws).push(s);
+            // v1.12.8：单主子代理编排（无感）：插件提取消息流 → 一个主子代理自主判断/总结/落盘
+            const r = await runStaleArchive(staleSessions);
+            if (r.ok) {
+              staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));
+              if (r.overflow > 0) clog("[dsh-memory] 剩余 " + r.overflow + " 个漏网会话将在下次检查时处理");
             }
-            const groupList = Array.from(groups.entries()).map(([ws, sess]) => ({ ws, sessions: sess }));
-            const batchGroups = groupList.slice(0, MAX_STALE_GROUPS);
-            const restGroups = groupList.slice(MAX_STALE_GROUPS);
-            const batchSessions = batchGroups.reduce((a, g) => a + g.sessions.length, 0);
-            clog("[dsh-memory] 漏网会话 " + staleSessions.length + " 个（" + groupList.length + " 个工作空间），本批发起 " + batchGroups.length + " 个子代理归档 " + batchSessions + " 个会话" + (restGroups.length > 0 ? "（剩余 " + restGroups.reduce((a, g) => a + g.sessions.length, 0) + " 个留待下次）" : ""));
-            for (const g of batchGroups) {
-              try { await spawnStaleSummary(g); } catch (e) { cwarn("[dsh-memory] 归档发起异常:", e && e.message ? e.message : String(e)); }
-            }
-            batchGroups.forEach((g) => g.sessions.forEach((s) => STALE_NOTIFIED.add(s.id)));
-            // 剩余组不标记 → 下次 session-start/整合检查时再处理
-            if (restGroups.length > 0) {
-              clog("[dsh-memory] 剩余 " + restGroups.reduce((a, g) => a + g.sessions.length, 0) + " 个漏网会话将在下次检查时处理");
-            }
-          } else {
+            // 未发起成功不标记 → 下次再处理          } else {
             const lines = staleSessions.map((s) => {
               const days = Math.max(1, Math.round((Date.now() - s.mtime) / 86400000));
               return "- " + s.id + "（工作目录 " + s.ws.slice(0, 40) + "…，最后活动约 " + days + " 天前，日志 " + s.size + "B）";
             });
             const actionTxt =
               PLUGIN_CFG.staleAction === "approval"
-                ? "审批模式：请确认是否对以下会话发起子代理总结并写入 memory/（回复确认后执行）。"
+                ? "审批模式：确认后调用 stale_archive 工具即自动完成归档（插件提取消息流，单主子代理自主判断/总结/落盘，无需读原始日志）。"
                 : "处理（可选，由你决定）：若其中某个会话有值得归档的内容，可让我 review 其原始日志并总结进 memory/；若无需归档可忽略。";
             parts.push(
               "【dsh-memory 漏网会话提醒】检测到 " + staleSessions.length + " 个会话超过 " + PLUGIN_CFG.staleSessionDays + " 天无交互、且其内容未在记忆库 sessions/ 中落档（可能从未被总结）：\n" +
@@ -1571,6 +1532,30 @@ ctx.on("session/event", (session, event) => {
     } else {
       cerr("[dsh-memory] tools 服务不可用，memory_search 工具注册跳过（不影响记忆注入）");
     }
+
+      // v1.12.8：stale_archive —— approval 模式确认闭环（此前只有"问"没有"答"通路，模型确认后无法接续自动执行）
+      try {
+        toolSvc.register({
+          name: "stale_archive",
+          description: "对检测到的漏网会话发起记忆归档（dsh-memory approval 确认后调用）。插件自动提取消息流，单个主子代理自主判断价值/总结/落盘。无参数。",
+          parameters: { type: "object", properties: {}, required: [] },
+          output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
+          async execute() {
+            const stale = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
+              .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
+            if (stale.length === 0) return "当前没有待归档的漏网会话。";
+            const r = await runStaleArchive(stale);
+            if (r.ok) {
+              stale.forEach((s) => STALE_NOTIFIED.add(s.id));
+              return "已发起漏网归档主子代理（" + r.count + " 个会话" + (r.overflow > 0 ? "，另有 " + r.overflow + " 个留待下次" : "") + "），完成后控制台输出归档报告。";
+            }
+            return "归档未发起：" + r.reason;
+          }
+        });
+        clog("[dsh-memory] stale_archive 工具已注册（approval 确认通路）");
+      } catch (e) {
+        cerr("[dsh-memory] stale_archive 注册异常:", e && e.message ? e.message : String(e));
+      }
 
     // v1.5.0：定期自动整合记忆（对标 mimocode AutoDream 7d）
     // 宿主常驻进程 + ctx.interval 定时器；安装时记起始时间，每次整合完成刷新，下次再隔 integrateDays 天。
