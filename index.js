@@ -299,7 +299,21 @@ function updateMonitorSummary() {
     const eventN = Array.isArray(d.events) ? d.events.length : 0;
     const updD = (d.updatedAt > 0) ? new Date(d.updatedAt) : null;
     const updTxt = updD ? pad(updD.getHours()) + ":" + pad(updD.getMinutes()) : "-";
-    const s = "提醒 A:" + d.hints.A + "/B:" + d.hints.B + "/C:" + d.hints.C +
+    // 各类型提醒最近一次触发时间（从事件尾倒扫，取最后一条 hintX）
+    const lastHintT = {};
+    const evs = Array.isArray(d.events) ? d.events : [];
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const ty = evs[i] && evs[i].type;
+      if (ty === "hintA" || ty === "hintB" || ty === "hintC") {
+        if (lastHintT[ty] === void 0 && evs[i].t > 0) lastHintT[ty] = evs[i].t;
+        if (lastHintT.hintA !== void 0 && lastHintT.hintB !== void 0 && lastHintT.hintC !== void 0) break;
+      }
+    }
+    const hhmm = (t) => { const dt = new Date(t); return pad(dt.getHours()) + ":" + pad(dt.getMinutes()); };
+    const hintTxt = "A:" + d.hints.A + (lastHintT.hintA !== void 0 ? "(" + hhmm(lastHintT.hintA) + ")" : "") +
+      "/B:" + d.hints.B + (lastHintT.hintB !== void 0 ? "(" + hhmm(lastHintT.hintB) + ")" : "") +
+      "/C:" + d.hints.C + (lastHintT.hintC !== void 0 ? "(" + hhmm(lastHintT.hintC) + ")" : "");
+    const s = "提醒 " + hintTxt +
       " 记忆查询:" + d.queries +
       (followRate !== null ? " 跟进率:" + followRate + "%" : "") +
       (topDomains ? " 高频领域:" + topDomains : "") +
