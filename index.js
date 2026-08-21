@@ -125,7 +125,9 @@ const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
 // 关键词表从 index.md 自动提取（零维护）：解析 "名称 → 文件.md（描述）" 行 → 名称+描述词 = 匹配关键词。
 let MEMORY_HINT_TABLE = null;            // 懒加载：[{keywords:[...], file:"MEMORY-*.md", domain:"领域名"}]
 let MEMORY_HINT_TABLE_MTIME = 0;         // 缓存 index.md 的 mtime，变化才重建
-const MEMORY_HINT_THROTTLE = new Map();  // sessionId -> 上次 A 类提醒时间（30 分钟节流）
+const MEMORY_HINT_THROTTLE = new Map();  // sessionId -> 用户输入序号（每条 +1，v1.12.10 起）
+const MEMORY_HINT_LAST_SEQ = new Map();  // v1.12.10: sessionId -> 上次 A 类提醒时的输入序号（冷却闸：距上次 <2 条跳过）
+const MEMORY_HINT_SEEN = new Map();      // v1.12.10: sessionId -> Set<file> 已提醒过的记忆文件（领域去重闸）
 const MEMORY_HINT_ERRORS = new Map();    // sessionId -> Map<签名, 次数>（B/C 判断）
 
 // 从 index.md 自动提取"领域→记忆文件→关键词"匹配表
@@ -1240,15 +1242,20 @@ export default {
         // 判断 A：只在每轮第一条用户消息（step 1）做，命中已知领域才提醒
         if (step !== 1 || !agent || typeof agent.inject !== "function") return decision;
         const sid = (agent.session && agent.session.id) || "?";
-        // 节流：每会话每 3 次用户输入提醒 1 次（计数器，非时间）
-        const c3 = (MEMORY_HINT_THROTTLE.get(sid) || 0) + 1;
-        MEMORY_HINT_THROTTLE.set(sid, c3);
-        if (c3 % 3 !== 0) return decision;
+        // v1.12.10：检查/提醒解耦 —— 每条输入都跑关键词检查（免费）；提醒受两道闸：
+        //   ① 冷却：距上次提醒至少隔 1 条用户输入（用户定：第 1 条提醒了，最早第 3 条再提醒）
+        //   ② 领域去重：同会话同记忆文件只提醒 1 次；冷却期内的新领域保留不标已见，冷却后补提醒
+        const seq = (MEMORY_HINT_THROTTLE.get(sid) || 0) + 1;
+        MEMORY_HINT_THROTTLE.set(sid, seq);
+        const lastSeq = MEMORY_HINT_LAST_SEQ.get(sid) || -999;
+        const inCooldown = (seq - lastSeq) < 2;
         const userText = hintTextOf(messages);
         if (!userText) return decision;
-        // 记忆命中才继续（不命中不提示、不查 skill）
-        const memHits = matchMemoryHints(userText);
-        if (memHits.length === 0) return decision;
+        const hitsAll = matchMemoryHints(userText);
+        const seenDom = MEMORY_HINT_SEEN.get(sid) || new Set();
+        const memHits = hitsAll.filter((h) => !seenDom.has(h.file));
+        if (memHits.length === 0) return decision;      // 无新领域
+        if (inCooldown) return decision;                // 冷却中：保留待办，之后补提醒
         // 记忆命中 → 顺便查相关 skill（只在命中记忆时提示，避免误提醒）
         const skillHits = [];
         try {
@@ -1267,6 +1274,10 @@ export default {
         const memLines = memHits.map(h => "- 记忆: memory_search " + JSON.stringify(h.name) + "（" + h.file + "，踩坑/现成脚本/约定）").join("\n");
         const skillLines = skillHits.length > 0 ? "\n" + skillHits.map(s => "- skill: 技能目录加载 " + s + "（SKILL.md）").join("\n") : "";
         const hintText = "<system-reminder>\n【dsh-memory 提示】此任务可能涉及已知领域，建议先查再动手：\n" + memLines + skillLines + "\n（纯读零成本；若无关可忽略本条）\n</system-reminder>";
+        // v1.12.10：记录本次提醒序号 + 标记领域已见
+        MEMORY_HINT_LAST_SEQ.set(sid, seq);
+        memHits.forEach((h) => seenDom.add(h.file));
+        MEMORY_HINT_SEEN.set(sid, seenDom);
         // 监控：记录 A 类提醒（打开跟随判定窗口）
         monitorHintA(memHits[0] && memHits[0].name ? memHits[0].name : "?");
         // setTimeout(0) 推迟注入，避免 pre-step 窗口内重入
