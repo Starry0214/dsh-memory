@@ -145,7 +145,7 @@ window.__ModuleLoader__.load({
 				),
 				// 行：监控统计（只读汇总）
 				itemRow("记忆使用统计",
-					react.createElement("span", { style: { fontSize: "13px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", wordBreak: "break-all" } }, monitorSummary || "暂无统计（使用记忆/触发提醒后更新）")
+					react.createElement("span", { style: { fontSize: "13px", lineHeight: "22px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", overflowWrap: "break-word" } }, monitorSummary || "暂无统计（使用记忆/触发提醒后更新）")
 				)
 			);
 		}
