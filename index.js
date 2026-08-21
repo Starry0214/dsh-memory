@@ -300,8 +300,9 @@ function updateMonitorSummary() {
       " 记忆查询:" + d.queries +
       (followRate !== null ? " 跟进率:" + followRate + "%" : "") +
       (topDomains ? " 高频领域:" + topDomains : "");
-    if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.set === "function") {
-      HOST_SETTINGS_SCOPE.set("monitorSummary", s).catch(() => {});
+    // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
+    if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
+      HOST_SETTINGS_SCOPE.update({ monitorSummary: s }).catch(() => {});
     }
   } catch (e) { /* 汇总失败忽略 */ }
 }
@@ -1101,9 +1102,9 @@ export default {
           }
           // v1.4.0：更新只读统计（设置界面显示"未整合记忆会话数"）
           try {
-            if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.set === "function") {
+            if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
               const total = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id)).length;
-              HOST_SETTINGS_SCOPE.set("staleCount", total).catch(() => {});
+              HOST_SETTINGS_SCOPE.update({ staleCount: total }).catch(() => {});
             }
           } catch (e) { /* 统计更新失败不影响主流程 */ }
         }
