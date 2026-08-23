@@ -1340,7 +1340,8 @@ ctx.on("tools/result", (exec, result) => {
         const toolName = exec.tool || exec.name || "other";
         // 1) 监控：记录工具调用；memory_search/skill 触发查询统计与跟随判定
         if (toolName === "memory_search") {
-          const q = (exec.input && (exec.input.query || exec.input.name)) ? String(exec.input.query || exec.input.name) : "";
+          const minp = exec.arguments || exec.input || {};  // v1.12.13: 真实字段是 arguments（exec.input 不存在导致查询词恒空）
+          const q = (minp.query || minp.name) ? String(minp.query || minp.name) : "";
           monitorToolCall("memory_search", { query: q });
         } else if (toolName === "skill") {
           monitorToolCall("skill");
