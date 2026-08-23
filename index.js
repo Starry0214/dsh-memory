@@ -475,6 +475,8 @@ const SPIRAL_NEG_TH = 0.4;     // 窗口内负面结果占比阈值（S2）
 const SPIRAL_NEG_RE = /error|fail|exception|traceback|eperm|eacces|denied|not found|no such|不存在|失败|无法|超时|timeout|invalid|cannot|could not|refused|abort|证书|cert/i;
 const SPIRAL_SKIP = new Set(["job_output", "job_list", "job_kill", "memory_search", "skill", "todo_write"]);  // 轮询/元工具豁免
 let SPIRAL_WS = "?";             // v1.12.16.1: 当前会话工作空间尾段（纯诊断属性，不进判定逻辑）
+let DREAM_TRACK = null;   // v1.12.17: dream 运行跟踪 { since, sessionId, steps }（跨层共享）
+let DREAM_PATCH = null;   // v1.12.17: 进度落盘函数桥（闭包内注入，顶层监听调用）
 let TURN_CUR = null;           // 当前任务周期画像 { t0, calls, negN, errN, spiralN }
 const SPIRAL_WIN = [];         // 滑窗 [{argsTxt, resKey, neg, rep}]
 function diceBigram(a, b) {
@@ -1456,7 +1458,21 @@ ctx.on("tools/result", (exec, result) => {
           if (cw) SPIRAL_WS = String(cw).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "?";   // v1.12.16.1 诊断属性
         } catch (e) {}
         spiralObserve(toolName, exec.arguments, result, !!result.isError);
-        spiralObserve(toolName, exec.arguments, result, !!result.isError);
+        // v1.12.17: dream 心跳——发起后第一个出现的裸 UUID 会话即整合子代理
+        try {
+          if (DREAM_TRACK && DREAM_PATCH) {
+            const sid2 = exec.agent && exec.agent.session && exec.agent.session.id;
+            if (sid2 && sid2.indexOf("session-") !== 0) {
+              if (!DREAM_TRACK.sessionId) DREAM_TRACK.sessionId = sid2;
+              if (sid2 === DREAM_TRACK.sessionId) {
+                DREAM_TRACK.steps += 1;
+                if (DREAM_TRACK.steps % 5 === 1) {
+                  DREAM_PATCH({ steps: DREAM_TRACK.steps, lastTool: toolName, elapsedMin: Math.round(((Date.now() - DREAM_TRACK.since) / 6000)) / 100 });
+                }
+              }
+            }
+          }
+        } catch (e) {}
         // 2) 判断 B/C：仅工具执行失败时
         if (!result.isError) return;
         const agent = exec.agent;
@@ -1798,6 +1814,15 @@ ctx.on("session/event", (session, event) => {
       } catch (e) { return null; }
     }
 
+    // v1.12.17: dream 进度/结果落盘（GUI 不展示后台子代理会话——任何会话读 .integrate.json 可查）
+    function dreamProgressPatch(patch) {
+      try {
+        const st = readIntegrateState() || {};
+        st.progress = Object.assign({}, st.progress || {}, patch, { updatedAt: Date.now() });
+        writeIntegrateState(st);
+      } catch (e) { /* 忽略 */ }
+    }
+    DREAM_PATCH = dreamProgressPatch;
     async function spawnIntegrate(agentForParent, reason) {
       const subagents = ctx.get("subagents");
       if (!subagents || typeof subagents.start !== "function") {
@@ -1886,11 +1911,23 @@ ctx.on("session/event", (session, event) => {
         run.result.then((result) => {
           const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\\n");
           clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+          let u = null;
           const sdir = findNewestSpawnedSession(startedAt);
           if (sdir) {
-            const u = summarizeSubagentUsage(sdir);
+            u = summarizeSubagentUsage(sdir);
             if (u) clog("[dsh-memory] 整合消耗: 输入 " + u.input + " | 输出 " + u.output + " | 缓存命中 " + u.cache + " | 推理 " + u.reasoning + " tokens | 总时长 " + u.durMin + " 分钟");
           }
+          // v1.12.17: 完成回执落盘（错过控制台也能事后查）
+          if (DREAM_PATCH) {
+            DREAM_PATCH({
+              status: result.stopReason === "end" ? "done" : ("stopped:" + (result.stopReason || "?")),
+              finishedAt: Date.now(),
+              durMin: u ? u.durMin : Math.round(((Date.now() - startedAt) / 60000) * 10) / 10,
+              tokens: u ? ("in " + u.input + " / out " + u.output + " / cache " + u.cache) : null,
+              summary: outText.slice(0, 200)
+            });
+          }
+          DREAM_TRACK = null;
           if (outText.length > 0 && outText.length <= 600) {
             clog("[dsh-memory] 整合报告: " + outText.replace(/\\n/g, " | "));
           }
@@ -1901,8 +1938,12 @@ ctx.on("session/event", (session, event) => {
           clog("[dsh-memory] 下次自动整合：" + PLUGIN_CFG.integrateDays + " 天后");
         }).catch((e) => {
           cwarn("[dsh-memory] 自动整合子代理失败:", e && e.message ? e.message : String(e));
+          if (DREAM_TRACK && DREAM_PATCH) { DREAM_PATCH({ status: "failed", error: String((e && e.message) || e).slice(0, 120) }); }
+          DREAM_TRACK = null;
         });
-        clog("[dsh-memory] 已发起自动整合子代理（" + reason + "，后台执行中）");
+        DREAM_TRACK = { since: Date.now(), sessionId: null, steps: 0 };
+        dreamProgressPatch({ status: "running", reason: reason, startedAt: Date.now(), steps: 0, lastTool: "-" });
+        clog("[dsh-memory] 已发起自动整合子代理（" + reason + "，后台执行中；进度见 ~/.dsh/memory/.integrate.json progress 字段）");
         return true;
       } catch (e) {
         cwarn("[dsh-memory] 自动整合启动失败:", e && e.message ? e.message : String(e));
@@ -1954,7 +1995,7 @@ ctx.on("session/event", (session, event) => {
           handler: async (inv) => {
             const started = await spawnIntegrate(inv.agent, "手动");
             return started
-              ? { kind: "success", text: "已发起记忆整合（后台执行，完成后自动刷新下次自动整合时间）。" }
+? { kind: "success", text: "已发起记忆整合（后台执行中）。进度实时写入 ~/.dsh/memory/.integrate.json 的 progress 字段——任意会话问「dream 跑到哪了」即可查询；完成后控制台输出消耗报告。" }
               : { kind: "error", text: "整合启动失败（无可用父 agent 或 subagents 服务不可用），请稍后重试。" };
           }
         });
