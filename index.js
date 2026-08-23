@@ -279,7 +279,9 @@ function sectionAwareSlice(text, budgetChars, fileLabel) {
 // v1.12.0：使用监控 —— 记录提醒/查询/错误事件，供设置界面展示 + 使用一段时间后优化。
 // 数据存 .monitor.json（全量保留，无窗口限制）；设置界面显示精简汇总（monitorSummary 只读字段）。
 const MONITOR_FILE = MEMORY_ROOT + "/.monitor.json";
-const MONITOR_FOLLOW_WINDOW = 3;   // 提醒后 N 个工具调用内调用 memory_search/skill 视为"跟随"
+// v1.12.15: 跟进窗口上限——A 类按任务周期（下一条用户输入结算，此处仅防失控上限）；B/C 类按修错场景固定步数
+const FOLLOW_CAP_A = 20;
+const FOLLOW_CAP_BC = 8;
 let MONITOR_DATA = null;           // 懒加载
 let MONITOR_DOLLAR = false;        // 写入防抖标记（避免高频工具调用频繁写盘）
 // v1.12.14: 未决跟随窗口改为持久化——唯一真源是 .monitor.json 的 hintOpen 字段（{ type, count }），跨重启续判
@@ -297,7 +299,7 @@ function defaultMonitorData() {
     recentQueries: [],                // 最近查询（最多 20 条 {t, query}）
     followed: 0, ignored: 0,          // 提醒后是否被跟随（有效/忽略）
     events: [],                       // 全量事件 {t, type, detail}（全量保留）
-    hintOpen: null };                 // v1.12.14: 未决跟随窗口 { type, count }——持久化，跨重启续判
+    hintOpen: null };                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
 }
 
 function readMonitorData() {
@@ -408,7 +410,7 @@ function monitorHintA(domainName) {
   const d = readMonitorData();
   d.hints.A += 1;
   if (domainName) d.byDomain[domainName] = (d.byDomain[domainName] || 0) + 1;
-  d.hintOpen = { type: "A", count: 0 };  // v1.12.14: 持久化未决窗口
+  d.hintOpen = { kind: "A", type: "A", count: 0 };  // v1.12.15: 窗口至下一条用户输入（上限 20 调用）
   monitorEvent("hintA", { domain: domainName || "?", time: Date.now() });
 }
 
@@ -416,34 +418,40 @@ function monitorHintA(domainName) {
 function monitorHintBC(type) {
   const d = readMonitorData();
   d.hints[type] = (d.hints[type] || 0) + 1;
-  d.hintOpen = { type: type, count: 0 };  // v1.12.14: 持久化未决窗口
+  d.hintOpen = { kind: "BC", type: type, count: 0 };  // v1.12.15: 上限 8 调用
   monitorEvent("hint" + type, { time: Date.now() });
 }
 
 // 工具调用：记录 memory_search/skill 行为 + 跟随判定
-function monitorToolCall(toolName, ...rest) {
+function monitorToolCall(toolName, meta, args) {
   try {
     if (PLUGIN_CFG.monitorEnabled === false) return;
     const d = readMonitorData();
     if (toolName === "memory_search") {
       d.queries += 1;
-      const q = (rest[0] && rest[0].query) || "";
+      const q = (meta && meta.query) || "";
       d.recentQueries.push({ t: Date.now(), query: String(q).slice(0, 60) });
       if (d.recentQueries.length > 20) d.recentQueries = d.recentQueries.slice(-20);
     }
-    if (toolName === "memory_search" || toolName === "skill") {
-      // 跟随判定：若有待判定提醒且在窗口内
-      if (d.hintOpen && d.hintOpen.count <= MONITOR_FOLLOW_WINDOW) {
+    // v1.12.15：跟随信号集——①memory_search/skill ②read/grep/glob 目标路径含 .dsh/memory（直读记忆文件是最常见跟随形态）
+    const isQuerySignal = toolName === "memory_search" || toolName === "skill";
+    let memReadSignal = false;
+    if (!isQuerySignal && d.hintOpen && (toolName === "read" || toolName === "grep" || toolName === "glob")) {
+      const p = String((args && (args.file_path || args.path)) || "").toLowerCase().replace(/\\/g, "/");
+      memReadSignal = p.includes(".dsh/memory");
+    }
+    // 三态判定：信号命中 → followed；窗口超限 → ignored；未超限 → 保持 open（不计入分母，跨重启续判）
+    if (d.hintOpen) {
+      if (isQuerySignal || memReadSignal) {
         d.followed += 1;
         d.hintOpen = null;
-      }
-    }
-    // 每次工具调用推进窗口计数；窗口超限且仍有待判定 → 记为忽略
-    if (d.hintOpen) {
-      d.hintOpen.count += 1;
-      if (d.hintOpen.count > MONITOR_FOLLOW_WINDOW) {
-        d.ignored += 1;
-        d.hintOpen = null;
+      } else {
+        d.hintOpen.count += 1;
+        const cap = d.hintOpen.kind === "A" ? FOLLOW_CAP_A : FOLLOW_CAP_BC;
+        if (d.hintOpen.count > cap) {
+          d.ignored += 1;
+          d.hintOpen = null;
+        }
       }
     }
     // v1.12.14: hintOpen 随尾部 monitorEvent 防抖写盘持久化，跨重启续判
@@ -1287,6 +1295,15 @@ export default {
         // 判断 A：只在每轮第一条用户消息（step 1）做，命中已知领域才提醒
         if (step !== 1 || !agent || typeof agent.inject !== "function") return decision;
         const sid = (agent.session && agent.session.id) || "?";
+        // v1.12.15：新用户输入 = 上一任务周期结束——未决跟随窗口结算为 ignored（本周期无显式跟随信号）
+        try {
+          const dm = readMonitorData();
+          if (dm.hintOpen) {
+            dm.ignored += 1;
+            dm.hintOpen = null;
+            scheduleMonitorSave();
+          }
+        } catch (e) {}
         // v1.12.10：检查/提醒解耦 —— 每条输入都跑关键词检查（免费）；提醒受两道闸：
         //   ① 冷却：距上次提醒至少隔 1 条用户输入（用户定：第 1 条提醒了，最早第 3 条再提醒）
         //   ② 领域去重：同会话同记忆文件只提醒 1 次；冷却期内的新领域保留不标已见，冷却后补提醒
@@ -1345,7 +1362,7 @@ ctx.on("tools/result", (exec, result) => {
         } else if (toolName === "skill") {
           monitorToolCall("skill");
         } else {
-          monitorToolCall(toolName);
+          monitorToolCall(toolName, null, exec.arguments);
         }
         // 2) 判断 B/C：仅工具执行失败时
         if (!result.isError) return;
