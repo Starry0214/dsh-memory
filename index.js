@@ -282,8 +282,7 @@ const MONITOR_FILE = MEMORY_ROOT + "/.monitor.json";
 const MONITOR_FOLLOW_WINDOW = 3;   // 提醒后 N 个工具调用内调用 memory_search/skill 视为"跟随"
 let MONITOR_DATA = null;           // 懒加载
 let MONITOR_DOLLAR = false;        // 写入防抖标记（避免高频工具调用频繁写盘）
-let MONITOR_HINT_OPEN = null;      // 当前"待判定"的提醒：{ seq, type, domain, name }，跟随判定用
-let MONITOR_HINT_OPEN_COUNT = 0;   // 提醒后的工具调用计数
+// v1.12.14: 未决跟随窗口改为持久化——唯一真源是 .monitor.json 的 hintOpen 字段（{ type, count }），跨重启续判
 let MONITOR_LAST_SUMMARY = "";     // v1.12.6: 上次推送的汇总串（内容不变不重复推送）
 let MONITOR_LAST_PUSH_AT = 0;      // v1.12.6: 上次推送时间戳（60s 节流，防高频工具调用刷屏）
 let MONITOR_PUSH_TIMER = null;     // v1.12.6: 节流到期补推定时器
@@ -297,7 +296,8 @@ function defaultMonitorData() {
     queries: 0,                       // memory_search 总调用数
     recentQueries: [],                // 最近查询（最多 20 条 {t, query}）
     followed: 0, ignored: 0,          // 提醒后是否被跟随（有效/忽略）
-    events: [] };                     // 全量事件 {t, type, detail}（全量保留）
+    events: [],                       // 全量事件 {t, type, detail}（全量保留）
+    hintOpen: null };                 // v1.12.14: 未决跟随窗口 { type, count }——持久化，跨重启续判
 }
 
 function readMonitorData() {
@@ -408,8 +408,7 @@ function monitorHintA(domainName) {
   const d = readMonitorData();
   d.hints.A += 1;
   if (domainName) d.byDomain[domainName] = (d.byDomain[domainName] || 0) + 1;
-  MONITOR_HINT_OPEN = { type: "A", domain: domainName || "?" };
-  MONITOR_HINT_OPEN_COUNT = 0;
+  d.hintOpen = { type: "A", count: 0 };  // v1.12.14: 持久化未决窗口
   monitorEvent("hintA", { domain: domainName || "?", time: Date.now() });
 }
 
@@ -417,8 +416,7 @@ function monitorHintA(domainName) {
 function monitorHintBC(type) {
   const d = readMonitorData();
   d.hints[type] = (d.hints[type] || 0) + 1;
-  MONITOR_HINT_OPEN = { type: type };
-  MONITOR_HINT_OPEN_COUNT = 0;
+  d.hintOpen = { type: type, count: 0 };  // v1.12.14: 持久化未决窗口
   monitorEvent("hint" + type, { time: Date.now() });
 }
 
@@ -435,19 +433,20 @@ function monitorToolCall(toolName, ...rest) {
     }
     if (toolName === "memory_search" || toolName === "skill") {
       // 跟随判定：若有待判定提醒且在窗口内
-      if (MONITOR_HINT_OPEN && MONITOR_HINT_OPEN_COUNT <= MONITOR_FOLLOW_WINDOW) {
+      if (d.hintOpen && d.hintOpen.count <= MONITOR_FOLLOW_WINDOW) {
         d.followed += 1;
-        MONITOR_HINT_OPEN = null;
+        d.hintOpen = null;
       }
     }
     // 每次工具调用推进窗口计数；窗口超限且仍有待判定 → 记为忽略
-    if (MONITOR_HINT_OPEN) {
-      MONITOR_HINT_OPEN_COUNT += 1;
-      if (MONITOR_HINT_OPEN_COUNT > MONITOR_FOLLOW_WINDOW) {
+    if (d.hintOpen) {
+      d.hintOpen.count += 1;
+      if (d.hintOpen.count > MONITOR_FOLLOW_WINDOW) {
         d.ignored += 1;
-        MONITOR_HINT_OPEN = null;
+        d.hintOpen = null;
       }
     }
+    // v1.12.14: hintOpen 随尾部 monitorEvent 防抖写盘持久化，跨重启续判
     monitorEvent("tool", { name: toolName });
   } catch (e) { /* 忽略 */ }
 }
