@@ -474,6 +474,7 @@ const SPIRAL_REP_TH = 0.45;    // 窗口内打转占比阈值
 const SPIRAL_NEG_TH = 0.4;     // 窗口内负面结果占比阈值（S2）
 const SPIRAL_NEG_RE = /error|fail|exception|traceback|eperm|eacces|denied|not found|no such|不存在|失败|无法|超时|timeout|invalid|cannot|could not|refused|abort|证书|cert/i;
 const SPIRAL_SKIP = new Set(["job_output", "job_list", "job_kill", "memory_search", "skill", "todo_write"]);  // 轮询/元工具豁免
+let SPIRAL_WS = "?";             // v1.12.16.1: 当前会话工作空间尾段（纯诊断属性，不进判定逻辑）
 let TURN_CUR = null;           // 当前任务周期画像 { t0, calls, negN, errN, spiralN }
 const SPIRAL_WIN = [];         // 滑窗 [{argsTxt, resKey, neg, rep}]
 function diceBigram(a, b) {
@@ -501,10 +502,11 @@ function spiralObserve(toolName, args, result, isError) {
     const neg = !rTxt.trim() || isError || SPIRAL_NEG_RE.test(rTxt.slice(0, 200));
     let rep = 0;
     for (const w of SPIRAL_WIN) { if (diceBigram(aTxt, w.argsTxt) >= SPIRAL_SIM_TH) { rep = 1; break; } }
-    SPIRAL_WIN.push({ argsTxt: aTxt, resKey: rTxt.slice(0, 80), neg: neg ? 1 : 0, rep });
+    SPIRAL_WIN.push({ argsTxt: aTxt, resKey: rTxt.slice(0, 80), neg: neg ? 1 : 0, rep, tool: toolName });
     if (SPIRAL_WIN.length > SPIRAL_W) SPIRAL_WIN.shift();
-    if (!TURN_CUR) TURN_CUR = { t0: Date.now(), calls: 0, negN: 0, errN: 0, spiralN: 0 };
+    if (!TURN_CUR) TURN_CUR = { t0: Date.now(), calls: 0, negN: 0, errN: 0, spiralN: 0, tools: {} };
     TURN_CUR.calls += 1;
+    TURN_CUR.tools[toolName] = (TURN_CUR.tools[toolName] || 0) + 1;   // v1.12.16.1 周期工具分布
     if (neg) TURN_CUR.negN += 1;
     if (isError) TURN_CUR.errN += 1;
     if (SPIRAL_WIN.length >= 5) {
@@ -516,7 +518,10 @@ function spiralObserve(toolName, args, result, isError) {
         if (TURN_CUR.spiralN === 1) {   // 每周期只记首次样本，防膨胀
           const d = readMonitorData();
           if (!Array.isArray(d.spiralEvents)) d.spiralEvents = [];
-          d.spiralEvents.push({ t: Date.now(), tool: toolName, repRate: Math.round(repRate * 100) / 100, negRate: Math.round(negRate * 100) / 100, sample: aTxt.slice(0, 60) });
+          const tCnt = {};
+          for (const w2 of SPIRAL_WIN) tCnt[w2.tool] = (tCnt[w2.tool] || 0) + 1;
+          const wTop = Object.entries(tCnt).sort((a2, b2) => b2[1] - a2[1]).slice(0, 2).map((x2) => x2[0]).join(",");
+          d.spiralEvents.push({ t: Date.now(), tool: toolName, repRate: Math.round(repRate * 100) / 100, negRate: Math.round(negRate * 100) / 100, sample: aTxt.slice(0, 60), ws: SPIRAL_WS, topTools: wTop });
           if (d.spiralEvents.length > 100) d.spiralEvents = d.spiralEvents.slice(-100);
           scheduleMonitorSave();
         }
@@ -530,7 +535,8 @@ function settleTurnProfile() {
     if (!TURN_CUR || !TURN_CUR.calls) { TURN_CUR = null; SPIRAL_WIN.length = 0; return; }
     const d = readMonitorData();
     if (!Array.isArray(d.turnProfiles)) d.turnProfiles = [];
-    d.turnProfiles.push({ t: Date.now(), durMin: Math.round(((Date.now() - TURN_CUR.t0) / 6000)) / 100, calls: TURN_CUR.calls, negN: TURN_CUR.negN, errN: TURN_CUR.errN, spiralN: TURN_CUR.spiralN });
+    const pTop = Object.entries(TURN_CUR.tools || {}).sort((a2, b2) => b2[1] - a2[1]).slice(0, 2).map((x2) => x2[0]).join(",");
+    d.turnProfiles.push({ t: Date.now(), durMin: Math.round(((Date.now() - TURN_CUR.t0) / 6000)) / 100, calls: TURN_CUR.calls, negN: TURN_CUR.negN, errN: TURN_CUR.errN, spiralN: TURN_CUR.spiralN, ws: SPIRAL_WS, topTools: pTop });
     if (d.turnProfiles.length > 200) d.turnProfiles = d.turnProfiles.slice(-200);
     TURN_CUR = null;
     SPIRAL_WIN.length = 0;
@@ -1444,6 +1450,12 @@ ctx.on("tools/result", (exec, result) => {
           monitorToolCall(toolName, null, exec.arguments);
         }
         // v1.12.16: 过程信号探针（影子）——覆盖被 isError 漏掉的失败形态（catch 吞错/exit码）
+        try {
+          const s2 = exec.agent && exec.agent.session;
+          const cw = s2 && ((s2.header && s2.header.cwd) || s2.cwd);
+          if (cw) SPIRAL_WS = String(cw).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "?";   // v1.12.16.1 诊断属性
+        } catch (e) {}
+        spiralObserve(toolName, exec.arguments, result, !!result.isError);
         spiralObserve(toolName, exec.arguments, result, !!result.isError);
         // 2) 判断 B/C：仅工具执行失败时
         if (!result.isError) return;
