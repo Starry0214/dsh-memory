@@ -1810,7 +1810,10 @@ ctx.on("session/event", (session, event) => {
           if (j.type === "turn/start") t0 = j.time;
           if (j.type === "turn/end") t1 = j.time;
         }
-        return { input: inT, output: outT, cache: cacheT, reasoning: reasonT, durMin: t1 > t0 ? Math.round((t1 - t0) / 60000 * 10) / 10 : 0 };
+        // v1.12.17.1: turn/end 可能尚未落盘（完成回调与日志写盘竞态）→ t0 兜底到当前时间
+        const durMin = t1 > t0 ? Math.round((t1 - t0) / 60000 * 10) / 10 : (t0 > 0 ? Math.round((Date.now() - t0) / 60000 * 10) / 10 : 0);
+        // v1.12.17.1: 口径修正——inputTokens 仅是未命中部分，总输入 = inputTokens + cacheReadTokens
+        return { input: inT, output: outT, cache: cacheT, totalIn: inT + cacheT, reasoning: reasonT, durMin: durMin };
       } catch (e) { return null; }
     }
 
@@ -1915,7 +1918,7 @@ ctx.on("session/event", (session, event) => {
           const sdir = findNewestSpawnedSession(startedAt);
           if (sdir) {
             u = summarizeSubagentUsage(sdir);
-            if (u) clog("[dsh-memory] 整合消耗: 输入 " + u.input + " | 输出 " + u.output + " | 缓存命中 " + u.cache + " | 推理 " + u.reasoning + " tokens | 总时长 " + u.durMin + " 分钟");
+            if (u) clog("[dsh-memory] 整合消耗: 总输入 " + (u.totalIn || u.input) + " tokens（其中缓存命中 " + u.cache + "）| 输出 " + u.output + (u.reasoning > 0 ? " | 推理 " + u.reasoning : "") + " tokens | 总时长 " + u.durMin + " 分钟");
           }
           // v1.12.17: 完成回执落盘（错过控制台也能事后查）
           if (DREAM_PATCH) {
@@ -1923,7 +1926,7 @@ ctx.on("session/event", (session, event) => {
               status: result.stopReason === "end" ? "done" : ("stopped:" + (result.stopReason || "?")),
               finishedAt: Date.now(),
               durMin: u ? u.durMin : Math.round(((Date.now() - startedAt) / 60000) * 10) / 10,
-              tokens: u ? ("in " + u.input + " / out " + u.output + " / cache " + u.cache) : null,
+              tokens: u ? ("totalIn " + (u.totalIn || u.input) + " (cache " + u.cache + ") / out " + u.output) : null,
               summary: outText.slice(0, 200)
             });
           }
