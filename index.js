@@ -297,9 +297,11 @@ function defaultMonitorData() {
     byDomain: {},                     // A 类提醒按领域统计 { 领域名: 次数 }
     queries: 0,                       // memory_search 总调用数
     recentQueries: [],                // 最近查询（最多 20 条 {t, query}）
-    followed: 0, ignored: 0,          // 提醒后是否被跟随（有效/忽略）
+    followed: 0, ignored: 0, capped: 0,          // 提醒后是否被跟随（有效/忽略）；capped=v1.12.16 窗口超限截断（长任务），不计跟进率分母
     events: [],                       // 全量事件 {t, type, detail}（全量保留）
-    hintOpen: null };                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
+    hintOpen: null,
+    turnProfiles: [],                   // v1.12.16: 任务周期画像 [{t,durMin,calls,negN,errN,spiralN}]（滚动200条，调优基线）
+    spiralEvents: [] };                 // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（影子记录，不注入）                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
 }
 
 function readMonitorData() {
@@ -364,15 +366,19 @@ function updateMonitorSummary() {
     // v1.12.5：统计行改多行分明格式（client 端 pre-wrap 渲染换行）；数组 join 构造，禁止模板字符串写 \n（v1.12.3 教训）
     const sumLines = [
       "提醒  " + fmtHint("A", d.hints.A, lastHintT.hintA) + "｜" + fmtHint("B", d.hints.B, lastHintT.hintB) + "｜" + fmtHint("C", d.hints.C, lastHintT.hintC),
-      "查询  记忆查询 " + d.queries + " 次" + (followRate !== null ? " · 跟进率 " + followRate + "%" : "")
+      "查询  记忆查询 " + d.queries + " 次" + (followRate !== null ? " · 跟进率 " + followRate + "%" : "") + ((d.capped || 0) > 0 ? " · capped " + d.capped : "")
     ];
     if (topDomains) sumLines.push("领域  " + topDomains.split(",").join("、"));
+    const profN = Array.isArray(d.turnProfiles) ? d.turnProfiles.length : 0;
+    const spirN = Array.isArray(d.spiralEvents) ? d.spiralEvents.length : 0;
+    sumLines.push("过程  打转告警 " + spirN + " 次 · 周期画像 " + profN + " 轮");
     sumLines.push(
       "累计  " + eventN + " 事件 · 更新 " + updTxt,
       "",
       "A = 命中领域关键词，先查记忆再动手",
       "B = 同一错误第2次，提醒立即查",
-      "C = 连续失败3次，强制查记忆+skill"
+      "C = 连续失败3次，强制查记忆+skill",
+      "capped = 窗口超限截断（长任务），不计入跟进率"
     );
     const s = sumLines.join("\n");
     // v1.12.6：变化守卫 + 60s 节流 —— 内容没变不推；变了但距上次推送 <60s 先不推（每个工具调用都会产生 tool 事件并刷新 updatedAt/eventN），到期自动补推
@@ -449,7 +455,7 @@ function monitorToolCall(toolName, meta, args) {
         d.hintOpen.count += 1;
         const cap = d.hintOpen.kind === "A" ? FOLLOW_CAP_A : FOLLOW_CAP_BC;
         if (d.hintOpen.count > cap) {
-          d.ignored += 1;
+          d.capped += 1;  // v1.12.16: 超限=窗口被截断（如83调用长轮），非主动忽略
           d.hintOpen = null;
         }
       }
@@ -459,6 +465,78 @@ function monitorToolCall(toolName, meta, args) {
   } catch (e) { /* 忽略 */ }
 }
 
+// ── v1.12.16: 过程信号探针（影子模式）─────────────────────────
+// 「参数打转 × 无进展」双条件识别原地空转（回测标定：试错链命中、正常翻页不误报）。
+// 只落盘 spiralEvents/turnProfiles 供阈值调优，不注入任何提示。
+const SPIRAL_W = 8;            // 滑窗大小
+const SPIRAL_SIM_TH = 0.7;     // args bigram Dice 相似度阈值（S1）
+const SPIRAL_REP_TH = 0.45;    // 窗口内打转占比阈值
+const SPIRAL_NEG_TH = 0.4;     // 窗口内负面结果占比阈值（S2）
+const SPIRAL_NEG_RE = /error|fail|exception|traceback|eperm|eacces|denied|not found|no such|不存在|失败|无法|超时|timeout|invalid|cannot|could not|refused|abort|证书|cert/i;
+const SPIRAL_SKIP = new Set(["job_output", "job_list", "job_kill", "memory_search", "skill", "todo_write"]);  // 轮询/元工具豁免
+let TURN_CUR = null;           // 当前任务周期画像 { t0, calls, negN, errN, spiralN }
+const SPIRAL_WIN = [];         // 滑窗 [{argsTxt, resKey, neg, rep}]
+function diceBigram(a, b) {
+  const grams = (s) => { const set = new Set(); for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2)); return set; };
+  if (!a || !b) return 0;
+  const A = grams(a), B = grams(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  return (2 * inter) / (A.size + B.size);
+}
+function spiralObserve(toolName, args, result, isError) {
+  try {
+    if (PLUGIN_CFG.monitorEnabled === false || SPIRAL_SKIP.has(toolName)) return;
+    let aTxt = "";
+    try { aTxt = String(typeof args === "string" ? args : JSON.stringify(args) || ""); } catch (e) { aTxt = ""; }
+    aTxt = aTxt.replace(/\s+/g, " ").slice(0, 600);
+    let rTxt = "";
+    try {
+      if (result && Array.isArray(result.content)) rTxt = result.content.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join(" ");
+      else if (typeof result === "string") rTxt = result;
+      else rTxt = JSON.stringify(result) || "";
+    } catch (e) { rTxt = ""; }
+    rTxt = rTxt.replace(/\s+/g, " ");
+    const neg = !rTxt.trim() || isError || SPIRAL_NEG_RE.test(rTxt.slice(0, 200));
+    let rep = 0;
+    for (const w of SPIRAL_WIN) { if (diceBigram(aTxt, w.argsTxt) >= SPIRAL_SIM_TH) { rep = 1; break; } }
+    SPIRAL_WIN.push({ argsTxt: aTxt, resKey: rTxt.slice(0, 80), neg: neg ? 1 : 0, rep });
+    if (SPIRAL_WIN.length > SPIRAL_W) SPIRAL_WIN.shift();
+    if (!TURN_CUR) TURN_CUR = { t0: Date.now(), calls: 0, negN: 0, errN: 0, spiralN: 0 };
+    TURN_CUR.calls += 1;
+    if (neg) TURN_CUR.negN += 1;
+    if (isError) TURN_CUR.errN += 1;
+    if (SPIRAL_WIN.length >= 5) {
+      const n = SPIRAL_WIN.length;
+      const repRate = SPIRAL_WIN.reduce((s2, w2) => s2 + w2.rep, 0) / n;
+      const negRate = SPIRAL_WIN.reduce((s2, w2) => s2 + w2.neg, 0) / n;
+      if (repRate >= SPIRAL_REP_TH && negRate >= SPIRAL_NEG_TH && TURN_CUR) {
+        TURN_CUR.spiralN += 1;
+        if (TURN_CUR.spiralN === 1) {   // 每周期只记首次样本，防膨胀
+          const d = readMonitorData();
+          if (!Array.isArray(d.spiralEvents)) d.spiralEvents = [];
+          d.spiralEvents.push({ t: Date.now(), tool: toolName, repRate: Math.round(repRate * 100) / 100, negRate: Math.round(negRate * 100) / 100, sample: aTxt.slice(0, 60) });
+          if (d.spiralEvents.length > 100) d.spiralEvents = d.spiralEvents.slice(-100);
+          scheduleMonitorSave();
+        }
+      }
+    }
+  } catch (e) { /* 探针失败不影响会话 */ }
+}
+// v1.12.16: 任务周期画像结算（pre-step 新用户输入时调用）——后续动态阈值的基线数据
+function settleTurnProfile() {
+  try {
+    if (!TURN_CUR || !TURN_CUR.calls) { TURN_CUR = null; SPIRAL_WIN.length = 0; return; }
+    const d = readMonitorData();
+    if (!Array.isArray(d.turnProfiles)) d.turnProfiles = [];
+    d.turnProfiles.push({ t: Date.now(), durMin: Math.round(((Date.now() - TURN_CUR.t0) / 6000)) / 100, calls: TURN_CUR.calls, negN: TURN_CUR.negN, errN: TURN_CUR.errN, spiralN: TURN_CUR.spiralN });
+    if (d.turnProfiles.length > 200) d.turnProfiles = d.turnProfiles.slice(-200);
+    TURN_CUR = null;
+    SPIRAL_WIN.length = 0;
+    scheduleMonitorSave();
+  } catch (e) { /* 忽略 */ }
+}
 function findStaleSessions(maxAgeDays, afterTime) {
   const stale = [];
   // v1.11.0：记忆暂停（active=false，afterTime 为 null）→ 不纳入任何漏网
@@ -1303,6 +1381,7 @@ export default {
             dm.hintOpen = null;
             scheduleMonitorSave();
           }
+          settleTurnProfile();  // v1.12.16: 新用户输入=上一任务周期结束，落盘轮次画像
         } catch (e) {}
         // v1.12.10：检查/提醒解耦 —— 每条输入都跑关键词检查（免费）；提醒受两道闸：
         //   ① 冷却：距上次提醒至少隔 1 条用户输入（用户定：第 1 条提醒了，最早第 3 条再提醒）
@@ -1364,6 +1443,8 @@ ctx.on("tools/result", (exec, result) => {
         } else {
           monitorToolCall(toolName, null, exec.arguments);
         }
+        // v1.12.16: 过程信号探针（影子）——覆盖被 isError 漏掉的失败形态（catch 吞错/exit码）
+        spiralObserve(toolName, exec.arguments, result, !!result.isError);
         // 2) 判断 B/C：仅工具执行失败时
         if (!result.isError) return;
         const agent = exec.agent;
