@@ -598,49 +598,10 @@ function decompressSessionLog(filePath) {
     return out.toString("utf8");
   } catch (e) { return null; }
 }
-// v1.8.0：提取会话「对话消息流」（根治 token 爆炸的正式方案）——
-// 解压日志后提取 user/assistant 消息的文本内容（过滤 system-reminder 注入、工具结果、chunk 噪音），
-// 得到最新、紧凑、不遗漏的对话流（实测 6.37M token 原始日志 → ~12K token 消息流，缩小 ~500 倍）。
-// 子代理只读消息流总结归档，不碰原始日志。每消息截断防单条超长。
-function extractMessageFlow(filePath, maxChars) {
-  const limit = maxChars || 8000;
-  try {
-    const text = decompressSessionLog(filePath);
-    if (!text) return null;
-    const lines = text.split("\n").filter((l) => l.trim());
-    const parts = [];
-    let total = 0;
-    for (const l of lines) {
-      let j;
-      try { j = JSON.parse(l); } catch (e) { continue; }
-      if (j.type === "user/message") {
-        const content = j.data && j.data.content;
-        if (!Array.isArray(content)) continue;
-        const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
-        if (!txt) continue;
-        // 过滤 dsh-memory 注入的 system-reminder（非用户真实交互）
-        if (txt.startsWith("<system-reminder>")) continue;
-        const piece = "[用户] " + txt.slice(0, 800);
-        parts.push(piece); total += piece.length;
-      } else if (j.type === "assistant/message") {
-        const content = j.data && j.data.message && j.data.message.content;
-        if (!Array.isArray(content)) continue;
-        const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
-        if (!txt) continue;
-        const piece = "[助手] " + txt.slice(0, 1000);
-        parts.push(piece); total += piece.length;
-      }
-      if (total > limit) break; // 防超长，截断
-    }
-    if (parts.length === 0) return null;
-    return parts.join("\n").slice(0, limit);
-  } catch (e) { return null; }
-}
-    // v1.12.18: 快速消息流提取——帧级采样 + 行级快筛 + 工具轨迹 + 动态预算。
-    // 地基实测：zstd 多帧串联可按帧独立解压（subarray 从某帧 magic 起，单帧语义）。
-    // 大文件不再跳过（撤销 v1.12.17.2 的 25MB 截断）：首尾保真 + 中段均匀采样的有损可控视图。
-    // 逐帧间 setImmediate 让出，主线程不冻结。
-    // v1.12.18.2: 优先提取官方 compaction/summary 摘要链（完整上下文浓缩），消息流降为兜底。
+// v1.12.18.4: 旧版 extractMessageFlow（8000 截断）已删除——改为 extractMessageFlowAsync（compaction 优先 + 分段 map-reduce）
+    // v1.12.18+: 分层提取——先官方 compaction/summary 摘要链（完整上下文浓缩含工具脉络），
+    // 无压缩史的会话走帧级采样+行级快筛+工具轨迹+动态预算；大会话分段交 map-reduce 仿真压缩。
+    // 逐帧间 setImmediate 让出，主线程不冻结；zstd 多帧可独立解压（实测单帧语义）。
     async function extractMessageFlowAsync(filePath) {
       try {
         const st = fs.statSync(filePath);
@@ -662,7 +623,8 @@ function extractMessageFlow(filePath, maxChars) {
           if (frames.length >= 4) selected.push(frames[frames.length - 2], frames[frames.length - 1]);
           selected = Array.from(new Set(selected)).sort((a, b) => a - b);
         }
-        const maxChars = sizeMB < 5 ? 8000 : sizeMB < 15 ? 16000 : 32000;
+        // v1.12.18.3: 大会话预算放宽至 200K——不再截断丢弃，提取后按 40K 分段走 map-reduce 仿真压缩
+        const maxChars = sizeMB < 5 ? 8000 : 200000;
         // v1.12.18.2: 同一趟遍历双收获——官方 compaction 摘要（模型看过完整上下文含工具调用，
         // 大会话必有）优先于任何采样消息流；compParts 非空则最终以它为准。
         const compParts = [];
@@ -726,7 +688,20 @@ function extractMessageFlow(filePath, maxChars) {
           return { flow: flowOut.slice(-maxChars), sampled: false, source: "compaction", compCount: compParts.length };
         }
         if (parts.length === 0) return null;
-        return { flow: joinParts(parts).slice(0, maxChars), sampled: !FULL, source: "messageflow" };
+        // v1.12.18.3: 无压缩史 → 按 40K 分段输出（≤5 段；超出保首尾均匀取中），供 map-reduce 仿真压缩
+        const allText = joinParts(parts);
+        const SEG = 40000, MAX_SEG = 5;
+        const segments = [];
+        for (let i = 0; i < allText.length && segments.length < MAX_SEG; i += SEG) segments.push(allText.slice(i, i + SEG));
+        if (allText.length > SEG * MAX_SEG) {
+          const tail = allText.slice(allText.length - SEG);
+          const midA = SEG, span = allText.length - SEG * 2;
+          const dense = [allText.slice(0, SEG)];
+          for (let k = 1; k < MAX_SEG - 1; k++) { const p = midA + Math.floor(span * k / (MAX_SEG - 1)); dense.push(allText.slice(p, p + SEG)); }
+          dense.push(tail);
+          return { segments: dense, sampled: true, source: "messageflow" };
+        }
+        return { segments: segments, sampled: !FULL, source: "messageflow" };
       } catch (e) { return null; }
     }
 
@@ -1189,6 +1164,31 @@ export default {
     //   插件只提取消息流 + spawn 一个主归档子代理；价值判断/拆分/汇总/落盘全由主子代理自主完成，
     //   消除多子代理并发 append 同一文件的竞态；控制台只有发起/完成两条日志。
     const MAX_ARCHIVE_SESSIONS = 10;   // v1.12.17.2: 20→10（提取为同步 CPU 密集操作，大批量曾冻结宿主）  // 单批上限，超出留待下次
+    // v1.12.18.3: 仿真压缩指令（对标 DSH 官方 compaction 的节结构）
+    const COMPACT_INSTRUCTION =
+      "你是会话压缩器。对以下会话片段执行一次仿真压缩，输出高密度 Markdown 摘要，固定结构：\n" +
+      "## 任务与意图\n## 关键决策\n## 错误与修复（报错串/参数逐字保留）\n## 工具与产物（文件/命令/接口）\n## 未决事项\n## 其他长期有价值的事实\n" +
+      "纪律：要点化；精确字面量（文号/路径/数字/命令/报错串/数值）逐字保留绝不概括改写；总长不超过 1500 字符；不要复述原文、不要任何额外解释或开场白。";
+
+    // v1.12.18.3: 单次压缩调用（spawn 压缩子代理，返回其摘要文本）
+    async function compactOnce(subagents, parent, promptText, tag) {
+      try {
+        const opts = {
+          label: "dsh-memory-压缩-" + tag,
+          prompt: [{ type: "text", text: promptText }],
+          signal: new AbortController().signal,
+          toolFilter: { allow: ["memory_search"] }
+        };
+        if (parent) opts.parent = parent;
+        const run = await subagents.start("spawn", opts);
+        const result = await run.result;
+        return (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n").trim().slice(0, 4000) || null;
+      } catch (e) {
+        cwarn("[dsh-memory] 压缩子代理失败(" + tag + "):", e && e.message ? e.message : String(e));
+        return null;
+      }
+    }
+
     async function runStaleArchive(staleSessions) {
       const subagents = ctx.get("subagents");
       if (!subagents || typeof subagents.start !== "function") {
@@ -1206,10 +1206,24 @@ export default {
         const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
         clog("[dsh-memory] 提取消息流 " + (flowSessions.length + skippedNoFlow.length + 1) + "/" + batch.length + ": " + s.id.slice(0, 12) + "...");
         const r3 = await extractMessageFlowAsync(logPath);
-        if (r3 && r3.flow) flowSessions.push({ session: s, flow: r3.flow, sampled: r3.sampled });
+        if (r3 && (r3.flow || (r3.segments && r3.segments.length > 0))) flowSessions.push({ session: s, flow: r3.flow || "", segments: r3.segments || null, sampled: !!r3.sampled });
         else skippedNoFlow.push(s.id.slice(0, 12));
       }
-      skippedTooBig.forEach((id) => STALE_NOTIFIED.add(batch.find((x) => x.id.startsWith(id)) ? batch.find((x) => x.id.startsWith(id)).id : id));
+      // v1.12.18.3: 已撤销 25MB 跳过（skippedTooBig 随 v1.12.18 一并移除）
+      // v1.12.18.3: map-reduce 仿真压缩——多段会话逐段压缩成高密度摘要（DSH 8 节 compact 同款指令），
+      // 替代原截断式消息流：多花少量 token 换 100% 信息覆盖。
+      for (const f of flowSessions) {
+        if (!f.segments || f.segments.length <= 1) { if (f.segments && f.segments.length === 1) f.flow = f.segments[0]; continue; }
+        clog("[dsh-memory] 会话 " + f.session.id.slice(0, 12) + "... 消息流分 " + f.segments.length + " 段，逐段仿真压缩中...");
+        const compOut = [];
+        for (let si = 0; si < f.segments.length; si++) {
+          await new Promise((r2) => setImmediate(r2));
+          const sum = await compactOnce(subagents, LAST_TOP_AGENT, COMPACT_INSTRUCTION + "\n===== 会话片段 " + (si + 1) + "/" + f.segments.length + " =====\n" + f.segments[si], f.session.id.slice(0, 8) + "-s" + (si + 1));
+          if (sum) compOut.push("【片段 " + (si + 1) + "/" + f.segments.length + "】\n" + sum);
+        }
+        if (compOut.length > 0) { f.flow = compOut.join("\n\n"); f.compressed = true; }
+        else { f.flow = f.segments[0]; }   // 压缩全败保底：至少带上第一段
+      }
       skippedNoFlow.forEach((id) => {
         const s = batch.find((x) => x.id.startsWith(id));
         if (s) STALE_NOTIFIED.add(s.id);
@@ -1901,21 +1915,11 @@ ctx.on("session/event", (session, event) => {
       try {
         const zpath = sessionDir + "/session.jsonl.zstd";
         if (!fs.existsSync(zpath)) return null;
-        const buf = fs.readFileSync(zpath);
-        let out = Buffer.alloc(0), off = 0;
-        const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-        while (off < buf.length) {
-          const frame = zlib.zstdDecompressSync(buf.subarray(off));
-          out = Buffer.concat([out, frame]);
-          let next = -1;
-          for (let i = off + 4; i < buf.length - 3; i++) {
-            if (buf[i] === MAGIC[0] && buf[i+1] === MAGIC[1] && buf[i+2] === MAGIC[2] && buf[i+3] === MAGIC[3]) { next = i; break; }
-          }
-          if (next < 0) break;
-          off = next;
-        }
+        // v1.12.18.4: 复用共享解压实现（消除两套 zstd 多帧循环）
+        const text = decompressSessionLog(zpath);
+        if (!text) return null;
         let inT = 0, outT = 0, cacheT = 0, reasonT = 0, t0 = 0, t1 = 0;
-        for (const line of out.toString("utf8").split("\n")) {
+        for (const line of text.split("\n")) {
           if (line.indexOf("\"usage\"") < 0 && line.indexOf("turn/") < 0) continue;
           let j; try { j = JSON.parse(line); } catch (e) { continue; }
           if (j.type === "assistant/chunk" && j.data && j.data.chunk && j.data.chunk.type === "usage") {
