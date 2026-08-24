@@ -1,0 +1,15 @@
+{
+ "file": "C:/Users/Starry/OneDrive/Desktop/agent周事项/插件开发调整/dsh-memory-plugin/client/lib/client.js",
+ "ops": [
+  {
+   "tag": "C1-labels",
+   "old": "\t\tconst ACTION_OPTIONS = [\n\t\t\t{ id: \"remind\", label: \"仅提醒\" },\n\t\t\t{ id: \"silent\", label: \"静默子代理\" },\n\t\t\t{ id: \"approval\", label: \"审批后子代理\" }\n\t\t];\n\t\tconst ACTION_LABEL = { remind: \"仅提醒\", silent: \"静默子代理\", approval: \"审批后子代理\" };",
+   "new": "\t\tconst ACTION_OPTIONS = [\n\t\t\t{ id: \"remind\", label: \"仅提醒·dream不含归档\" },\n\t\t\t{ id: \"silent\", label: \"静默归档·dream全包\" },\n\t\t\t{ id: \"approval\", label: \"审批归档·dream不含\" }\n\t\t];\n\t\tconst ACTION_LABEL = { remind: \"仅提醒\", silent: \"静默归档\", approval: \"审批后归档\" };"
+  },
+  {
+   "tag": "C2-desc",
+   "old": "\t\t\t\t// 行：漏网处理动作\n\t\t\t\titemRow(\"漏网处理动作\",\n\t\t\t\t\treact.createElement(\"div\", { style: { display: \"flex\", alignItems: \"center\", gap: \"6px\" } },\n\t\t\t\t\t\tACTION_OPTIONS.map((o) =>\n\t\t\t\t\t\t\treact.createElement(\"button\", {\n\t\t\t\t\t\t\t\ttype: \"button\", key: o.id,\n\t\t\t\t\t\t\t\tstyle: Object.assign({}, segStyle, action === o.id ? segSelected : {}),\n\t\t\t\t\t\t\t\t\"aria-pressed\": action === o.id,\n\t\t\t\t\t\t\t\tonClick: () => setStaleAction(o.id)\n\t\t\t\t\t\t\t}, o.label)\n\t\t\t\t\t\t)\n\t\t\t\t\t)\n\t\t\t\t),",
+   "new": "\t\t\t\t// 行：漏网处理动作\n\t\t\t\titemRow(\"漏网处理动作\",\n\t\t\t\t\treact.createElement(\"div\", { style: { display: \"flex\", alignItems: \"center\", gap: \"6px\" } },\n\t\t\t\t\t\tACTION_OPTIONS.map((o) =>\n\t\t\t\t\t\t\treact.createElement(\"button\", {\n\t\t\t\t\t\t\t\ttype: \"button\", key: o.id,\n\t\t\t\t\t\t\t\tstyle: Object.assign({}, segStyle, action === o.id ? segSelected : {}),\n\t\t\t\t\t\t\t\t\"aria-pressed\": action === o.id,\n\t\t\t\t\t\t\t\tonClick: () => setStaleAction(o.id)\n\t\t\t\t\t\t\t}, o.label)\n\t\t\t\t\t\t)\n\t\t\t\t\t)\n\t\t\t\t),\n\t\t\t\t// v1.12.18：漏网动作与 /dream 的联动说明（随选中值变化）\n\t\t\t\treact.createElement(\"div\", { style: Object.assign({}, descStyle, { padding: \"0 0 10px\", marginTop: \"-4px\" }) },\n\t\t\t\t\taction === \"silent\"\n\t\t\t\t\t\t? \"silent：后台自动归档漏网会话；/dream 会先归档再整合，一条命令完成。\"\n\t\t\t\t\t\t: action === \"approval\"\n\t\t\t\t\t\t\t? \"approval：检测到漏网仅提醒，你确认调用 stale_archive 后才归档；此模式下 /dream 不含归档。\"\n\t\t\t\t\t\t\t: \"remind：仅提醒不自动归档；此模式下 /dream 不含归档。\")\n\t\t\t\t),"
+  }
+ ]
+}
