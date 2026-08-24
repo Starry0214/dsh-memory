@@ -117,7 +117,8 @@ function ts() {
 // v1.6.0：加 afterTime 界限 —— 插件启用前创建的会话不触发整合（用户要求）；
 //         插件关闭期间产生的会话（创建时间在启用之后）仍会被检测 → 重新启用后"未整合范围扩大"。
 // 判定"漏网"：会话创建于启用之后 + 最后一次写入距今超过阈值 + 未在记忆库落档
-const STALE_NOTIFIED = new Set();  // 本实例内已提醒过的会话 id（防多会话重复提醒）
+const STALE_NOTIFIED = new Set();  // 本实例内已提醒过的会话 id（v1.12.19 起仅防重复注入提醒文案）
+const ARCHIVED_SESSIONS = new Set(); // v1.12.19: 归档流程已处置的会话 id（含"验证已覆盖跳过"与无流跳过），持久化 .integrate.json archivedSessions；pending 过滤与 staleCount 收敛以此为准
 let staleNotifiedLoaded = false;
 const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
 
@@ -1225,10 +1226,12 @@ export default {
         if (compOut.length > 0) { f.flow = compOut.join("\n\n"); f.compressed = true; }
         else { f.flow = f.segments[0]; }   // 压缩全败保底：至少带上第一段
       }
+      const handledIds = []; // v1.12.19: 本轮实际处置名单（送审会话 + 无流跳过），供调用方登记 ARCHIVED_SESSIONS；overflow 不在内
       skippedNoFlow.forEach((id) => {
         const s = batch.find((x) => x.id.startsWith(id));
-        if (s) STALE_NOTIFIED.add(s.id);
+        if (s) { STALE_NOTIFIED.add(s.id); handledIds.push(s.id); }
       });
+      flowSessions.forEach((f) => handledIds.push(f.session.id));
       if (flowSessions.length === 0) {
         clog("[dsh-memory] 无可归档会话（全部无消息流，跳过 " + skippedNoFlow.length + " 个）");
         return { ok: false, reason: "全部会话无消息流", overflow: overflow };
@@ -1267,7 +1270,7 @@ export default {
           doneResolveRef(true);
           // v1.12.18.6: 归档后刷新设置界面 staleCount 快照
           try {
-            const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id)).length;
+            const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && !ARCHIVED_SESSIONS.has(s.id)).length;
             if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") HOST_SETTINGS_SCOPE.update({ staleCount: remain }).catch(() => {});
             saveStaleNotified();
           } catch (e) {}
@@ -1296,7 +1299,7 @@ export default {
           doneResolveRef(false);
         });
         clog("[dsh-memory] 已发起漏网归档主子代理: " + label + "（后台执行中，完成后输出报告）");
-        return { ok: true, count: flowSessions.length, overflow: overflow, done: done };
+        return { ok: true, count: flowSessions.length, overflow: overflow, done: done, handled: handledIds };
       } catch (e) {
         cwarn("[dsh-memory] 漏网归档主子代理启动失败: " + label + " - " + (e && e.message ? e.message : String(e)));
         return { ok: false, reason: e && e.message ? e.message : String(e), overflow: overflow };
@@ -1372,36 +1375,40 @@ export default {
       try {
         // v1.6.0：installAt 界限 —— 插件启用前创建的会话不触发整合
         const staleSessions = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
-          .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
+          .filter((s) => !ARCHIVED_SESSIONS.has(s.id) && !sessionMentionedInMemory(s.id));   // v1.12.19: pending 归档待办只看 ARCHIVED，不看提醒去重账本
         if (staleSessions.length > 0) {
           if (PLUGIN_CFG.staleAction === "silent") {
             // v1.12.8：单主子代理编排（无感）：插件提取消息流 → 一个主子代理自主判断/总结/落盘
             const r = await runStaleArchive(staleSessions);
             if (r.ok) {
-              staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));
+              (r.handled || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 实际处置才消号，overflow 留待下轮
+              saveStaleNotified();
               if (r.overflow > 0) clog("[dsh-memory] 剩余 " + r.overflow + " 个漏网会话将在下次检查时处理");
             }
             // 未发起成功不标记 → 下次再处理          } else {
-            const lines = staleSessions.map((s) => {
-              const days = Math.max(1, Math.round((Date.now() - s.mtime) / 86400000));
-              return "- " + s.id + "（工作目录 " + s.ws.slice(0, 40) + "…，最后活动约 " + days + " 天前，日志 " + s.size + "B）";
-            });
-            const actionTxt =
-              PLUGIN_CFG.staleAction === "approval"
-                ? "审批模式：确认后调用 stale_archive 工具即自动完成归档（插件提取消息流，单主子代理自主判断/总结/落盘，无需读原始日志）。"
-                : "处理（可选，由你决定）：若其中某个会话有值得归档的内容，可让我 review 其原始日志并总结进 memory/；若无需归档可忽略。";
-            parts.push(
-              "【dsh-memory 漏网会话提醒】检测到 " + staleSessions.length + " 个会话超过 " + PLUGIN_CFG.staleSessionDays + " 天无交互、且其内容未在记忆库 sessions/ 中落档（可能从未被总结）：\n" +
-              lines.join("\n") + "\n" +
-              actionTxt + "\n" +
-              "（原始日志：~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd；同实例内只提示一次）"
-            );
-            staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));
+            const remindList = staleSessions.filter((s) => !STALE_NOTIFIED.has(s.id));   // v1.12.19: 提醒去重回归 NOTIFIED 账本（防同实例刷屏）
+            staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));   // 本实例内不再重复进入提醒候选
+            if (remindList.length > 0) {
+              const lines = remindList.map((s) => {
+                const days = Math.max(1, Math.round((Date.now() - s.mtime) / 86400000));
+                return "- " + s.id + "（工作目录 " + s.ws.slice(0, 40) + "…，最后活动约 " + days + " 天前，日志 " + s.size + "B）";
+              });
+              const actionTxt =
+                PLUGIN_CFG.staleAction === "approval"
+                  ? "审批模式：确认后调用 stale_archive 工具即自动完成归档（插件提取消息流，单主子代理自主判断/总结/落盘，无需读原始日志）。"
+                  : "处理（可选，由你决定）：若其中某个会话有值得归档的内容，可让我 review 其原始日志并总结进 memory/；若无需归档可忽略。";
+              parts.push(
+                "【dsh-memory 漏网会话提醒】检测到 " + remindList.length + " 个会话超过 " + PLUGIN_CFG.staleSessionDays + " 天无交互、且其内容未在记忆库 sessions/ 中落档（可能从未被总结）：\n" +
+                lines.join("\n") + "\n" +
+                actionTxt + "\n" +
+                "（原始日志：~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd；同实例内只提示一次）"
+              );
+            }
           }
           // v1.4.0：更新只读统计（设置界面显示"未整合记忆会话数"）
           try {
             if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-              const total = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id)).length;
+              const total = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && !ARCHIVED_SESSIONS.has(s.id)).length;
               HOST_SETTINGS_SCOPE.update({ staleCount: total }).catch(() => {});
             }
           } catch (e) { /* 统计更新失败不影响主流程 */ }
@@ -1891,11 +1898,12 @@ ctx.on("session/event", (session, event) => {
           async execute() {
             ensureStaleNotified();
             const stale = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
-              .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
+              .filter((s) => !ARCHIVED_SESSIONS.has(s.id) && !sessionMentionedInMemory(s.id));   // v1.12.19
             if (stale.length === 0) return "当前没有待归档的漏网会话。";
             const r = await runStaleArchive(stale);
             if (r.ok) {
-              stale.forEach((s) => STALE_NOTIFIED.add(s.id));
+              (r.handled || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 实际处置才消号
+              saveStaleNotified();
               return "已发起漏网归档主子代理（" + r.count + " 个会话" + (r.overflow > 0 ? "，另有 " + r.overflow + " 个留待下次" : "") + "），完成后控制台输出归档报告。";
             }
             return "归档未发起：" + r.reason;
@@ -1988,14 +1996,16 @@ ctx.on("session/event", (session, event) => {
       if (staleNotifiedLoaded) return;
       staleNotifiedLoaded = true;
       try {
-        const arr = ((readIntegrateState() || {}).staleNotified) || [];
-        arr.forEach((id) => STALE_NOTIFIED.add(id));
+        const st0 = readIntegrateState() || {};
+        (st0.staleNotified || []).forEach((id) => STALE_NOTIFIED.add(id));
+        (st0.archivedSessions || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 双账本加载
       } catch (e) { /* 忽略 */ }
     }
     function saveStaleNotified() {
       try {
         const st = readIntegrateState() || {};
         st.staleNotified = Array.from(STALE_NOTIFIED).slice(-300);
+        st.archivedSessions = Array.from(ARCHIVED_SESSIONS).slice(-300);   // v1.12.19
         writeIntegrateState(st);
       } catch (e) { /* 忽略 */ }
     }
@@ -2143,10 +2153,14 @@ ctx.on("session/event", (session, event) => {
       let note = "";
       try {
         const pending = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
-          .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
+          .filter((s) => !ARCHIVED_SESSIONS.has(s.id) && !sessionMentionedInMemory(s.id));   // v1.12.19: 只看 ARCHIVED 账本
         if (PLUGIN_CFG.staleAction === "silent" && pending.length > 0) {
           clog("[dsh-memory] dream 管线: 先归档 " + pending.length + " 个漏网会话，完成后自动接续整合");
           const r = await runStaleArchive(pending);
+          if (r.ok) {
+            (r.handled || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 实际处置才消号
+            saveStaleNotified();
+          }
           if (r.ok && r.done) {
             const flag = await Promise.race([r.done, new Promise((res) => setTimeout(() => res("timeout"), 25 * 60000))]);
             note = "已归档 " + r.count + " 个漏网会话（" + flag + "）→ ";
