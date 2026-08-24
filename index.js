@@ -300,6 +300,7 @@ function defaultMonitorData() {
     followed: 0, ignored: 0, capped: 0,          // 提醒后是否被跟随（有效/忽略）；capped=v1.12.16 窗口超限截断（长任务），不计跟进率分母
     events: [],                       // 全量事件 {t, type, detail}（全量保留）
     hintOpen: null,
+    maintain: { integRuns: 0, archRuns: 0, inT: 0, cacheT: 0, outT: 0 },  // v1.12.18.1: 维护 token 累计
     turnProfiles: [],                   // v1.12.16: 任务周期画像 [{t,durMin,calls,negN,errN,spiralN}]（滚动200条，调优基线）
     spiralEvents: [] };                 // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（影子记录，不注入）                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
 }
@@ -371,6 +372,8 @@ function updateMonitorSummary() {
     if (topDomains) sumLines.push("领域  " + topDomains.split(",").join("、"));
     const profN = Array.isArray(d.turnProfiles) ? d.turnProfiles.length : 0;
     const spirN = Array.isArray(d.spiralEvents) ? d.spiralEvents.length : 0;
+    const mt = d.maintain || {};
+    sumLines.push("维护  整合 " + (mt.integRuns || 0) + " 次 · 归档 " + (mt.archRuns || 0) + " 次 · 累计 in " + (mt.inT || 0) + " / out " + (mt.outT || 0) + " tokens");
     sumLines.push("过程  打转告警 " + spirN + " 次 · 周期画像 " + profN + " 轮");
     sumLines.push(
       "累计  " + eventN + " 事件 · 更新 " + updTxt,
@@ -1236,7 +1239,10 @@ export default {
           const sdir2 = findNewestSpawnedSession(startedAt);
           if (sdir2) {
             const u2 = summarizeSubagentUsage(sdir2);
-            if (u2) clog("[dsh-memory] 归档消耗: 输入 " + u2.input + " | 输出 " + u2.output + " | 缓存命中 " + u2.cache + " | 推理 " + u2.reasoning + " tokens | 总时长 " + u2.durMin + " 分钟");
+                      if (u2) {
+            clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟");
+            trackMaintain("arch", u2);
+          }
           }
           if (outText.length > 0 && outText.length <= 1200) {
             clog("[dsh-memory] 归档报告:\n" + outText);
@@ -1905,6 +1911,17 @@ ctx.on("session/event", (session, event) => {
     }
 
     // v1.12.17: dream 进度/结果落盘（GUI 不展示后台子代理会话——任何会话读 .integrate.json 可查）
+    // v1.12.18.1: 维护消耗累计（整合 / 归档通用）
+    function trackMaintain(kind, u) {
+      try {
+        if (!u) return;
+        const d = readMonitorData();
+        const m = d.maintain || (d.maintain = { integRuns: 0, archRuns: 0, inT: 0, cacheT: 0, outT: 0 });
+        if (kind === "integ") m.integRuns += 1; else m.archRuns += 1;
+        m.inT += (u.totalIn || u.input || 0); m.cacheT += (u.cache || 0); m.outT += (u.output || 0);
+        scheduleMonitorSave();
+      } catch (e) { /* 忽略 */ }
+    }
     function dreamProgressPatch(patch) {
       try {
         const st = readIntegrateState() || {};
@@ -2025,6 +2042,7 @@ ctx.on("session/event", (session, event) => {
           const st = readIntegrateState() || {};
           st.lastIntegrateAt = Date.now();
           writeIntegrateState(st);
+          trackMaintain("integ", u);
           clog("[dsh-memory] 下次自动整合：" + PLUGIN_CFG.integrateDays + " 天后");
         }).catch((e) => {
           cwarn("[dsh-memory] 自动整合子代理失败:", e && e.message ? e.message : String(e));
