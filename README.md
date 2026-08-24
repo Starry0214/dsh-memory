@@ -75,7 +75,7 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `staleSessionDays` | `5` | 漏网会话检测阈值（天）：超过该天数无交互且未在记忆库落档的会话触发提醒 |
-| `staleAction` | `remind` | 漏网处理动作：`remind`=仅注入提醒（默认）| `silent`=后台静默子代理总结 | `approval`=经用户审批后子代理总结 |
+| `staleAction` | `remind` | 漏网处理动作（**同时决定 /dream 是否带归档**）：`remind`=仅提醒，/dream 不含归档 | `silent`=后台自动归档，**/dream 先归档再整合** | `approval`=提醒后需确认（调用 stale_archive）才归档，/dream 不含归档 |
 | `integrateEnabled` | `false` | 定期自动整合开关（每 integrateDays 天一次，对标 mimocode dream；也可随时 /dream 手动触发） |
 | `integrateDays` | `7` | 自动整合周期（天） |
 | `monitorEnabled` | `true` | 使用监控开关（提醒/查询/跟进判定/打转探针的数据采集） |

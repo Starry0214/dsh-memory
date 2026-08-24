@@ -44,11 +44,11 @@ window.__ModuleLoader__.load({
 
 		// 漏网处理动作选项（对齐原生 Menu 的 items 结构）
 		const ACTION_OPTIONS = [
-			{ id: "remind", label: "仅提醒" },
-			{ id: "silent", label: "静默子代理" },
-			{ id: "approval", label: "审批后子代理" }
+			{ id: "remind", label: "仅提醒·dream不含归档" },
+			{ id: "silent", label: "静默归档·dream全包" },
+			{ id: "approval", label: "审批归档·dream不含" }
 		];
-		const ACTION_LABEL = { remind: "仅提醒", silent: "静默子代理", approval: "审批后子代理" };
+		const ACTION_LABEL = { remind: "仅提醒", silent: "静默归档", approval: "审批后归档" };
 
 		const inject = ["slots", "settingsScope"];
 
@@ -118,6 +118,13 @@ window.__ModuleLoader__.load({
 						)
 					)
 				),
+				// v1.12.18：漏网动作与 /dream 的联动说明（随选中值变化）
+				react.createElement("div", { style: Object.assign({}, descStyle, { padding: "0 0 10px", marginTop: "-4px" }) },
+					action === "silent"
+						? "silent：后台自动归档漏网会话；/dream 会先归档再整合，一条命令完成。"
+						: action === "approval"
+							? "approval：检测到漏网仅提醒，你确认调用 stale_archive 后才归档；此模式下 /dream 不含归档。"
+							: "remind：仅提醒不自动归档；此模式下 /dream 不含归档。"),
 				// 行：自动整合（开关 + 间隔）
 				itemRow("自动整合记忆",
 					react.createElement("div", { style: { display: "flex", alignItems: "center", gap: "10px" } },

@@ -757,7 +757,7 @@ function sessionMentionedInMemory(sessionId) {
 
 // v1.3.0：可配置项（cordis.patch.yml 的 config 字段覆盖；未配置时用默认值）
 //  - staleSessionDays: 漏网会话检测阈值（天），默认 5
-//  - staleAction:      漏网处理动作，remind=仅注入提醒（默认）| silent=后台静默子代理总结 | approval=经用户审批后子代理总结
+//  - staleAction:      漏网处理动作（v1.12.18 起同时决定 /dream 是否带归档）：remind=仅提醒，/dream 不含归档 | silent=后台自动归档，/dream 先归档再整合 | approval=确认后才归档，/dream 不含归档
 // v1.7.1：默认 staleAction=remind（仅提醒，不自动 spawn 子代理——实测漏网归档子代理单会话可烧数百万 token）
 const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true, monitorEnabled: true };
 // v1.11.0：active = 记忆活跃开关（独立于 DSH 进程启停）——
