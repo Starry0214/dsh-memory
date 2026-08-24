@@ -818,23 +818,18 @@ export default {
       const st = readIntegrateState() || { installAt: now, lastIntegrateAt: 0 };
       if (!st.installAt) st.installAt = now;
       // 用户显式暂停记忆：enabledAt 置空，漏网不纳入
+      // v1.12.19.2: 启动期状态日志静默化（用户切换开关的实时反馈仍保留在 settings watch 处）
       if (PLUGIN_CFG.active === false) {
-        st.enabledAt = null;
-        clog("[dsh-memory] 记忆活跃开关已关，enabledAt 置空（记忆整合暂停）");
+        st.enabledAt = null;   // 用户显式暂停记忆
       } else if (!(typeof st.enabledAt === "number" && st.enabledAt > 0)) {
-        // active=true 且无有效 enabledAt → 设 installAt（首次安装/历史残留），与进程启停无关
-        st.enabledAt = st.installAt;
-        clog("[dsh-memory] 记忆整合启用，enabledAt=安装时间 " + new Date(st.enabledAt).toISOString().slice(0, 19) + "（覆盖安装以来所有会话）");
-      } else {
-        // active=true 且已有 enabledAt → 保持，不随 DSH 启动刷新
-        clog("[dsh-memory] 记忆整合持续启用中，enabledAt 保持 " + new Date(st.enabledAt).toISOString().slice(0, 19) + "（不随 DSH 启动刷新）");
+        st.enabledAt = st.installAt;   // 首次安装/历史残留，与进程启停无关
       }
+      // active=true 且已有 enabledAt → 保持，不随 DSH 启动刷新
       delete st.lastEnabledAt;  // 旧字段清理
       writeIntegrateState(st);
     } catch (e) { /* 状态记录失败不影响功能 */ }
     // v1.10.0：启动时加载 sessions/*.md 缓存（漏网检测高性能）
     refreshMemorySessionsIndex();
-    clog("[dsh-memory] sessions 索引已加载（" + (MEMORY_SESSIONS_INDEX || "").length + " 字符）");
     try {
       ctx.inject(["settings"], (sctx) => {
         try {
@@ -866,7 +861,6 @@ export default {
               clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction + ", active=" + PLUGIN_CFG.active);
             }
           });
-          clog("[dsh-memory] 设置命名空间已注册（settings.yaml 可配置，设置界面可改）");
           // v1.12.1：启动时主动推送一次监控汇总（读磁盘历史数据），否则重启后界面一直显示"暂无统计"
           updateMonitorSummary();
         } catch (e) {
@@ -876,8 +870,6 @@ export default {
     } catch (e) {
       cwarn("[dsh-memory] settings 注入失败，回退 cordis config:", e && e.message ? e.message : String(e));
     }
-    clog("[dsh-memory] 配置: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction);
-
     // v6：主会话 id（session-start 时记录第一个，用于过滤子代理压缩事件）
     // v10.3：不再用 rootSessionId 判定"主会话"（多主会话场景会误判），改查 session.header.origin；
     // 保留 rootSessionId 仅作兼容兜底，判定主逻辑见 isTopLevelSession()
@@ -1456,6 +1448,7 @@ export default {
       }
       (async () => {
         try {
+          const injectedParts = [];   // v1.12.19.2: 注入确认合并为单条日志
           // 消息A：稳定层
           const globalRaw = await readText(MEMORY_ROOT + "/global.md");
           const indexRaw = await readText(MEMORY_ROOT + "/index.md");
@@ -1483,7 +1476,7 @@ export default {
             agent.inject(makeMessage(
               "<system-reminder>\n以下为跨会话持久记忆（dsh-memory 稳定层，自动注入）。按需引用；更具体细节请调用 memory_search 工具。\n" + stableParts.join("\n\n") + "\n</system-reminder>"
             ));
-            clog("[dsh-memory] 已注入稳定层 (" + stableParts.length + " 段)[会话: " + SESSION_LABEL + "]");
+            injectedParts.push("稳定层");
           } else {
             cwarn("[dsh-memory] 稳定层为空（global/index 读取失败）");
           }
@@ -1502,10 +1495,12 @@ export default {
             agent.inject(makeMessage(
               "<system-reminder>\n【上次会话摘要】（" + latest.file + "，衔接上次的下一步行动）\n" + sumText + sumNote + "\n</system-reminder>"
             ));
-            clog("[dsh-memory] 已注入摘要: " + latest.file + "[会话: " + SESSION_LABEL + "]");
+            injectedParts.push("摘要(" + latest.file.slice(0, 40) + ")");
           } else {
             cwarn("[dsh-memory] 未找到会话摘要");
           }
+          // v1.12.19.2: 注入确认合并为单条（缺失项由上方各自 cwarn 说明）
+          clog("[dsh-memory] 记忆注入" + (injectedParts.length > 0 ? ": " + injectedParts.join("+") : "失败") + "[会话: " + SESSION_LABEL + "]");
 
           // 消息C：v9 维护提醒（备份到期 / 轮转到期 / 超限整理，只读检查后注入）
           // v10.3：同实例只对第一个顶层会话注入——避免多个主会话/子代理并发收到整理指令
@@ -1881,7 +1876,6 @@ ctx.on("session/event", (session, event) => {
             return "搜索「" + q + "」命中 " + kept.length + " 个文件（OR 分词 + 相关度排序，Top " + kept.length + "）：\n\n" + body + "\n\n需要全文请用 memory_search 查精确文件名。";
           }
         });
-        clog("[dsh-memory] memory_search 工具已注册（ctx.tools）");
       } catch (e) {
         cerr("[dsh-memory] 工具注册异常:", e && e.message ? e.message : String(e));
       }
@@ -1908,8 +1902,8 @@ ctx.on("session/event", (session, event) => {
             return "归档未发起：" + r.reason;
           }
         });
-        clog("[dsh-memory] stale_archive 工具已注册（approval 确认通路）");
       } catch (e) {
+        cerr("[dsh-memory] stale_archive 注册异常:", e && e.message ? e.message : String(e));
         cerr("[dsh-memory] stale_archive 注册异常:", e && e.message ? e.message : String(e));
       }
 
@@ -2176,8 +2170,7 @@ ctx.on("session/event", (session, event) => {
           // 首次：记录安装起始时间，不立即整合（给用户适应期，到 integrateDays 天后再触发）
           st = { installAt: now, lastIntegrateAt: now };
           writeIntegrateState(st);
-          clog("[dsh-memory] 自动整合已初始化（起始 " + new Date(now).toISOString().slice(0, 10) + "，每 " + PLUGIN_CFG.integrateDays + " 天一次）");
-          return;
+          return;   // v1.12.19.2: 首次初始化日志静默化
         }
         if (!PLUGIN_CFG.integrateEnabled) return;
         const due = now - (st.lastIntegrateAt || st.installAt || 0) >= PLUGIN_CFG.integrateDays * 86400000;
@@ -2194,7 +2187,6 @@ ctx.on("session/event", (session, event) => {
     try {
       checkIntegrate();
       ctx.interval(() => { checkIntegrate(); }, 3600000);
-      clog("[dsh-memory] 自动整合定时器已启动（每 " + PLUGIN_CFG.integrateDays + " 天整合一次，每小时检查）");
     } catch (e) {
       cwarn("[dsh-memory] 自动整合定时器启动失败:", e && e.message ? e.message : String(e));
     }
@@ -2215,13 +2207,19 @@ ctx.on("session/event", (session, event) => {
               : { kind: "error", text: "整合启动失败（无可用父 agent 或 subagents 服务不可用），请稍后重试。" };
           }
         });
-        clog("[dsh-memory] /dream 手动整合命令已注册");
       } else {
         cwarn("[dsh-memory] commands 服务不可用，/dream 命令未注册");
       }
     } catch (e) {
       cwarn("[dsh-memory] /dream 命令注册失败:", e && e.message ? e.message : String(e));
     }
+
+    // v1.12.19.2: 启动横幅合并为单条就绪日志（各组件注册失败仍有独立 cwarn/cerr 报告）
+    clog("[dsh-memory] 就绪：staleSessionDays=" + PLUGIN_CFG.staleSessionDays
+      + " staleAction=" + PLUGIN_CFG.staleAction
+      + " active=" + PLUGIN_CFG.active
+      + " integrate=" + (PLUGIN_CFG.integrateEnabled ? PLUGIN_CFG.integrateDays + "天/次" : "关")
+      + "（memory_search / stale_archive / /dream 已挂载，定时器运行中）");
 
     // v1.11.0：dispose 钩子 —— 不再置空 enabledAt！
     // DSH 退出/重启会触发 dispose，但「插件启停」已与「DSH 进程启停」解耦：
