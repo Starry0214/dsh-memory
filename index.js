@@ -313,7 +313,8 @@ function defaultMonitorData() {
     hintOpen: null,
     maintain: { integRuns: 0, archRuns: 0, inT: 0, cacheT: 0, outT: 0 },  // v1.12.18.1: 维护 token 累计
     turnProfiles: [],                   // v1.12.16: 任务周期画像 [{t,durMin,calls,negN,errN,spiralN}]（滚动200条，调优基线）
-    spiralEvents: [] };                 // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（v2.0.2 起可注入D类提醒，样本仍全量保留供调优）                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
+    spiralEvents: [],                   // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（v2.0.2 起可注入D类提醒，样本仍全量保留供调优）
+    spiralThresh: null };               // v2.0.3: D 类阈值覆盖层 {rep,neg,sim,w,cooldownMin}——null=用内置默认；/dream 自校准写入
 }
 
 function readMonitorData() {
@@ -385,7 +386,8 @@ function updateMonitorSummary() {
     const spirN = Array.isArray(d.spiralEvents) ? d.spiralEvents.length : 0;
     const mt = d.maintain || {};
     sumLines.push("维护  整合 " + (mt.integRuns || 0) + " 次 · 归档 " + (mt.archRuns || 0) + " 次 · 累计 in " + (mt.inT || 0) + " / out " + (mt.outT || 0) + " tokens");
-    sumLines.push("过程  打转告警 " + spirN + " 次 · 周期画像 " + profN + " 轮");
+    const et = effectiveSpiralThresh();
+    sumLines.push("过程  打转告警 " + spirN + " 次 · 周期画像 " + profN + " 轮 · 阈值 rep≥" + et.rep + "/neg≥" + et.neg + "/sim≥" + et.sim + "/窗" + et.w + "/冷却" + et.cooldownMin + "分");
     sumLines.push(
       "累计  " + eventN + " 事件 · 更新 " + updTxt,
       "",
@@ -489,6 +491,19 @@ function monitorToolCall(toolName, meta, args) {
 }
 
 // ── v1.12.16: 过程信号探针（影子模式）─────────────────────────
+// v2.0.3: D 类阈值生效值——新安装用户无 spiralThresh 字段 → 全部内置默认（标定值），开箱即用；
+// /dream 自校准经 dsh_spiral_thresh 工具写覆盖层，逐字段钳制校验，越界/非法回退默认。
+function effectiveSpiralThresh() {
+  const t = (MONITOR_DATA && MONITOR_DATA.spiralThresh) || {};
+  const num = (v, lo, hi, dft) => (typeof v === "number" && isFinite(v) && v >= lo && v <= hi) ? v : dft;
+  return {
+    rep: num(t.rep, 0.30, 0.80, SPIRAL_REP_TH),
+    neg: num(t.neg, 0.20, 0.80, SPIRAL_NEG_TH),
+    sim: num(t.sim, 0.50, 0.90, SPIRAL_SIM_TH),
+    w: Math.round(num(t.w, 5, 16, SPIRAL_W)),
+    cooldownMin: num(t.cooldownMin, 5, 60, 10)
+  };
+}
 // 「参数打转 × 无进展」双条件识别原地空转（回测标定：试错链命中、正常翻页不误报）。
 // v2.0.2: 样本落盘 spiralEvents/turnProfiles 供阈值调优；周期内首次命中返回 true，
 // 由调用点结合 spiralRemind 开关与冷却注入 D 类「LLM循环试错提醒」（关闭=纯影子模式）。
@@ -525,6 +540,7 @@ function spiralObserve(toolName, args, result, isError, sid) {
   try {
     if (PLUGIN_CFG.monitorEnabled === false || SPIRAL_SKIP.has(toolName)) return;
     const B = spiralBucket(sid);   // v2.0.1: 会话桶 { cur, win, ws } 替代全局单例
+    const ET = effectiveSpiralThresh();   // v2.0.3: 生效阈值（内置默认 + spiralThresh 覆盖层）
     let aTxt = "";
     try { aTxt = String(typeof args === "string" ? args : JSON.stringify(args) || ""); } catch (e) { aTxt = ""; }
     aTxt = aTxt.replace(/\s+/g, " ").slice(0, 600);
@@ -537,9 +553,9 @@ function spiralObserve(toolName, args, result, isError, sid) {
     rTxt = rTxt.replace(/\s+/g, " ");
     const neg = !rTxt.trim() || isError || SPIRAL_NEG_RE.test(rTxt.slice(0, 200));
     let rep = 0;
-    for (const w of B.win) { if (diceBigram(aTxt, w.argsTxt) >= SPIRAL_SIM_TH) { rep = 1; break; } }
+    for (const w of B.win) { if (diceBigram(aTxt, w.argsTxt) >= ET.sim) { rep = 1; break; } }
     B.win.push({ argsTxt: aTxt, resKey: rTxt.slice(0, 80), neg: neg ? 1 : 0, rep, tool: toolName });
-    if (B.win.length > SPIRAL_W) B.win.shift();
+    if (B.win.length > ET.w) B.win.shift();
     if (!B.cur) B.cur = { t0: Date.now(), calls: 0, negN: 0, errN: 0, spiralN: 0, tools: {} };
     B.cur.calls += 1;
     B.cur.tools[toolName] = (B.cur.tools[toolName] || 0) + 1;   // v1.12.16.1 周期工具分布
@@ -549,7 +565,7 @@ function spiralObserve(toolName, args, result, isError, sid) {
       const n = B.win.length;
       const repRate = B.win.reduce((s2, w2) => s2 + w2.rep, 0) / n;
       const negRate = B.win.reduce((s2, w2) => s2 + w2.neg, 0) / n;
-      if (repRate >= SPIRAL_REP_TH && negRate >= SPIRAL_NEG_TH && B.cur) {
+      if (repRate >= ET.rep && negRate >= ET.neg && B.cur) {
         const firstHit = B.cur.spiralN === 0;   // 本周期首次命中
         B.cur.spiralN += 1;
         if (firstHit) {   // 每周期只记首次样本，防膨胀
@@ -1636,8 +1652,8 @@ ctx.on("tools/result", (exec, result) => {
           const cw = s2 && ((s2.header && s2.header.cwd) || s2.cwd);
           if (cw) spiralBucket(spSid).ws = String(cw).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "?";   // v1.12.16.1 诊断属性；v2.0.1 写入会话桶
           const spiralFirst = spiralObserve(toolName, exec.arguments, result, !!result.isError, spSid);
-          // v2.0.2: D 类「LLM循环试错提醒」三道闸——周期首次命中 × spiralRemind 开关 × 同会话10分钟冷却（防连刷）
-          if (spiralFirst && PLUGIN_CFG.spiralRemind && (Date.now() - (SPIRAL_REMIND_AT.get(spSid) || 0) >= 600000)) {
+          // v2.0.2: D 类「LLM循环试错提醒」三道闸——周期首次命中 × spiralRemind 开关 × 同会话冷却（防连刷）；v2.0.3 冷却分钟数可自校准
+          if (spiralFirst && PLUGIN_CFG.spiralRemind && (Date.now() - (SPIRAL_REMIND_AT.get(spSid) || 0) >= effectiveSpiralThresh().cooldownMin * 60000)) {
             SPIRAL_REMIND_AT.set(spSid, Date.now());
             monitorHintD();
             const agent2 = exec.agent;
@@ -1954,6 +1970,42 @@ ctx.on("session/event", (session, event) => {
         cerr("[dsh-memory] stale_archive 注册异常:", e && e.message ? e.message : String(e));
       }
 
+      // v2.0.3：dsh_spiral_thresh —— D 类「LLM循环试错提醒」阈值自校准（/dream 整合代理分析监控数据后调用）
+      // 插件侧钳制校验后写内存态+防抖落盘，规避子代理直写 .monitor.json 被插件内存态覆盖的竞态
+      try {
+        toolSvc.register({
+          name: "dsh_spiral_thresh",
+          description: "更新 D 类「LLM循环试错提醒」判定阈值（dsh-memory /dream 自校准专用）。全部字段可选；越界字段被拒绝并回退内置默认。",
+          parameters: { type: "object", properties: {
+            rep: { type: "number", description: "打转占比阈值 0.30~0.80（内置默认 0.45）" },
+            neg: { type: "number", description: "负面结果占比阈值 0.20~0.80（内置默认 0.40）" },
+            sim: { type: "number", description: "args 相似度阈值 0.50~0.90（内置默认 0.70）" },
+            w: { type: "number", description: "滑窗大小 5~16（内置默认 8）" },
+            cooldownMin: { type: "number", description: "同会话提醒冷却分钟数 5~60（内置默认 10）" }
+          }, required: [] },
+          output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
+          async execute(args) {
+            const a = args || {};
+            const bounds = { rep: [0.30, 0.80], neg: [0.20, 0.80], sim: [0.50, 0.90], w: [5, 16], cooldownMin: [5, 60] };
+            const cur = effectiveSpiralThresh();
+            const next = {}; const rejected = [];
+            for (const k of ["rep", "neg", "sim", "w", "cooldownMin"]) {
+              if (a[k] === undefined) continue;
+              const v = k === "w" ? Math.round(a[k]) : a[k];
+              if (typeof v !== "number" || !isFinite(v) || v < bounds[k][0] || v > bounds[k][1]) { rejected.push(k + "=" + a[k]); continue; }
+              next[k] = v;
+            }
+            if (!Object.keys(next).length) return "未更新任何阈值。" + (rejected.length ? "越界被拒：" + rejected.join("、") + "。" : "") + "当前生效：rep≥" + cur.rep + " neg≥" + cur.neg + " sim≥" + cur.sim + " 窗=" + cur.w + " 冷却=" + cur.cooldownMin + "分";
+            readMonitorData().spiralThresh = Object.assign({}, (MONITOR_DATA.spiralThresh || {}), next);
+            scheduleMonitorSave();
+            const et = effectiveSpiralThresh();
+            return "D 类阈值已更新并落盘" + (rejected.length ? "（越界被拒：" + rejected.join("、") + "）" : "") + "。当前生效：rep≥" + et.rep + " neg≥" + et.neg + " sim≥" + et.sim + " 窗=" + et.w + " 冷却=" + et.cooldownMin + "分";
+          }
+        });
+      } catch (e) {
+        cerr("[dsh-memory] dsh_spiral_thresh 注册异常:", e && e.message ? e.message : String(e));
+      }
+
     // v1.5.0：定期自动整合记忆（对标 mimocode AutoDream 7d）
     // 宿主常驻进程 + ctx.interval 定时器；安装时记起始时间，每次整合完成刷新，下次再隔 integrateDays 天。
     // 状态文件：MEMORY_ROOT/.integrate.json（{ installAt, lastIntegrateAt }）——常量见模块级
@@ -2127,6 +2179,11 @@ ctx.on("session/event", (session, event) => {
 "- 只动 ~/.dsh/memory/ 目录；不读/不依赖原始大日志;\n" +
 "- 保留 source session 引用便于追溯.\n" +
 "\n" +
+"## D-threshold Self-Calibration（D类「LLM循环试错提醒」阈值自校准）\n" +
+"- 读 ~/.dsh/memory/.monitor.json（node:fs）：turnProfiles=每周期画像，spiralEvents=打转触发样本（含 repRate/negRate 与 sample 文本）.\n" +
+"- 判定规则：spiralEvents 少于 5 条=数据不足，跳过本节不调阈值；样本 repRate 多数贴线（≤当前阈值+0.05）且伴随错误少 → rep 上调 0.05（上限 0.80）降误报；turnProfiles 中 spiralN>0 周期占比 >50%（提醒过吵）→ neg 上调 0.05（上限 0.80）；占比 <10% 且有真实空转漏报迹象 → rep 下调 0.05（下限 0.30）提高灵敏；D 类提醒后模型很少查记忆/skill → cooldownMin 上调（上限 60）.\n" +
+"- 应用变更只准调用 dsh_spiral_thresh 工具（插件侧钳制校验+落盘；禁止直写 .monitor.json——会被插件内存态覆盖）.\n" +
+"- 无需调整就不调用工具。最终 Output 加一行 Thresholds: kept/changed + 一句理由.\n" +
 "## Output — brief summary only\n" +
 "- Consolidated: n entries added (按节列出)\n" +
 "- Updated: n entries changed\n" +
@@ -2140,7 +2197,7 @@ ctx.on("session/event", (session, event) => {
           prompt: [{ type: "text", text: promptText }],
           parent: parent,
           signal: new AbortController().signal,
-          toolFilter: { allow: ["read", "write", "edit", "grep", "glob", "memory_search"] }
+          toolFilter: { allow: ["read", "write", "edit", "grep", "glob", "memory_search", "dsh_spiral_thresh"] }
         });
         run.result.then((result) => {
           const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\\n");
@@ -2267,7 +2324,7 @@ ctx.on("session/event", (session, event) => {
       + " active=" + PLUGIN_CFG.active
       + " integrate=" + (PLUGIN_CFG.integrateEnabled ? PLUGIN_CFG.integrateDays + "天/次" : "关")
       + " spiral=" + (PLUGIN_CFG.spiralRemind ? "remind(D类)" : "shadow(仅记录)")
-      + "（memory_search / stale_archive / /dream 已挂载，定时器运行中）");
+      + "（memory_search / stale_archive / dsh_spiral_thresh / /dream 已挂载，定时器运行中）");
 
     // v1.11.0：dispose 钩子 —— 不再置空 enabledAt！
     // DSH 退出/重启会触发 dispose，但「插件启停」已与「DSH 进程启停」解耦：
