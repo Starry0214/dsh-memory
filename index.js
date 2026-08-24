@@ -314,7 +314,8 @@ function defaultMonitorData() {
     maintain: { integRuns: 0, archRuns: 0, inT: 0, cacheT: 0, outT: 0 },  // v1.12.18.1: 维护 token 累计
     turnProfiles: [],                   // v1.12.16: 任务周期画像 [{t,durMin,calls,negN,errN,spiralN}]（滚动200条，调优基线）
     spiralEvents: [],                   // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（v2.0.2 起可注入D类提醒，样本仍全量保留供调优）
-    spiralThresh: null };               // v2.0.3: D 类阈值覆盖层 {rep,neg,sim,w,cooldownMin}——null=用内置默认；/dream 自校准写入
+    spiralThresh: null,                 // v2.0.3: D 类阈值覆盖层 {rep,neg,sim,w,cooldownMin}——null=用内置默认；/dream 自校准写入
+    spiralThreshLog: [] };              // v2.0.4: 阈值变更日志 [{t,from,to,reason}]（滚动20条，审计/回滚依据）
 }
 
 function readMonitorData() {
@@ -387,7 +388,14 @@ function updateMonitorSummary() {
     const mt = d.maintain || {};
     sumLines.push("维护  整合 " + (mt.integRuns || 0) + " 次 · 归档 " + (mt.archRuns || 0) + " 次 · 累计 in " + (mt.inT || 0) + " / out " + (mt.outT || 0) + " tokens");
     const et = effectiveSpiralThresh();
-    sumLines.push("过程  打转告警 " + spirN + " 次 · 周期画像 " + profN + " 轮 · 阈值 rep≥" + et.rep + "/neg≥" + et.neg + "/sim≥" + et.sim + "/窗" + et.w + "/冷却" + et.cooldownMin + "分");
+    const calib = Array.isArray(d.spiralThreshLog) && d.spiralThreshLog.length > 0 ? d.spiralThreshLog[d.spiralThreshLog.length - 1] : null;
+    let procLine = "过程  打转告警 " + spirN + " 次 · 周期画像 " + profN + " 轮 · 阈值 rep≥" + et.rep + "/neg≥" + et.neg + "/sim≥" + et.sim + "/窗" + et.w + "/冷却" + et.cooldownMin + "分（" + (d.spiralThresh ? "已校准" : "内置默认") + "）";
+    if (calib) {
+      const cd = new Date(calib.t);
+      const chgs = Object.keys(calib.to || {}).map(k => k + " " + ((calib.from || {})[k] !== undefined ? calib.from[k] : "?") + "→" + calib.to[k]).join(" ");
+      procLine += "\n      最近校准 " + pad(cd.getMonth() + 1) + "-" + pad(cd.getDate()) + " " + pad(cd.getHours()) + ":" + pad(cd.getMinutes()) + " " + chgs + (calib.reason ? "（" + calib.reason + "）" : "");
+    }
+    sumLines.push(procLine);
     sumLines.push(
       "累计  " + eventN + " 事件 · 更新 " + updTxt,
       "",
@@ -1981,7 +1989,8 @@ ctx.on("session/event", (session, event) => {
             neg: { type: "number", description: "负面结果占比阈值 0.20~0.80（内置默认 0.40）" },
             sim: { type: "number", description: "args 相似度阈值 0.50~0.90（内置默认 0.70）" },
             w: { type: "number", description: "滑窗大小 5~16（内置默认 8）" },
-            cooldownMin: { type: "number", description: "同会话提醒冷却分钟数 5~60（内置默认 10）" }
+            cooldownMin: { type: "number", description: "同会话提醒冷却分钟数 5~60（内置默认 10）" },
+            reason: { type: "string", description: "本次调整的一句话理由（记入变更日志，供审计）" }
           }, required: [] },
           output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
           async execute(args) {
@@ -1996,10 +2005,18 @@ ctx.on("session/event", (session, event) => {
               next[k] = v;
             }
             if (!Object.keys(next).length) return "未更新任何阈值。" + (rejected.length ? "越界被拒：" + rejected.join("、") + "。" : "") + "当前生效：rep≥" + cur.rep + " neg≥" + cur.neg + " sim≥" + cur.sim + " 窗=" + cur.w + " 冷却=" + cur.cooldownMin + "分";
-            readMonitorData().spiralThresh = Object.assign({}, (MONITOR_DATA.spiralThresh || {}), next);
+            const md = readMonitorData();
+            const from = {}; for (const k of Object.keys(next)) from[k] = cur[k];
+            md.spiralThresh = Object.assign({}, (MONITOR_DATA.spiralThresh || {}), next);
+            // v2.0.4: 变更日志（滚动20条）——阈值是被 AI 自动改的政策参数，必须留痕供审计/回滚
+            if (!Array.isArray(md.spiralThreshLog)) md.spiralThreshLog = [];
+            md.spiralThreshLog.push({ t: Date.now(), from: from, to: Object.assign({}, next), reason: String(a.reason || "").slice(0, 80) });
+            if (md.spiralThreshLog.length > 20) md.spiralThreshLog = md.spiralThreshLog.slice(-20);
             scheduleMonitorSave();
             const et = effectiveSpiralThresh();
-            return "D 类阈值已更新并落盘" + (rejected.length ? "（越界被拒：" + rejected.join("、") + "）" : "") + "。当前生效：rep≥" + et.rep + " neg≥" + et.neg + " sim≥" + et.sim + " 窗=" + et.w + " 冷却=" + et.cooldownMin + "分";
+            const chgDesc = Object.keys(next).map(k => k + " " + from[k] + "→" + et[k]).join(" ");
+            clog("[dsh-memory] D 类阈值变更: " + chgDesc + (a.reason ? "（" + String(a.reason).slice(0, 60) + "）" : ""));
+            return "D 类阈值已更新并落盘（" + chgDesc + "）" + (rejected.length ? "，越界被拒：" + rejected.join("、") : "") + "。当前生效：rep≥" + et.rep + " neg≥" + et.neg + " sim≥" + et.sim + " 窗=" + et.w + " 冷却=" + et.cooldownMin + "分";
           }
         });
       } catch (e) {
@@ -2182,7 +2199,7 @@ ctx.on("session/event", (session, event) => {
 "## D-threshold Self-Calibration（D类「LLM循环试错提醒」阈值自校准）\n" +
 "- 读 ~/.dsh/memory/.monitor.json（node:fs）：turnProfiles=每周期画像，spiralEvents=打转触发样本（含 repRate/negRate 与 sample 文本）.\n" +
 "- 判定规则：spiralEvents 少于 5 条=数据不足，跳过本节不调阈值；样本 repRate 多数贴线（≤当前阈值+0.05）且伴随错误少 → rep 上调 0.05（上限 0.80）降误报；turnProfiles 中 spiralN>0 周期占比 >50%（提醒过吵）→ neg 上调 0.05（上限 0.80）；占比 <10% 且有真实空转漏报迹象 → rep 下调 0.05（下限 0.30）提高灵敏；D 类提醒后模型很少查记忆/skill → cooldownMin 上调（上限 60）.\n" +
-"- 应用变更只准调用 dsh_spiral_thresh 工具（插件侧钳制校验+落盘；禁止直写 .monitor.json——会被插件内存态覆盖）.\n" +
+"- 应用变更只准调用 dsh_spiral_thresh 工具并带 reason 参数（一句话理由，插件侧钳制校验+落盘+记变更日志；禁止直写 .monitor.json——会被插件内存态覆盖）.\n" +
 "- 无需调整就不调用工具。最终 Output 加一行 Thresholds: kept/changed + 一句理由.\n" +
 "## Output — brief summary only\n" +
 "- Consolidated: n entries added (按节列出)\n" +
