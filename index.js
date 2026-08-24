@@ -164,12 +164,20 @@ function buildMemoryHintTable() {
 }
 
 // 从用户消息文本提取纯文本（ContentBlock[] → string）
+// v1.12.19.3: 只取用户真实输入——剔除 <system-reminder> 注入块（维护提醒/本插件提示文本含关键词，
+// 混入匹配源会自我强化：提示里的「日志填写」等词被当成用户输入再次命中，BitDock 会话实测循环注入）。
 function hintTextOf(messages) {
   const parts = [];
   for (const msg of messages || []) {
     if (!msg || !Array.isArray(msg.content)) continue;
+    // 只取 role=user 的消息（排除 assistant 输出与注入的 system-reminder）
+    if (msg.role && msg.role !== "user") continue;
     for (const b of msg.content) {
-      if (b && b.type === "text" && typeof b.text === "string") parts.push(b.text);
+      if (b && b.type === "text" && typeof b.text === "string") {
+        const t = b.text;
+        if (t.indexOf("<system-reminder>") >= 0 || t.indexOf("【dsh-memory") >= 0) continue;  // 剔除插件注入块
+        parts.push(t);
+      }
     }
   }
   return parts.join("\n").slice(0, 2000);  // 只取前 2000 字符匹配（足够判断领域）
