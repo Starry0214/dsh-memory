@@ -2238,8 +2238,8 @@ ctx.on("session/event", (session, event) => {
 "- 保留 source session 引用便于追溯.\n" +
 "\n" +
 "## D-threshold Self-Calibration（D类「LLM循环试错提醒」阈值自校准）\n" +
-"- 读 ~/.dsh/memory/.monitor.json（node:fs）：turnProfiles=每周期画像，spiralEvents=打转触发样本（含 repRate/negRate 与 sample 文本）.\n" +
-"- 判定规则：spiralEvents 少于 5 条=数据不足，跳过本节不调阈值；样本 repRate 多数贴线（≤当前阈值+0.05）且伴随错误少 → rep 上调 0.05（上限 0.80）降误报；turnProfiles 中 spiralN>0 周期占比 >50%（提醒过吵）→ neg 上调 0.05（上限 0.80）；占比 <10% 且有真实空转漏报迹象 → rep 下调 0.05（下限 0.30）提高灵敏；D 类提醒后模型很少查记忆/skill → cooldownMin 上调（上限 60）.\n" +
+"- 实测统计（插件已算好，直接引用，勿自行读取文件或计算数字）：" + calibStats + "\n" +
+"- 若统计提示数据不足则跳过本节。否则按此对照调整：repRate 中位数 ≤ 当前 rep+0.05 且伴随错误少 → rep 上调 0.05 降误报；打转周期占比 >50%（提醒过吵）→ neg 上调 0.05；占比 <10% 且有真实空转漏报迹象 → rep 下调 0.05 提高灵敏；提醒后很少跟进 → cooldownMin 上调。各字段合法范围见 dsh_spiral_thresh 工具描述（越界会被拒绝回退）。\n" +
 "- 应用变更只准调用 dsh_spiral_thresh 工具并带 reason 参数（一句话理由，插件侧钳制校验+落盘+记变更日志；禁止直写 .monitor.json——会被插件内存态覆盖）.\n" +
 "- 无需调整就不调用工具。最终 Output 加一行 Thresholds: kept/changed + 一句理由.\n" +
 "## Output — brief summary only\n" +
