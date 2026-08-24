@@ -1165,7 +1165,7 @@ export default {
     // v1.12.8：统一漏网归档入口 —— 单主子代理编排（用户要求"无感"）：
     //   插件只提取消息流 + spawn 一个主归档子代理；价值判断/拆分/汇总/落盘全由主子代理自主完成，
     //   消除多子代理并发 append 同一文件的竞态；控制台只有发起/完成两条日志。
-    const MAX_ARCHIVE_SESSIONS = 10;   // v1.12.17.2: 20→10（提取为同步 CPU 密集操作，大批量曾冻结宿主）  // 单批上限，超出留待下次
+    const MAX_ARCHIVE_SESSIONS = 32;   // v1.12.19.1: 10→32——v1.12.18 起提取器已逐帧让出+行级快筛+段压缩，冻结风险消除；漏网量一次轮完（overflow 仍兜底）
     // v1.12.18.3: 仿真压缩指令（对标 DSH 官方 compaction 的节结构）
     const COMPACT_INSTRUCTION =
       "你是会话压缩器。对以下会话片段执行一次仿真压缩，输出高密度 Markdown 摘要，固定结构：\n" +
@@ -1268,6 +1268,9 @@ export default {
         const run = await subagents.start("spawn", spawnOpts);
         run.result.then((result) => {
           doneResolveRef(true);
+          // v1.12.19.1: 处置完成才消号——子代理正常结束=已执行完整任务书（含"验证已覆盖跳过"决策）；
+          // 失败(catch)与 25min 超时均不消号，会话留待下轮重新送审，杜绝静默丢失。
+          try { handledIds.forEach((id) => ARCHIVED_SESSIONS.add(id)); saveStaleNotified(); } catch (e) {}
           // v1.12.18.6: 归档后刷新设置界面 staleCount 快照
           try {
             const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && !ARCHIVED_SESSIONS.has(s.id)).length;
@@ -1381,10 +1384,8 @@ export default {
             // v1.12.8：单主子代理编排（无感）：插件提取消息流 → 一个主子代理自主判断/总结/落盘
             const r = await runStaleArchive(staleSessions);
             if (r.ok) {
-              (r.handled || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 实际处置才消号，overflow 留待下轮
-              saveStaleNotified();
               if (r.overflow > 0) clog("[dsh-memory] 剩余 " + r.overflow + " 个漏网会话将在下次检查时处理");
-            }
+            }   // 消号 v1.12.19.1 起在子代理完成回调内执行（处置完成才消号）
             // 未发起成功不标记 → 下次再处理          } else {
             const remindList = staleSessions.filter((s) => !STALE_NOTIFIED.has(s.id));   // v1.12.19: 提醒去重回归 NOTIFIED 账本（防同实例刷屏）
             staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));   // 本实例内不再重复进入提醒候选
@@ -1902,10 +1903,8 @@ ctx.on("session/event", (session, event) => {
             if (stale.length === 0) return "当前没有待归档的漏网会话。";
             const r = await runStaleArchive(stale);
             if (r.ok) {
-              (r.handled || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 实际处置才消号
-              saveStaleNotified();
               return "已发起漏网归档主子代理（" + r.count + " 个会话" + (r.overflow > 0 ? "，另有 " + r.overflow + " 个留待下次" : "") + "），完成后控制台输出归档报告。";
-            }
+            }   // 消号 v1.12.19.1 起在子代理完成回调内执行
             return "归档未发起：" + r.reason;
           }
         });
@@ -2157,11 +2156,7 @@ ctx.on("session/event", (session, event) => {
         if (PLUGIN_CFG.staleAction === "silent" && pending.length > 0) {
           clog("[dsh-memory] dream 管线: 先归档 " + pending.length + " 个漏网会话，完成后自动接续整合");
           const r = await runStaleArchive(pending);
-          if (r.ok) {
-            (r.handled || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 实际处置才消号
-            saveStaleNotified();
-          }
-          if (r.ok && r.done) {
+          if (r.ok && r.done) {   // 消号 v1.12.19.1 起在子代理完成回调内执行
             const flag = await Promise.race([r.done, new Promise((res) => setTimeout(() => res("timeout"), 25 * 60000))]);
             note = "已归档 " + r.count + " 个漏网会话（" + flag + "）→ ";
           }
