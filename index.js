@@ -633,6 +633,76 @@ function extractMessageFlow(filePath, maxChars) {
     return parts.join("\n").slice(0, limit);
   } catch (e) { return null; }
 }
+    // v1.12.18: 快速消息流提取——帧级采样 + 行级快筛 + 工具轨迹 + 动态预算。
+    // 地基实测：zstd 多帧串联可按帧独立解压（subarray 从某帧 magic 起，单帧语义）。
+    // 大文件不再跳过（撤销 v1.12.17.2 的 25MB 截断）：首尾保真 + 中段均匀采样的有损可控视图。
+    // 逐帧间 setImmediate 让出，主线程不冻结。
+    async function extractMessageFlowAsync(filePath) {
+      try {
+        const st = fs.statSync(filePath);
+        const sizeMB = st.size / 1048576;
+        const buf = fs.readFileSync(filePath);
+        const frames = [];
+        for (let i = 0; i < buf.length - 3; i++) {
+          if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) frames.push(i);
+        }
+        if (frames.length === 0) return null;
+        const FULL = sizeMB < 8 || frames.length <= 12;
+        let selected;
+        if (FULL) selected = frames.slice();
+        else {
+          selected = frames.slice(0, 2);
+          const midA = 2, midB = frames.length - 2, span = Math.max(1, midB - midA);
+          const K = Math.min(Math.max(6, Math.round(sizeMB * 1.5)), span);
+          for (let k = 0; k < K; k++) selected.push(frames[midA + Math.floor(span * k / K)]);
+          if (frames.length >= 4) selected.push(frames[frames.length - 2], frames[frames.length - 1]);
+          selected = Array.from(new Set(selected)).sort((a, b) => a - b);
+        }
+        const maxChars = sizeMB < 5 ? 8000 : sizeMB < 15 ? 16000 : 32000;
+        const parts = [];
+        let total = 0;
+        let stop = false;
+        const nSel = selected.length;
+        for (let si = 0; si < nSel && !stop; si++) {
+          if (si > 0) await new Promise((r2) => setImmediate(r2));
+          let text = "";
+          try { text = zlib.zstdDecompressSync(buf.subarray(selected[si])).toString("utf8"); } catch (e) { continue; }
+          if (!FULL) parts.push(si === 0 ? "[采样视图 " + nSel + "/" + frames.length + " 帧·首尾保真中段均匀]" : "[段 " + (si + 1) + "/" + nSel + "]");
+          const segLines = text.split("\n");
+          for (const line of segLines) {
+            let kind = 0;
+            if (line.indexOf('"type":"user/message"') >= 0 || line.indexOf('"type": "user/message"') >= 0) kind = 1;
+            else if (line.indexOf('"type":"assistant/message"') >= 0 || line.indexOf('"type": "assistant/message"') >= 0) kind = 2;
+            else if (line.indexOf('"type":"tool/call"') >= 0 || line.indexOf('"type": "tool/call"') >= 0) kind = 3;
+            if (kind === 0) continue;
+            let j; try { j = JSON.parse(line); } catch (e) { continue; }
+            if (kind === 1) {
+              const content = j.data && j.data.content;
+              if (!Array.isArray(content)) continue;
+              const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
+              if (!txt || txt.indexOf("<system-reminder>") === 0) continue;
+              const piece = "[用户] " + txt.slice(0, 800);
+              parts.push(piece); total += piece.length;
+            } else if (kind === 2) {
+              const content = j.data && j.data.message && j.data.message.content;
+              if (!Array.isArray(content)) continue;
+              const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
+              if (!txt) continue;
+              const piece = "[助手] " + txt.slice(0, 1000);
+              parts.push(piece); total += piece.length;
+            } else {
+              const nm = (j.data && j.data.name) || "?";
+              const args = String((j.data && j.data.arguments) || "").replace(/\s+/g, " ").slice(0, 80);
+              const piece = "[工具] " + nm + "(" + args + ")";
+              parts.push(piece); total += piece.length;
+            }
+            if (total > maxChars) { stop = true; break; }
+          }
+        }
+        if (parts.length === 0) return null;
+        return { flow: parts.join("\n").slice(0, maxChars), sampled: !FULL };
+      } catch (e) { return null; }
+    }
 
 // v1.11.0：记忆活跃界限（漏网检测过滤用）——
 // enabledAt 由记忆活跃开关 active 驱动，与 DSH 进程启停解耦：
@@ -1104,19 +1174,13 @@ export default {
       const overflow = staleSessions.length - batch.length;
       const flowSessions = [];
       const skippedNoFlow = [];
-      let skippedTooBig = [];
       for (const s of batch) {
-        // v1.12.17.2: 同步解压+全量 JSON.parse 会冻结事件循环（实测两次宿主卡死）——
-        // 每个会话前让出一拍，且 >25MB 的超大日志直接跳过（留待人工处理）。
+        // v1.12.18: extractMessageFlowAsync——帧采样+行级快筛+工具轨迹+动态预算，大会话完整消化（撤销 25MB 跳过），逐帧让出不冻结。
         await new Promise((r2) => setImmediate(r2));
         const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
-        try {
-          const st2 = fs.statSync(logPath);
-          if (st2.size > 25 * 1024 * 1024) { skippedTooBig.push(s.id.slice(0, 12) + "(" + Math.round(st2.size / 1048576) + "MB)"); continue; }
-        } catch (e) { skippedNoFlow.push(s.id.slice(0, 12)); continue; }
-        clog("[dsh-memory] 提取消息流 " + (flowSessions.length + skippedNoFlow.length + skippedTooBig.length + 1) + "/" + batch.length + ": " + s.id.slice(0, 12) + "...");
-        const flow = extractMessageFlow(logPath, 8000);
-        if (flow) flowSessions.push({ session: s, flow: flow });
+        clog("[dsh-memory] 提取消息流 " + (flowSessions.length + skippedNoFlow.length + 1) + "/" + batch.length + ": " + s.id.slice(0, 12) + "...");
+        const r3 = await extractMessageFlowAsync(logPath);
+        if (r3 && r3.flow) flowSessions.push({ session: s, flow: r3.flow, sampled: r3.sampled });
         else skippedNoFlow.push(s.id.slice(0, 12));
       }
       skippedTooBig.forEach((id) => STALE_NOTIFIED.add(batch.find((x) => x.id.startsWith(id)) ? batch.find((x) => x.id.startsWith(id)).id : id));
@@ -1130,7 +1194,7 @@ export default {
       }
       const todayStr = new Date().toISOString().slice(0, 10);
       const flowBlocks = flowSessions.map((f) =>
-        "===== 会话 " + f.session.id + "（工作目录 " + f.session.ws.slice(0, 60) + "，最后交互约 " + Math.max(1, Math.round((Date.now() - f.session.mtime) / 86400000)) + " 天前）=====\n" + f.flow
+        (f.sampled ? "【采样视图】" : "") + "===== 会话 " + f.session.id + "（工作目录 " + f.session.ws.slice(0, 60) + "，最后交互约 " + Math.max(1, Math.round((Date.now() - f.session.mtime) / 86400000)) + " 天前）=====\n" + f.flow
       ).join("\n\n");
       const promptText =
         "你是 dsh-memory 主归档子代理，独立完成本轮全部漏网会话的记忆归档（fresh 会话，上下文只含本任务说明与已提取的对话消息流）。\n" +
@@ -1153,8 +1217,20 @@ export default {
           toolFilter: { allow: ["read", "write", "edit", "grep", "glob", "memory_search", "subagent"] }
         };
         if (LAST_TOP_AGENT) spawnOpts.parent = LAST_TOP_AGENT;
+        // v1.12.18: done promise——dream 管线等归档子代理完成后再接续整合
+        let doneDone = false; let doneTid = null; let doneResolveRef = null;
+        const done = new Promise((res) => { doneResolveRef = (v) => { if (!doneDone) { doneDone = true; clearTimeout(doneTid); res(v); } }; });
+        doneTid = setTimeout(() => doneResolveRef("timeout"), 25 * 60000);
         const run = await subagents.start("spawn", spawnOpts);
         run.result.then((result) => {
+          doneResolveRef(true);
+          // v1.12.18: 归档→整合联动提示（距上次整合超 1 天才提示，避免刷屏）
+          try {
+            const stI = readIntegrateState() || {};
+            if (!stI.lastIntegrateAt || Date.now() - stI.lastIntegrateAt > 86400000) {
+              clog("[dsh-memory] 本轮新增摘要可用 /dream 整合进全局记忆。");
+            }
+          } catch (e) {}
           const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
           clog("[dsh-memory] 漏网归档完成: " + label + "（stopReason=" + result.stopReason + "，报告 " + outText.length + " 字符）");
           const sdir2 = findNewestSpawnedSession(startedAt);
@@ -1167,9 +1243,10 @@ export default {
           }
         }).catch((e) => {
           cwarn("[dsh-memory] 漏网归档主子代理失败: " + label + " - " + (e && e.message ? e.message : String(e)));
+          doneResolveRef(false);
         });
         clog("[dsh-memory] 已发起漏网归档主子代理: " + label + "（后台执行中，完成后输出报告）");
-        return { ok: true, count: flowSessions.length, overflow: overflow };
+        return { ok: true, count: flowSessions.length, overflow: overflow, done: done };
       } catch (e) {
         cwarn("[dsh-memory] 漏网归档主子代理启动失败: " + label + " - " + (e && e.message ? e.message : String(e)));
         return { ok: false, reason: e && e.message ? e.message : String(e), overflow: overflow };
@@ -1964,6 +2041,27 @@ ctx.on("session/event", (session, event) => {
       }
     }
 
+    // v1.12.18: dream 管线——silent 模式先归档漏网再整合（一条命令到终点）；
+    // remind/approval 不绕审批闸：只提示漏网数，确认归档后下次 /dream 一并处理。
+    async function runDreamPipeline(reason, agentForParent) {
+      let note = "";
+      try {
+        const pending = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
+          .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
+        if (PLUGIN_CFG.staleAction === "silent" && pending.length > 0) {
+          clog("[dsh-memory] dream 管线: 先归档 " + pending.length + " 个漏网会话，完成后自动接续整合");
+          const r = await runStaleArchive(pending);
+          if (r.ok && r.done) {
+            const flag = await Promise.race([r.done, new Promise((res) => setTimeout(() => res("timeout"), 25 * 60000))]);
+            note = "已归档 " + r.count + " 个漏网会话（" + flag + "）→ ";
+          }
+        } else if (pending.length > 0) {
+          note = "另有 " + pending.length + " 个漏网会话未归档（staleAction=" + PLUGIN_CFG.staleAction + " 待确认，确认后下次 /dream 将一并处理）；";
+        }
+      } catch (e) { cwarn("[dsh-memory] dream 管线归档阶段异常:", e && e.message ? e.message : String(e)); }
+      return spawnIntegrate(agentForParent, reason);
+    }
+
     // 整合检查：到点且未整合过 → 发起
     async function checkIntegrate() {
       try {
@@ -1980,7 +2078,7 @@ ctx.on("session/event", (session, event) => {
         const due = now - (st.lastIntegrateAt || st.installAt || 0) >= PLUGIN_CFG.integrateDays * 86400000;
         if (due) {
           clog("[dsh-memory] 距上次整合已满 " + PLUGIN_CFG.integrateDays + " 天，触发自动整合");
-          await spawnIntegrate(null, "定期");
+          await runDreamPipeline("定期", null);
         }
       } catch (e) {
         cwarn("[dsh-memory] 整合检查异常:", e && e.message ? e.message : String(e));
@@ -2006,9 +2104,9 @@ ctx.on("session/event", (session, event) => {
           description: "手动触发一次记忆整合（对标 mimocode /dream）：扫描历史会话，把跨会话成立的决策/踩坑/规律归类提升到 global/projects 并精简超限文件。",
           input: { hint: "/dream 无参数" },
           handler: async (inv) => {
-            const started = await spawnIntegrate(inv.agent, "手动");
+            const started = await runDreamPipeline("手动", inv.agent);
             return started
-? { kind: "success", text: "已发起记忆整合（后台执行中）。进度实时写入 ~/.dsh/memory/.integrate.json 的 progress 字段——任意会话问「dream 跑到哪了」即可查询；完成后控制台输出消耗报告。" }
+? { kind: "success", text: "已发起 dream 管线（后台执行中）：漏网会话先归档（silent 模式自动，其他模式待你确认后单独处理）→ 接续整合全部摘要。进度实时写入 ~/.dsh/memory/.integrate.json 的 progress 字段——任意会话问「dream 跑到哪了」即可查询；完成后控制台输出消耗报告与归档明细。" }
               : { kind: "error", text: "整合启动失败（无可用父 agent 或 subagents 服务不可用），请稍后重试。" };
           }
         });
