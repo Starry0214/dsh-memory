@@ -1753,8 +1753,32 @@ ctx.on("session/event", (session, event) => {
             render(_a, v) { return [{ type: "text", text: String(v) }] }
           },
           async execute(args) {
-            const q = (args.query || "").trim();
-            if (!q) return "用法：memory_search(query)。query = 主题关键词 / 文件名 / 记忆条目（如 OA日志、智检API、长沙项目、金额）。";
+            // v1.12.18.5: 宽松归一化——异构调用方参数形态兼容（字符串/数组/嵌套对象/位置字段），
+            // 未命中时打印形状日志（首次排障用），避免搜索静默降级为用法回显。
+            let argsShape = "";
+            try { argsShape = typeof args === "string" ? "string" : Array.isArray(args) ? "array" : Object.keys(args || {}).join(","); } catch (e) {}
+            let q = "";
+            try {
+              if (typeof args === "string") q = args;
+              else if (args && typeof args === "object") {
+                let v = args.query;
+                if (Array.isArray(v)) v = v.join(" ");
+                else if (v && typeof v === "object") v = v.query || Object.values(v)[0];
+                if (typeof v !== "string") {
+                  for (const k of Object.keys(args)) {
+                    const cand = args[k];
+                    if (typeof cand === "string" && cand.trim()) { v = cand; break; }
+                    if (Array.isArray(cand) && cand.every((x) => typeof x === "string")) { v = cand.join(" "); break; }
+                  }
+                }
+                q = (typeof v === "string") ? v : String(v ?? "");
+              }
+            } catch (e) { q = ""; }
+            q = q.trim();
+            if (!q) {
+              cwarn("[dsh-memory] memory_search 收到无法解析的参数形状: " + argsShape + " → 返回用法回显");
+              return "用法：memory_search(query)。query = 主题关键词 / 文件名 / 记忆条目（如 OA日志、智检API、长沙项目、金额）。";
+            }
             // 固定记忆库目标
             const fixedTargets = [
               ["全局画像", "global.md"],
