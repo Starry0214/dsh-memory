@@ -640,6 +640,7 @@ function extractMessageFlow(filePath, maxChars) {
     // 地基实测：zstd 多帧串联可按帧独立解压（subarray 从某帧 magic 起，单帧语义）。
     // 大文件不再跳过（撤销 v1.12.17.2 的 25MB 截断）：首尾保真 + 中段均匀采样的有损可控视图。
     // 逐帧间 setImmediate 让出，主线程不冻结。
+    // v1.12.18.2: 优先提取官方 compaction/summary 摘要链（完整上下文浓缩），消息流降为兜底。
     async function extractMessageFlowAsync(filePath) {
       try {
         const st = fs.statSync(filePath);
@@ -662,6 +663,11 @@ function extractMessageFlow(filePath, maxChars) {
           selected = Array.from(new Set(selected)).sort((a, b) => a - b);
         }
         const maxChars = sizeMB < 5 ? 8000 : sizeMB < 15 ? 16000 : 32000;
+        // v1.12.18.2: 同一趟遍历双收获——官方 compaction 摘要（模型看过完整上下文含工具调用，
+        // 大会话必有）优先于任何采样消息流；compParts 非空则最终以它为准。
+        const compParts = [];
+        let compTotal = 0;
+        let lastCompSi = -1;
         const parts = [];
         let total = 0;
         let stop = false;
@@ -677,6 +683,7 @@ function extractMessageFlow(filePath, maxChars) {
             if (line.indexOf('"type":"user/message"') >= 0 || line.indexOf('"type": "user/message"') >= 0) kind = 1;
             else if (line.indexOf('"type":"assistant/message"') >= 0 || line.indexOf('"type": "assistant/message"') >= 0) kind = 2;
             else if (line.indexOf('"type":"tool/call"') >= 0 || line.indexOf('"type": "tool/call"') >= 0) kind = 3;
+            else if (line.indexOf('"type":"compaction/summary"') >= 0 || line.indexOf('"type": "compaction/summary"') >= 0) kind = 4;
             if (kind === 0) continue;
             let j; try { j = JSON.parse(line); } catch (e) { continue; }
             if (kind === 1) {
@@ -685,25 +692,41 @@ function extractMessageFlow(filePath, maxChars) {
               const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
               if (!txt || txt.indexOf("<system-reminder>") === 0) continue;
               const piece = "[用户] " + txt.slice(0, 800);
-              parts.push(piece); total += piece.length;
+              parts.push({ si: si, s: piece }); total += piece.length;
             } else if (kind === 2) {
               const content = j.data && j.data.message && j.data.message.content;
               if (!Array.isArray(content)) continue;
               const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
               if (!txt) continue;
               const piece = "[助手] " + txt.slice(0, 1000);
-              parts.push(piece); total += piece.length;
+              parts.push({ si: si, s: piece }); total += piece.length;
             } else {
               const nm = (j.data && j.data.name) || "?";
               const args = String((j.data && j.data.arguments) || "").replace(/\s+/g, " ").slice(0, 80);
               const piece = "[工具] " + nm + "(" + args + ")";
-              parts.push(piece); total += piece.length;
+              parts.push({ si: si, s: piece }); total += piece.length;
+            }
+            if (kind === 4) {
+              // 官方压缩摘要：模型看全量上下文（含工具调用）后的浓缩——最高价值来源
+              const segs = (j.data && j.data.summary) || [];
+              const txt = segs.filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n").trim();
+              if (txt) { compParts.push("【压缩点摘要】\n" + txt); compTotal += txt.length; lastCompSi = si; }
             }
             if (total > maxChars) { stop = true; break; }
           }
         }
+        // v1.12.18.2: 三态组装——
+        // ① 有压缩史：压缩摘要链（完整演进史）+ 末次压缩点之后的新增交互（摘要覆盖不到的最新内容）
+        // ② 无压缩史：消息流（小会话无损 / 大会话首尾保真中段采样）
+        const joinParts = (arr) => arr.map((p) => p.s).join("\n");
+        if (compParts.length > 0 && lastCompSi >= 0) {
+          const post = joinParts(parts.filter((p) => p.si > lastCompSi));
+          let flowOut = compParts.join("\n\n=====\n\n");
+          if (post) flowOut += '\n\n【末次压缩后的新增交互】\n' + post;
+          return { flow: flowOut.slice(-maxChars), sampled: false, source: "compaction", compCount: compParts.length };
+        }
         if (parts.length === 0) return null;
-        return { flow: parts.join("\n").slice(0, maxChars), sampled: !FULL };
+        return { flow: joinParts(parts).slice(0, maxChars), sampled: !FULL, source: "messageflow" };
       } catch (e) { return null; }
     }
 
