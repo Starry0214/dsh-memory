@@ -118,6 +118,7 @@ function ts() {
 //         插件关闭期间产生的会话（创建时间在启用之后）仍会被检测 → 重新启用后"未整合范围扩大"。
 // 判定"漏网"：会话创建于启用之后 + 最后一次写入距今超过阈值 + 未在记忆库落档
 const STALE_NOTIFIED = new Set();  // 本实例内已提醒过的会话 id（防多会话重复提醒）
+let staleNotifiedLoaded = false;
 const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
 
 // v1.12.0：自动提醒查记忆/查 skill（判断 A/B/C 插件化）——
@@ -1264,6 +1265,12 @@ export default {
         const run = await subagents.start("spawn", spawnOpts);
         run.result.then((result) => {
           doneResolveRef(true);
+          // v1.12.18.6: 归档后刷新设置界面 staleCount 快照
+          try {
+            const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id)).length;
+            if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") HOST_SETTINGS_SCOPE.update({ staleCount: remain }).catch(() => {});
+            saveStaleNotified();
+          } catch (e) {}
           // v1.12.18: 归档→整合联动提示（距上次整合超 1 天才提示，避免刷屏）
           try {
             const stI = readIntegrateState() || {};
@@ -1298,6 +1305,7 @@ export default {
 
     // v9：组装维护提醒（备份到期 + 轮转到期），有需要时注入
     async function injectMaintenanceReminder(agent, sessionLabel) {
+      ensureStaleNotified();
       LAST_TOP_AGENT = agent;  // v1.12.8: 记录最近顶层会话句柄
       const SESSION_LABEL = sessionLabel || "?";
 
@@ -1407,6 +1415,7 @@ export default {
         "<system-reminder>\n以下为 dsh-memory 维护提醒（写入 ~/.dsh 需要一次审批，频率很低）：\n" + parts.join("\n\n") + "\n</system-reminder>"
       ));
       clog("[dsh-memory] 已注入维护提醒（" + parts.length + " 项）[会话: " + SESSION_LABEL + "]");
+      saveStaleNotified();
     }
 
     // v1.4.0：会话标识（日志关联用）—— 工作目录最后一段 + session id 前 8 位
@@ -1880,6 +1889,7 @@ ctx.on("session/event", (session, event) => {
           parameters: { type: "object", properties: {}, required: [] },
           output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
           async execute() {
+            ensureStaleNotified();
             const stale = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
               .filter((s) => !STALE_NOTIFIED.has(s.id) && !sessionMentionedInMemory(s.id));
             if (stale.length === 0) return "当前没有待归档的漏网会话。";
@@ -1971,6 +1981,22 @@ ctx.on("session/event", (session, event) => {
         if (kind === "integ") m.integRuns += 1; else m.archRuns += 1;
         m.inT += (u.totalIn || u.input || 0); m.cacheT += (u.cache || 0); m.outT += (u.output || 0);
         scheduleMonitorSave();
+      } catch (e) { /* 忽略 */ }
+    }
+    // v1.12.18.6: STALE_NOTIFIED 持久化——重启后不重复提醒/重复归档跳过项；staleCount 快照可正确收敛
+    function ensureStaleNotified() {
+      if (staleNotifiedLoaded) return;
+      staleNotifiedLoaded = true;
+      try {
+        const arr = ((readIntegrateState() || {}).staleNotified) || [];
+        arr.forEach((id) => STALE_NOTIFIED.add(id));
+      } catch (e) { /* 忽略 */ }
+    }
+    function saveStaleNotified() {
+      try {
+        const st = readIntegrateState() || {};
+        st.staleNotified = Array.from(STALE_NOTIFIED).slice(-300);
+        writeIntegrateState(st);
       } catch (e) { /* 忽略 */ }
     }
     function dreamProgressPatch(patch) {
@@ -2113,6 +2139,7 @@ ctx.on("session/event", (session, event) => {
     // v1.12.18: dream 管线——silent 模式先归档漏网再整合（一条命令到终点）；
     // remind/approval 不绕审批闸：只提示漏网数，确认归档后下次 /dream 一并处理。
     async function runDreamPipeline(reason, agentForParent) {
+      ensureStaleNotified();
       let note = "";
       try {
         const pending = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
