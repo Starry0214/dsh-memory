@@ -1092,7 +1092,7 @@ export default {
     // v1.12.8：统一漏网归档入口 —— 单主子代理编排（用户要求"无感"）：
     //   插件只提取消息流 + spawn 一个主归档子代理；价值判断/拆分/汇总/落盘全由主子代理自主完成，
     //   消除多子代理并发 append 同一文件的竞态；控制台只有发起/完成两条日志。
-    const MAX_ARCHIVE_SESSIONS = 20;  // 单批上限，超出留待下次
+    const MAX_ARCHIVE_SESSIONS = 10;   // v1.12.17.2: 20→10（提取为同步 CPU 密集操作，大批量曾冻结宿主）  // 单批上限，超出留待下次
     async function runStaleArchive(staleSessions) {
       const subagents = ctx.get("subagents");
       if (!subagents || typeof subagents.start !== "function") {
@@ -1104,12 +1104,22 @@ export default {
       const overflow = staleSessions.length - batch.length;
       const flowSessions = [];
       const skippedNoFlow = [];
+      let skippedTooBig = [];
       for (const s of batch) {
+        // v1.12.17.2: 同步解压+全量 JSON.parse 会冻结事件循环（实测两次宿主卡死）——
+        // 每个会话前让出一拍，且 >25MB 的超大日志直接跳过（留待人工处理）。
+        await new Promise((r2) => setImmediate(r2));
         const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
+        try {
+          const st2 = fs.statSync(logPath);
+          if (st2.size > 25 * 1024 * 1024) { skippedTooBig.push(s.id.slice(0, 12) + "(" + Math.round(st2.size / 1048576) + "MB)"); continue; }
+        } catch (e) { skippedNoFlow.push(s.id.slice(0, 12)); continue; }
+        clog("[dsh-memory] 提取消息流 " + (flowSessions.length + skippedNoFlow.length + skippedTooBig.length + 1) + "/" + batch.length + ": " + s.id.slice(0, 12) + "...");
         const flow = extractMessageFlow(logPath, 8000);
         if (flow) flowSessions.push({ session: s, flow: flow });
         else skippedNoFlow.push(s.id.slice(0, 12));
       }
+      skippedTooBig.forEach((id) => STALE_NOTIFIED.add(batch.find((x) => x.id.startsWith(id)) ? batch.find((x) => x.id.startsWith(id)).id : id));
       skippedNoFlow.forEach((id) => {
         const s = batch.find((x) => x.id.startsWith(id));
         if (s) STALE_NOTIFIED.add(s.id);
