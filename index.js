@@ -151,7 +151,10 @@ function buildMemoryHintTable() {
       // name 除整串外，按斜杠切子领域（如 "REST API/推送" → 追加 "推送"）——混合词的中文主体可独立命中
       const nameParts = [name, ...name.split(/[/／]+/).map((s) => s.trim()).filter((s) => s.length >= 2)];
       for (const part of [...nameParts, ...desc.split(/[/、,，;；\s]+/).filter(Boolean)]) {
-        if (part.length >= 2) kws.push(splitKw(part));
+        // v2.0.4: 丢弃空关键词——2字符纯英文/数字词（Qt/CA/OA/26/38）通过长度准入但 splitKw 的 lats 正则要求≥3字符，
+        // 产出 {han:[],lats:[]} 对任何文本无条件命中（08-24 实测 7 个领域行中招，A 类提醒与任务无关的根因）
+        const k = splitKw(part);
+        if (k.hanGrams.length || k.lats.length) kws.push(k);
       }
       rows.push({ kws, file, name });
     }
@@ -168,20 +171,24 @@ function buildMemoryHintTable() {
 // v1.12.19.3: 只取用户真实输入——剔除 <system-reminder> 注入块（维护提醒/本插件提示文本含关键词，
 // 混入匹配源会自我强化：提示里的「日志填写」等词被当成用户输入再次命中，BitDock 会话实测循环注入）。
 function hintTextOf(messages) {
-  const parts = [];
+  // v2.0.4: 只取最后一条 role=user 消息——A 类判断的是「当前任务是否涉及已知领域」，
+  // 全史拼接会让早期粘贴的控制台输出/runtime context 永久参与每轮匹配（08-24 实测跨天长会话注入与任务无关的提示）。
+  let lastUser = null;
   for (const msg of messages || []) {
     if (!msg || !Array.isArray(msg.content)) continue;
-    // 只取 role=user 的消息（排除 assistant 输出与注入的 system-reminder）
     if (msg.role && msg.role !== "user") continue;
-    for (const b of msg.content) {
-      if (b && b.type === "text" && typeof b.text === "string") {
-        const t = b.text;
-        if (t.indexOf("<system-reminder>") >= 0 || t.indexOf("【dsh-memory") >= 0) continue;  // 剔除插件注入块
-        parts.push(t);
-      }
+    lastUser = msg;   // 同一条消息的多 text 块仍合并（长消息分块场景）
+  }
+  if (!lastUser) return "";
+  const parts = [];
+  for (const b of lastUser.content) {
+    if (b && b.type === "text" && typeof b.text === "string") {
+      const t = b.text;
+      if (t.indexOf("<system-reminder>") >= 0 || t.indexOf("【dsh-memory") >= 0) continue;  // 剔除插件注入块
+      parts.push(t);
     }
   }
-  return parts.join("\n").slice(0, 2000);  // 只取前 2000 字符匹配（足够判断领域）
+  return parts.join("\n").slice(0, 2000);
 }
 
 // v1.12.11：关键词预处理（对标 MiMo-Code skill/search.ts tokenize）——
@@ -218,6 +225,7 @@ function matchMemoryHints(userText) {
   for (const row of table) {
     let hit = false;
     for (const kw of row.kws) {
+      if (kw.hanGrams.length === 0 && (!kw.lats || kw.lats.length === 0)) continue;  // v2.0.4: 空关键词无条件命中的防御
       // 中文部分：bigram 交集 ≥ 半数（至少 1）
       let hanHit = kw.hanGrams.length === 0;
       if (!hanHit) {
@@ -1243,7 +1251,14 @@ export default {
       }
     }
 
+    // v2.0.5: 防重入——模型反复调 stale_archive 会重复提取消息流+重复 spawn 烧 token，不信任模型自觉
+    let STALE_RUNNING = false;
     async function runStaleArchive(staleSessions) {
+      if (STALE_RUNNING) return { ok: false, reason: "上一轮漏网归档仍在进行中，本次忽略（防重复发起）" };
+      STALE_RUNNING = true;
+      try { return await runStaleArchiveInner(staleSessions); } finally { STALE_RUNNING = false; }
+    }
+    async function runStaleArchiveInner(staleSessions) {
       const subagents = ctx.get("subagents");
       if (!subagents || typeof subagents.start !== "function") {
         cwarn("[dsh-memory] subagents 服务不可用，漏网归档降级为提醒");
@@ -2152,6 +2167,32 @@ ctx.on("session/event", (session, event) => {
       }
       // v1.11.0：整合升级（对标 mimocode Dream）—— D3 归类分节+来源id、D4 容量上限+修剪、验证后写入
       // 只读最近信号（不穷举）+ 简报输出（省 token）
+      // v2.0.5: 发起前快照 global/index 容量与时间戳行——完成后验收"模型是否真按任务书精简"，不信任口头汇报
+      const dreamSnap = {};
+      try {
+        for (const df of ["global.md", "index.md"]) {
+          const dt = fs.readFileSync(portable(MEMORY_ROOT + "/" + df), "utf8");
+          dreamSnap[df] = { chars: dt.length, stampLine: (dt.split("\n").slice(0, 5).find((l) => l.includes("最后更新")) || "") };
+        }
+      } catch (e) { /* 快照失败不影响发起 */ }
+      // v2.0.5: 自校准统计预计算——中位数/占比等数字由代码算好直接喂给整合代理（LLM 算数不可靠），
+      // 子代理只做定性判断（要不要调、调哪个方向）并经 dsh_spiral_thresh 钳制应用。
+      let calibStats = "监控数据不足（spiralEvents<5 或无周期画像），跳过 D-threshold Self-Calibration 节";
+      try {
+        const md = readMonitorData();
+        const se = Array.isArray(md.spiralEvents) ? md.spiralEvents : [];
+        const tps = Array.isArray(md.turnProfiles) ? md.turnProfiles : [];
+        if (se.length >= 5 && tps.length > 0) {
+          const reps = se.map((x) => x.repRate || 0).sort((a2, b2) => a2 - b2);
+          const medRep = reps[Math.floor(reps.length / 2)];
+          const negs = se.map((x) => x.negRate || 0).sort((a2, b2) => a2 - b2);
+          const medNeg = negs[Math.floor(negs.length / 2)];
+          const spiralCycles = tps.filter((x) => x.spiralN > 0).length;
+          const spiralPct = Math.round((spiralCycles / tps.length) * 100);
+          const curTh = effectiveSpiralThresh();
+          calibStats = "spiralEvents 共 " + se.length + " 条；repRate 中位数=" + medRep + "，negRate 中位数=" + medNeg + "；近 " + tps.length + " 个周期中打转周期占 " + spiralPct + "%；当前生效阈值 rep≥" + curTh.rep + "/neg≥" + curTh.neg + "/sim≥" + curTh.sim + "/窗" + curTh.w + "/冷却" + curTh.cooldownMin + "分";
+        }
+      } catch (e) { /* 统计失败按数据不足处理 */ }
       const promptText =
 "Run one automatic memory consolidation pass for the current DSH memory library (~/.dsh/memory/).\n" +
 "Consolidate only durable, VERIFIED information. Memory files (sessions/ summaries) are the working index.\n" +
@@ -2244,6 +2285,24 @@ ctx.on("session/event", (session, event) => {
           st.lastIntegrateAt = Date.now();
           writeIntegrateState(st);
           trackMaintain("integ", u);
+          // v2.0.5: 完成验收——容量上限与时间戳行是代码检查，不是模型自觉（超限/被改即报告并记入 progress.health）
+          try {
+            const health = [];
+            for (const df of ["global.md", "index.md"]) {
+              try {
+                const dt = fs.readFileSync(portable(MEMORY_ROOT + "/" + df), "utf8");
+                const lim = df === "global.md" ? 3000 : 2000;
+                if (dt.length >= lim) health.push(df + " " + dt.length + "字符未达精简目标(<" + lim + ")");
+                if (dreamSnap[df] && dreamSnap[df].stampLine && !dt.includes(dreamSnap[df].stampLine)) health.push(df + " 时间戳行被改动(前缀缓存失效)");
+              } catch (e2) {}
+            }
+            if (health.length) {
+              cwarn("[dsh-memory] 整合验收未过: " + health.join("; ") + "——下次整合优先处理");
+              if (DREAM_PATCH) DREAM_PATCH({ health: health.join("; ").slice(0, 200) });
+            } else if (dreamSnap["global.md"]) {
+              clog("[dsh-memory] 整合验收通过: global/index 容量与时间戳行合规");
+            }
+          } catch (e2) { /* 验收失败不影响主流程 */ }
           clog("[dsh-memory] 下次自动整合：" + PLUGIN_CFG.integrateDays + " 天后");
         }).catch((e) => {
           cwarn("[dsh-memory] 自动整合子代理失败:", e && e.message ? e.message : String(e));
