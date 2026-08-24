@@ -131,6 +131,7 @@ const MEMORY_HINT_THROTTLE = new Map();  // sessionId -> 用户输入序号（�
 const MEMORY_HINT_LAST_SEQ = new Map();  // v1.12.10: sessionId -> 上次 A 类提醒时的输入序号（冷却闸：距上次 <2 条跳过）
 const MEMORY_HINT_SEEN = new Map();      // v1.12.10: sessionId -> Set<file> 已提醒过的记忆文件（领域去重闸）
 const MEMORY_HINT_ERRORS = new Map();    // sessionId -> Map<签名, 次数>（B/C 判断）
+const SPIRAL_REMIND_AT = new Map();      // v2.0.2: sessionId -> 上次 D 类提醒时间戳（10 分钟冷却防连刷）
 
 // 从 index.md 自动提取"领域→记忆文件→关键词"匹配表
 function buildMemoryHintTable() {
@@ -303,7 +304,7 @@ let LAST_TOP_AGENT = null;         // v1.12.8: 最近顶层会话 agent 句柄�
 
 function defaultMonitorData() {
   return { version: 1, installedAt: Date.now(), updatedAt: Date.now(),
-    hints: { A: 0, B: 0, C: 0 },     // 提醒次数（按类型）
+    hints: { A: 0, B: 0, C: 0, D: 0 },     // 提醒次数（按类型；D=v2.0.2 LLM循环试错）
     byDomain: {},                     // A 类提醒按领域统计 { 领域名: 次数 }
     queries: 0,                       // memory_search 总调用数
     recentQueries: [],                // 最近查询（最多 20 条 {t, query}）
@@ -312,7 +313,7 @@ function defaultMonitorData() {
     hintOpen: null,
     maintain: { integRuns: 0, archRuns: 0, inT: 0, cacheT: 0, outT: 0 },  // v1.12.18.1: 维护 token 累计
     turnProfiles: [],                   // v1.12.16: 任务周期画像 [{t,durMin,calls,negN,errN,spiralN}]（滚动200条，调优基线）
-    spiralEvents: [] };                 // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（影子记录，不注入）                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
+    spiralEvents: [] };                 // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（v2.0.2 起可注入D类提醒，样本仍全量保留供调优）                 // v1.12.15: 未决跟随窗口 { kind, type, count }——持久化+三态判定
 }
 
 function readMonitorData() {
@@ -367,16 +368,16 @@ function updateMonitorSummary() {
     const evs = Array.isArray(d.events) ? d.events : [];
     for (let i = evs.length - 1; i >= 0; i--) {
       const ty = evs[i] && evs[i].type;
-      if (ty === "hintA" || ty === "hintB" || ty === "hintC") {
+      if (ty === "hintA" || ty === "hintB" || ty === "hintC" || ty === "hintD") {
         if (lastHintT[ty] === void 0 && evs[i].t > 0) lastHintT[ty] = evs[i].t;
-        if (lastHintT.hintA !== void 0 && lastHintT.hintB !== void 0 && lastHintT.hintC !== void 0) break;
+        if (lastHintT.hintA !== void 0 && lastHintT.hintB !== void 0 && lastHintT.hintC !== void 0 && lastHintT.hintD !== void 0) break;
       }
     }
     const hhmm = (t) => { const dt = new Date(t); return pad(dt.getHours()) + ":" + pad(dt.getMinutes()); };
     const fmtHint = (label, n, t) => label + ":" + n + (t !== void 0 ? "（" + hhmm(t) + "）" : "");
     // v1.12.5：统计行改多行分明格式（client 端 pre-wrap 渲染换行）；数组 join 构造，禁止模板字符串写 \n（v1.12.3 教训）
     const sumLines = [
-      "提醒  " + fmtHint("A", d.hints.A, lastHintT.hintA) + "｜" + fmtHint("B", d.hints.B, lastHintT.hintB) + "｜" + fmtHint("C", d.hints.C, lastHintT.hintC),
+      "提醒  " + fmtHint("A", d.hints.A || 0, lastHintT.hintA) + "｜" + fmtHint("B", d.hints.B || 0, lastHintT.hintB) + "｜" + fmtHint("C", d.hints.C || 0, lastHintT.hintC) + "｜" + fmtHint("D", d.hints.D || 0, lastHintT.hintD),
       "查询  记忆查询 " + d.queries + " 次" + (followRate !== null ? " · 跟进率 " + followRate + "%" : "") + ((d.capped || 0) > 0 ? " · capped " + d.capped : "")
     ];
     if (topDomains) sumLines.push("领域  " + topDomains.split(",").join("、"));
@@ -391,6 +392,7 @@ function updateMonitorSummary() {
       "A = 命中领域关键词，先查记忆再动手",
       "B = 同一错误第2次，提醒立即查",
       "C = 连续失败3次，强制查记忆+skill",
+      "D = LLM循环试错（同类调用反复×负面结果），提醒换思路查记忆/skill",
       "capped = 窗口超限截断（长任务），不计入跟进率"
     );
     const s = sumLines.join("\n");
@@ -441,6 +443,14 @@ function monitorHintBC(type) {
   monitorEvent("hint" + type, { time: Date.now() });
 }
 
+// D 类提醒（LLM循环试错）：记录 + 打开跟随判定窗口（v2.0.2 影子转正；跟随窗口 cap 与 BC 同为 8）
+function monitorHintD() {
+  const d = readMonitorData();
+  d.hints.D = (d.hints.D || 0) + 1;
+  d.hintOpen = { kind: "D", type: "D", count: 0 };
+  monitorEvent("hintD", { time: Date.now() });
+}
+
 // 工具调用：记录 memory_search/skill 行为 + 跟随判定
 function monitorToolCall(toolName, meta, args) {
   try {
@@ -480,7 +490,8 @@ function monitorToolCall(toolName, meta, args) {
 
 // ── v1.12.16: 过程信号探针（影子模式）─────────────────────────
 // 「参数打转 × 无进展」双条件识别原地空转（回测标定：试错链命中、正常翻页不误报）。
-// 只落盘 spiralEvents/turnProfiles 供阈值调优，不注入任何提示。
+// v2.0.2: 样本落盘 spiralEvents/turnProfiles 供阈值调优；周期内首次命中返回 true，
+// 由调用点结合 spiralRemind 开关与冷却注入 D 类「LLM循环试错提醒」（关闭=纯影子模式）。
 const SPIRAL_W = 8;            // 滑窗大小
 const SPIRAL_SIM_TH = 0.7;     // args bigram Dice 相似度阈值（S1）
 const SPIRAL_REP_TH = 0.45;    // 窗口内打转占比阈值
@@ -539,8 +550,9 @@ function spiralObserve(toolName, args, result, isError, sid) {
       const repRate = B.win.reduce((s2, w2) => s2 + w2.rep, 0) / n;
       const negRate = B.win.reduce((s2, w2) => s2 + w2.neg, 0) / n;
       if (repRate >= SPIRAL_REP_TH && negRate >= SPIRAL_NEG_TH && B.cur) {
+        const firstHit = B.cur.spiralN === 0;   // 本周期首次命中
         B.cur.spiralN += 1;
-        if (B.cur.spiralN === 1) {   // 每周期只记首次样本，防膨胀
+        if (firstHit) {   // 每周期只记首次样本，防膨胀
           const d = readMonitorData();
           if (!Array.isArray(d.spiralEvents)) d.spiralEvents = [];
           const tCnt = {};
@@ -550,9 +562,11 @@ function spiralObserve(toolName, args, result, isError, sid) {
           if (d.spiralEvents.length > 100) d.spiralEvents = d.spiralEvents.slice(-100);
           scheduleMonitorSave();
         }
+        return firstHit;   // v2.0.2: 是否周期首次打转（调用点决定是否注入 D 类提醒）
       }
     }
   } catch (e) { /* 探针失败不影响会话 */ }
+  return false;
 }
 // v1.12.16: 任务周期画像结算（pre-step 新用户输入时调用）——后续动态阈值的基线数据
 function settleTurnProfile(sid) {
@@ -778,7 +792,7 @@ function sessionMentionedInMemory(sessionId) {
 //  - staleSessionDays: 漏网会话检测阈值（天），默认 5
 //  - staleAction:      漏网处理动作（v1.12.18 起同时决定 /dream 是否带归档）：remind=仅提醒，/dream 不含归档 | silent=后台自动归档，/dream 先归档再整合 | approval=确认后才归档，/dream 不含归档
 // v1.7.1：默认 staleAction=remind（仅提醒，不自动 spawn 子代理——实测漏网归档子代理单会话可烧数百万 token）
-const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true, monitorEnabled: true };
+const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true, monitorEnabled: true, spiralRemind: true };
 // v1.11.0：active = 记忆活跃开关（独立于 DSH 进程启停）——
 // 用户显式关掉=记忆整合暂停（enabledAt 置空）；打开=重新启用（enabledAt 刷新为当前时间）。
 // DSH 重启/退出不再影响 enabledAt——「插件启停」与「DSH 进程启停」彻底解耦。
@@ -798,6 +812,8 @@ const SETTINGS_SCHEMA = z.object({
   active: z.boolean().default(true),
   // v1.12.0：使用监控开关（默认开）——记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总
   monitorEnabled: z.boolean().default(true),
+  // v2.0.2：LLM循环试错提醒（D类）——打转探针双条件命中时注入提醒；关闭则回退纯影子记录
+  spiralRemind: z.boolean().default(DEFAULT_CFG.spiralRemind),
   // 只读：监控汇总（客户端展示），宿主写入
   monitorSummary: z.string().required(false),
   // 只读统计：漏网（未整合记忆）会话数量，由宿主在检测后写入；非用户编辑项
@@ -817,6 +833,7 @@ function normalizeCfg(raw) {
   if (!(cfg.staleSessionDays >= 1 && cfg.staleSessionDays <= 90)) cfg.staleSessionDays = DEFAULT_CFG.staleSessionDays;
   if (typeof cfg.active !== "boolean") cfg.active = DEFAULT_CFG.active;
   if (typeof cfg.monitorEnabled !== "boolean") cfg.monitorEnabled = DEFAULT_CFG.monitorEnabled;
+  if (typeof cfg.spiralRemind !== "boolean") cfg.spiralRemind = DEFAULT_CFG.spiralRemind;
   return cfg;
 }
 
@@ -1618,7 +1635,17 @@ ctx.on("tools/result", (exec, result) => {
           const spSid = (s2 && s2.id) || "?";
           const cw = s2 && ((s2.header && s2.header.cwd) || s2.cwd);
           if (cw) spiralBucket(spSid).ws = String(cw).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "?";   // v1.12.16.1 诊断属性；v2.0.1 写入会话桶
-          spiralObserve(toolName, exec.arguments, result, !!result.isError, spSid);
+          const spiralFirst = spiralObserve(toolName, exec.arguments, result, !!result.isError, spSid);
+          // v2.0.2: D 类「LLM循环试错提醒」三道闸——周期首次命中 × spiralRemind 开关 × 同会话10分钟冷却（防连刷）
+          if (spiralFirst && PLUGIN_CFG.spiralRemind && (Date.now() - (SPIRAL_REMIND_AT.get(spSid) || 0) >= 600000)) {
+            SPIRAL_REMIND_AT.set(spSid, Date.now());
+            monitorHintD();
+            const agent2 = exec.agent;
+            if (agent2 && typeof agent2.inject === "function") {
+              const hintD = "<system-reminder>\n【dsh-memory 提示·LLM循环试错】检测到同类调用反复且负面结果占比高——大概率方向不对。建议暂停硬试：memory_search 搜当前任务关键词 + 查技能目录有无对应 skill，或换个思路/向用户确认。\n</system-reminder>";
+              setTimeout(() => { try { agent2.inject(makeMessage(hintD)); } catch (e2) {} }, 0);
+            }
+          }
         } catch (e) {}
         // v1.12.17: dream 心跳——发起后第一个出现的裸 UUID 会话即整合子代理
         try {
@@ -2239,6 +2266,7 @@ ctx.on("session/event", (session, event) => {
       + " staleAction=" + PLUGIN_CFG.staleAction
       + " active=" + PLUGIN_CFG.active
       + " integrate=" + (PLUGIN_CFG.integrateEnabled ? PLUGIN_CFG.integrateDays + "天/次" : "关")
+      + " spiral=" + (PLUGIN_CFG.spiralRemind ? "remind(D类)" : "shadow(仅记录)")
       + "（memory_search / stale_archive / /dream 已挂载，定时器运行中）");
 
     // v1.11.0：dispose 钩子 —— 不再置空 enabledAt！
