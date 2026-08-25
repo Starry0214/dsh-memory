@@ -131,7 +131,7 @@ const MEMORY_HINT_THROTTLE = new Map();  // sessionId -> 用户输入序号（�
 const MEMORY_HINT_LAST_SEQ = new Map();  // v1.12.10: sessionId -> 上次 A 类提醒时的输入序号（冷却闸：距上次 <2 条跳过）
 const MEMORY_HINT_SEEN = new Map();      // v1.12.10: sessionId -> Set<file> 已提醒过的记忆文件（领域去重闸）
 const MEMORY_HINT_ERRORS = new Map();    // sessionId -> Map<签名, 次数>（B/C 判断）
-const SPIRAL_REMIND_AT = new Map();      // v2.0.2: sessionId -> 上次 D 类提醒时间戳（10 分钟冷却防连刷）
+const SPIRAL_REMIND_AT = new Map();      // v2.0.6: sessionId -> { ts: 上次注入时刻, streak: 连续未奏效次数 }——指数退避+跟进复位+2h 自然归零
 
 // 从 index.md 自动提取"领域→记忆文件→关键词"匹配表
 function buildMemoryHintTable() {
@@ -470,7 +470,7 @@ function monitorHintD() {
 }
 
 // 工具调用：记录 memory_search/skill 行为 + 跟随判定
-function monitorToolCall(toolName, meta, args) {
+function monitorToolCall(toolName, meta, args, sid) {
   try {
     if (PLUGIN_CFG.monitorEnabled === false) return;
     const d = readMonitorData();
@@ -492,6 +492,8 @@ function monitorToolCall(toolName, meta, args) {
       if (isQuerySignal || memReadSignal) {
         d.followed += 1;
         d.hintOpen = null;
+        const sr = SPIRAL_REMIND_AT.get(sid);
+        if (sr) { sr.streak = 0; SPIRAL_REMIND_AT.set(sid, sr); }   // v2.0.6: 提醒奏效立即恢复灵敏度
       } else {
         d.hintOpen.count += 1;
         const cap = d.hintOpen.kind === "A" ? FOLLOW_CAP_A : FOLLOW_CAP_BC;
@@ -1658,31 +1660,42 @@ ctx.on("tools/result", (exec, result) => {
       try {
         if (!exec || !result) return;
         const toolName = exec.tool || exec.name || "other";
+        const agentSess = exec.agent && exec.agent.session;
+        const spSid = (agentSess && agentSess.id) || "?";
         // 1) 监控：记录工具调用；memory_search/skill 触发查询统计与跟随判定
         if (toolName === "memory_search") {
           const minp = exec.arguments || exec.input || {};  // v1.12.13: 真实字段是 arguments（exec.input 不存在导致查询词恒空）
           const q = (minp.query || minp.name) ? String(minp.query || minp.name) : "";
-          monitorToolCall("memory_search", { query: q });
+          monitorToolCall("memory_search", { query: q }, spSid);
         } else if (toolName === "skill") {
-          monitorToolCall("skill");
+          monitorToolCall("skill", null, null, spSid);
         } else {
-          monitorToolCall(toolName, null, exec.arguments);
+          monitorToolCall(toolName, null, exec.arguments, spSid);
         }
         // v1.12.16: 过程信号探针（影子）——覆盖被 isError 漏掉的失败形态（catch 吞错/exit码）
         try {
-          const s2 = exec.agent && exec.agent.session;
-          const spSid = (s2 && s2.id) || "?";
-          const cw = s2 && ((s2.header && s2.header.cwd) || s2.cwd);
+          const cw = agentSess && ((agentSess.header && agentSess.header.cwd) || agentSess.cwd);
           if (cw) spiralBucket(spSid).ws = String(cw).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "?";   // v1.12.16.1 诊断属性；v2.0.1 写入会话桶
           const spiralFirst = spiralObserve(toolName, exec.arguments, result, !!result.isError, spSid);
-          // v2.0.2: D 类「LLM循环试错提醒」三道闸——周期首次命中 × spiralRemind 开关 × 同会话冷却（防连刷）；v2.0.3 冷却分钟数可自校准
-          if (spiralFirst && PLUGIN_CFG.spiralRemind && (Date.now() - (SPIRAL_REMIND_AT.get(spSid) || 0) >= effectiveSpiralThresh().cooldownMin * 60000)) {
-            SPIRAL_REMIND_AT.set(spSid, Date.now());
-            monitorHintD();
-            const agent2 = exec.agent;
-            if (agent2 && typeof agent2.inject === "function") {
-              const hintD = "<system-reminder>\n【dsh-memory 提示·LLM循环试错】检测到同类调用反复且负面结果占比高——大概率方向不对。建议暂停硬试：memory_search 搜当前任务关键词 + 查技能目录有无对应 skill，或换个思路/向用户确认。\n</system-reminder>";
-              setTimeout(() => { try { agent2.inject(makeMessage(hintD)); } catch (e2) {} }, 0);
+          // v2.0.6: D 类提醒智能闸门——周期首次命中 × 开关 × 指数退避冷却（跟进复位/2h归零）× 批量进展豁免
+          if (spiralFirst && PLUGIN_CFG.spiralRemind) {
+            const nowMs = Date.now();
+            const stR = SPIRAL_REMIND_AT.get(spSid) || { ts: 0, streak: 0 };
+            const streak = (nowMs - stR.ts >= 120 * 60000) ? 0 : (stR.streak || 0);   // 2h 无新触发=新任务周期，退避自然归零
+            const B2 = spiralBucket(spSid);
+            const uniq = new Set(B2.win.map((w) => w.resKey)).size;
+            const okN = B2.win.filter((w) => !w.neg).length;
+            // 批量进展豁免：窗内结果多样且成功过半 → 批量循环而非空转，只记录不扰
+            const batchLike = B2.win.length > 0 && uniq >= Math.ceil(B2.win.length / 2) && okN * 2 >= B2.win.length;
+            const cdMs = Math.min(effectiveSpiralThresh().cooldownMin * Math.pow(2, streak), 60) * 60000;   // 指数退避 封顶60分
+            if (!batchLike && nowMs - stR.ts >= cdMs) {
+              SPIRAL_REMIND_AT.set(spSid, { ts: nowMs, streak: streak + 1 });
+              monitorHintD();
+              const agent2 = exec.agent;
+              if (agent2 && typeof agent2.inject === "function") {
+                const hintD = "<system-reminder>\n【dsh-memory 提示·LLM循环试错】检测到同类调用反复且负面结果占比高——大概率方向不对。建议暂停硬试：memory_search 搜当前任务关键词 + 查技能目录有无对应 skill，或换个思路/向用户确认。\n</system-reminder>";
+                setTimeout(() => { try { agent2.inject(makeMessage(hintD)); } catch (e2) {} }, 0);
+              }
             }
           }
         } catch (e) {}
