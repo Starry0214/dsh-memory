@@ -47,17 +47,17 @@ DeepSeek Harness（DSH）全局自动记忆插件：会话开始自动注入记�
 
 ### Windows（PowerShell）
 
-推荐用「下载到文件再执行」方式（避免 PowerShell 5.1 下 `irm ... | iex` 直接管道交互脚本时出现的参数绑定报错）：
+一行命令（Windows PowerShell 5.1 与 PowerShell 7 均实测通过）：
+
+```powershell
+irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex
+```
+
+脚本非交互，也可先下载到文件再跑（内网/代理环境更方便）：
 
 ```powershell
 irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 -OutFile "$env:TEMP\dsh-memory-install.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\dsh-memory-install.ps1"
-```
-
-也支持一行管道（安装脚本已改为非交互，5.1 下可正常跑）：
-
-```powershell
-irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex
 ```
 
 ### macOS / Linux
@@ -66,7 +66,17 @@ irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | i
 curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.sh | bash
 ```
 
-脚本自动完成：下载插件 → 写入 `<profile>/plugins/memory/index.js` → 在 `cordis.patch.yml` 追加 insert 注册（幂等，重复执行安全）→ 提示重启。
+脚本自动完成：取插件 → 写入 `<profile>/plugins/memory/index.js` → 把 insert 注册**合并**进 `cordis.patch.yml`（幂等，重复执行安全，每次改动前先落时间戳备份）→ 提示重启。
+
+`cordis.patch.yml` 合并规则（v2，2026-08-28 起）：DSH 给每个新 profile 生成的补丁层是「注释 + 顶层 `[]`」。脚本按文件实际形态处理，不再盲目追加——
+
+| 现状 | 行为 |
+|---|---|
+| 顶层 `[]`（DSH 默认空文档） | 用注册条目替换该 `[]` |
+| 已有顶层 `- insert:` 条目 | 追加到列表末尾（列 0） |
+| 只有注释 / 空文件 | 补齐后写入条目 |
+| 已被旧版脚本写坏（`[]` 与 `- insert:` 并存） | 自动删掉多余的 `[]` 行修好（含已注册的情况） |
+| 顶层是映射、非空流式数组、制表符缩进等无法判定的形态 | **一字不改**，另存 `cordis.patch.yml.dsh-memory-block.txt` 并给出人工合并指引 |
 
 可配置项（环境变量）：
 
@@ -75,8 +85,67 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 | `DSH_HOME` | `~/.dsh` | DSH 主目录 |
 | `DSH_PROFILE` | `web` | 目标 profile |
 | `DSH_MEMORY_RAW` | GitHub raw | 插件文件下载源（可指向镜像） |
+| `DSH_MEMORY_LOCAL` | 空 | 本地 index.js 路径；设置后不联网，直接复制安装 |
 
-### 插件可配置项
+### 装完 dsh 起不来：failed to parse overlay cordis.patch.yml
+
+若启动报下面这类错（2026-08-28 前的旧版安装脚本会留下这种文件）：
+
+```text
+Error: dsh: failed to parse overlay C:\Users\<你>\.dsh\profiles\web\cordis.patch.yml:
+YAMLException: end of the stream or a document separator is expected (7:1)
+```
+
+一条命令修复（只删多余的 `[]` 行，改前自动备份）：
+
+```powershell
+irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/fix-cordis-patch.ps1 | iex
+```
+
+参数：`-Profile web`（默认）/ `-Profile *`（所有 profile）/ `-DshHome <路径>` / `-DryRun`（只报告不写盘）。
+注意参数名是 `-DshHome` 而非 `-Home`——`$Home` 在 PowerShell 里是只读自动变量。
+
+不想联网的等价手工做法（PowerShell，一行）：
+
+```powershell
+$p="$HOME\.dsh\profiles\web\cordis.patch.yml"; Copy-Item $p "$p.bak" -Force; (Get-Content $p -Encoding UTF8) | Where-Object { $_ -notmatch '^[[]\s*[]]$' } | Set-Content $p -Encoding UTF8
+```
+
+即：把列 0 上那行 `[]` 删掉（一个 YAML 文档不能同时是流式数组和块式序列），保留下面的 `- insert:` 注册即可。
+
+### 首次初始化（新装用户）
+
+装完重启 DSH 后，插件会自动检查记忆库：
+
+- **记忆库为空** → 第一个会话里会注入一段「初始化引导」：模型用 `ask_user_question` 一次性问齐（称呼/单位岗位、项目与编号合同号、日常事项、协作人、偏好、环境要点），然后按协议落盘 `memory/global.md` 与 `memory/index.md`。全程约 1 分钟。
+- **引导节流**：一天最多提示一次；用户说「回头再说」则 24 小时内不再打扰（模型可调 `memory_onboard` 工具 snooze）。
+- **随时手动开始**：会话里说「初始化记忆」，或输入 `/memory-init`；状态可在 设置 → 通用设置 → 记忆 里看（版本与记忆库行）。
+- **读写协议**：安装脚本会在 `~/.dsh/AGENTS.md` 不存在时写入（内嵌模板，绝不覆盖已有文件）；它是「先查再写、会话结束归档」纪律的载体。
+- 开关：设置 → 通用设置 → 记忆 →「初始化引导」（关掉后 `initGuideEnabled=false`，但 `/memory-init` 仍可用）。
+
+### 升级与版本
+
+- **插件版本**：`v2.3.0`（仓库 `package.json` / `version.txt` / 插件 `PLUGIN_VERSION` 三处一致，测试会校验）。
+- **检查更新**：插件每天最多一次向发布源拉 `version.txt` 比对（4 秒超时，离线/内网失败静默，不影响使用）。发现新版本时：启动日志一行 + 会话里注入一次升级提醒。
+- **升级动作**：重跑安装命令即覆盖升级（幂等、安全，补丁层按形态合并不写坏、改前有 `.bak`）：
+  - Windows：`irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex`
+  - macOS/Linux：`curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.sh | bash`
+  - 升级后**必须重启 DSH** 才生效（宿主插件无热加载）。
+- **体检不改动**：`powershell -NoProfile -File install.ps1 -CheckOnly` 只报告（已装版本 / 远端版本 / 补丁层形状 / 记忆库状态），不下载不写盘。
+- **手动查新版**：会话里输 `/memory-update` 立即查一次；设置里可关闭「检查新版」（`updateCheckEnabled=false`，内网用户建议关或把 `DSH_MEMORY_RAW` 指向镜像）。
+- **镜像**：`DSH_MEMORY_RAW` 环境变量可指向内网镜像（index.js / version.txt / install 脚本同源）。
+
+### 测试（仓库自带）
+
+| 测试 | 命令 | 覆盖 |
+|---|---|---|
+| 补丁合并回归 | `powershell -NoProfile -ExecutionPolicy Bypass -File test/patch-merge.tests.ps1` | cordis.patch.yml 合并 11 例（含旧版写坏的修复、幂等、中文/CRLF） |
+| 初始化/升级纯逻辑 | `node test/onboard.unit.test.mjs` | 记忆库状态判定/版本比较/节流/文案 31 项 |
+| 插件集成冒烟 | `node test/plugin.smoke.test.mjs` | 真 import 插件跑 apply()：新装引导注入、工具/命令注册、升级检查与节流 30 项 |
+
+集成冒烟需要插件目录能解析 `@deepseek-ai/dsh-settings` 与 `@deepseek-ai/schemastery`（本机：给插件目录建 node_modules junction 指向 DSH 的 node_modules 即可，见测试文件头注释）。
+
+## 插件可配置项
 
 配置优先走 **设置 → 通用设置 → 记忆**（存 `~/.dsh/settings.yaml` 的 `dsh-memory` 命名空间，需安装 client 半区）；
 也可在 `cordis.patch.yml` 的 `config:` 里配（作为默认层 base，settings.yaml 用户配置覆盖它）。

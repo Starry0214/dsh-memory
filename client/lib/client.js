@@ -22,6 +22,9 @@ window.__ModuleLoader__.load({
 					staleCount: 0,
 					monitorEnabled: true,
 					monitorSummary: "",
+					initGuideEnabled: true,
+					updateCheckEnabled: true,
+					onboardSummary: "",
 					revision: -1,
 					status: "loading"
 				}),
@@ -35,6 +38,9 @@ window.__ModuleLoader__.load({
 						if (typeof next.staleCount === "number") d.staleCount = next.staleCount;
 						if (typeof next.monitorEnabled === "boolean") d.monitorEnabled = next.monitorEnabled;
 						if (typeof next.monitorSummary === "string") d.monitorSummary = next.monitorSummary;
+						if (typeof next.initGuideEnabled === "boolean") d.initGuideEnabled = next.initGuideEnabled;
+						if (typeof next.updateCheckEnabled === "boolean") d.updateCheckEnabled = next.updateCheckEnabled;
+						if (typeof next.onboardSummary === "string") d.onboardSummary = next.onboardSummary;
 						d.status = next.status || "ready";
 						d.revision = revision;
 					}
@@ -54,7 +60,7 @@ window.__ModuleLoader__.load({
 
 		// 通用设置 → 记忆（一行一项：每个配置项独立一行，左标签右控件 + 分割线）
 		function MemorySettingsRow(props) {
-			const { useStore, setStaleSessionDays, setStaleAction, setIntegrateEnabled, setIntegrateDays } = props;
+			const { useStore, setStaleSessionDays, setStaleAction, setIntegrateEnabled, setIntegrateDays, setMonitorEnabled, setInitGuideEnabled, setUpdateCheckEnabled } = props;
 			const days = useStore((s) => s.staleSessionDays);
 			const action = useStore((s) => s.staleAction);
 			const integrateEnabled = useStore((s) => s.integrateEnabled);
@@ -62,6 +68,9 @@ window.__ModuleLoader__.load({
 			const staleCount = useStore((s) => s.staleCount);
 			const monitorEnabled = useStore((s) => s.monitorEnabled);
 			const monitorSummary = useStore((s) => s.monitorSummary);
+			const initGuideEnabled = useStore((s) => s.initGuideEnabled);
+			const updateCheckEnabled = useStore((s) => s.updateCheckEnabled);
+			const onboardSummary = useStore((s) => s.onboardSummary);
 			const status = useStore((s) => s.status);
 
 			// 每行：水平 flex + 下方分割线（对齐 DSH 原生行）
@@ -142,6 +151,33 @@ window.__ModuleLoader__.load({
 						react.createElement("span", { style: { fontSize: "13px", color: "var(--dsw-alias-label-tertiary)" } }, "天/次")
 					)
 				),
+				// v2.3.0 行：版本与记忆库状态（只读，宿主 pushOnboardSummary 写入）
+				react.createElement("div", { style: rowStyle },
+					react.createElement("div", { style: { width: "100%" } },
+						react.createElement("div", { style: labelStyle }, "版本与记忆库"),
+						react.createElement("div", { style: { fontSize: "13px", lineHeight: "22px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", overflowWrap: "break-word" } },
+							onboardSummary || "读取中…（说「初始化记忆」可立即开始引导；/memory-update 可立即查新版）"
+						)
+					)
+				),
+				// 行：新装初始化引导开关
+				itemRow("初始化引导",
+					react.createElement("input", {
+						type: "checkbox", checked: !!initGuideEnabled,
+						title: "记忆库未初始化/不完整时，自动在会话里引导模型带你完成初始化（一天最多提一次）。关掉后仍可用 /memory-init 手动开始",
+						style: { width: "16px", height: "16px", cursor: "pointer" },
+						onChange: (e) => setInitGuideEnabled(e.target.checked)
+					})
+				),
+				// 行：检查新版开关
+				itemRow("检查新版",
+					react.createElement("input", {
+						type: "checkbox", checked: !!updateCheckEnabled,
+						title: "每天最多一次向发布源核对 version.txt，有新版本在会话里提示一次；离线/内网失败静默。内网可把 DSH_MEMORY_RAW 指向镜像",
+						style: { width: "16px", height: "16px", cursor: "pointer" },
+						onChange: (e) => setUpdateCheckEnabled(e.target.checked)
+					})
+				),
 				// 行：使用监控开关
 				itemRow("使用监控",
 					react.createElement("input", {
@@ -195,7 +231,9 @@ window.__ModuleLoader__.load({
 					setStaleAction: (value) => { if (scope) scope.set("staleAction", value); },
 					setIntegrateEnabled: (value) => { if (scope) scope.set("integrateEnabled", value); },
 					setIntegrateDays: (value) => { if (scope) scope.set("integrateDays", value); },
-					setMonitorEnabled: (value) => { if (scope) scope.set("monitorEnabled", value); }
+					setMonitorEnabled: (value) => { if (scope) scope.set("monitorEnabled", value); },
+					setInitGuideEnabled: (value) => { if (scope) scope.set("initGuideEnabled", value); },
+					setUpdateCheckEnabled: (value) => { if (scope) scope.set("updateCheckEnabled", value); }
 				};
 			};
 
