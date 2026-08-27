@@ -47,6 +47,15 @@ DeepSeek Harness（DSH）全局自动记忆插件：会话开始自动注入记�
 
 ### Windows（PowerShell）
 
+推荐用「下载到文件再执行」方式（避免 PowerShell 5.1 下 `irm ... | iex` 直接管道交互脚本时出现的参数绑定报错）：
+
+```powershell
+irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 -OutFile "$env:TEMP\dsh-memory-install.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\dsh-memory-install.ps1"
+```
+
+也支持一行管道（安装脚本已改为非交互，5.1 下可正常跑）：
+
 ```powershell
 irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex
 ```

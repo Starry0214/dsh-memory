@@ -97,6 +97,7 @@ Write-Host ''
 Write-Host 'Next step: restart DSH. On startup you should see:' -ForegroundColor Cyan
 Write-Host '  [dsh-memory] memory_search tool registered (ctx.tools)'
 Write-Host '  [dsh-memory] injected stable layer (N sections)'
-if (-not $SkipPrompt) {
-  Read-Host 'Press Enter to finish'
-}
+# NOTE: no interactive Read-Host here. Streaming a script with param()+Read-Host
+# through 'irm ... | iex' breaks in Windows PowerShell 5.1 ("cannot find a positional
+# parameter that accepts argument 'web'"). Keep this installer non-interactive so the
+# one-liner pipe works everywhere. -SkipPrompt is accepted for backward compat (no-op).
