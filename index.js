@@ -105,7 +105,7 @@ const PS_MEMORY = MEMORY_ROOT.replace(/\//g, "\\");
 const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 
 // v2.3.0：插件版本号——与仓库 package.json / version.txt 同步；升级检查以此比对远端版本
-const PLUGIN_VERSION = "2.3.0";
+const PLUGIN_VERSION = "2.3.1";
 // 远端发布基址（安装/升级命令同源）；DSH_MEMORY_RAW 可指向内网镜像
 const RAW_BASE_DEFAULT = "https://raw.githubusercontent.com/Starry0214/dsh-memory/main";
 
@@ -740,6 +740,7 @@ let MONITOR_LAST_SUMMARY = "";     // v1.12.6: 上次推送的汇总串（内容
 let MONITOR_LAST_PUSH_AT = 0;      // v1.12.6: 上次推送时间戳（60s 节流，防高频工具调用刷屏）
 let MONITOR_PUSH_TIMER = null;     // v1.12.6: 节流到期补推定时器
 let MONITOR_LAST_LOG_SIG = "";     // v1.12.7: 上次打日志的"有意义变化"签名（不含纯事件数增长）
+let MONITOR_LAST_LINES = null;       // v2.3.1: 上次推送的逐行快照 {行首key: 行文本}——增量输出基线（null=首推全量）
 let LAST_TOP_AGENT = null;         // v1.12.8: 最近顶层会话 agent 句柄（stale_archive 工具 spawn parent 用）
 
 function defaultMonitorData() {
@@ -868,6 +869,20 @@ function updateMonitorSummary() {
     // v2.3.0：版本与记忆库状态一行（新装用户未初始化、有新版本都在这看得见）
     try { sumLines.push("版本状态  " + onboardStatusLine() + " · 说「初始化记忆」可手动开始引导，/memory-update 立即查新版"); } catch (e) { sumLines.push("版本状态  v" + PLUGIN_VERSION + "（状态读取失败）"); }
     const s = sumLines.join("\n");
+    // v2.3.1：增量视图——只输出标题 + 相对上次有变动的统计行（用户不需要每次看全量）
+    const titleLine = sumLines[0];
+    const bodyLines = sumLines.slice(1);
+    const keyOf = (line) => { const m = /^\S+/.exec(line); return m ? m[0] : line; };
+    const nextLines = {};
+    for (const l of bodyLines) nextLines[keyOf(l)] = l;
+    let sLog = null;
+    if (MONITOR_LAST_LINES) {
+      const changed = bodyLines.filter((l) => MONITOR_LAST_LINES[keyOf(l)] !== l);
+      if (changed.length > 0) sLog = [titleLine, ...changed].join("\n");   // 无任何量变动→静默（仅设置字段更新全量）
+    } else {
+      sLog = s;
+    }
+    MONITOR_LAST_LINES = nextLines;
     // v1.12.6：变化守卫 + 60s 节流 —— 内容没变不推；变了但距上次推送 <60s 先不推（每个工具调用都会产生 tool 事件并刷新 updatedAt/eventN），到期自动补推
     if (s === MONITOR_LAST_SUMMARY) return;
     const nowMs = Date.now();
@@ -881,13 +896,13 @@ function updateMonitorSummary() {
     MONITOR_LAST_PUSH_AT = nowMs;
     // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
     if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-      // v1.12.7：仅"有意义变化"（提醒/查询/跟进/领域变化）才打日志，纯事件数增长静默推送；日志输出完整多行内容
+      // v2.3.1：日志只输出变动行（sLog）；设置界面 monitorSummary 仍全量 s；无任何量变动 → 静默不打印
       let didLog = false;  // v1.12.9：本次是否打了内容日志（成功回执与之同条件）
-      const logSig = s.split("\n").filter((l) => l.indexOf("累计") !== 0).join(" ⏎ ");
-      if (logSig !== MONITOR_LAST_LOG_SIG) {
+      const logSig = sLog !== null ? sLog.split("\n").filter((l) => l.indexOf("累计") !== 0).join(" ⏎ ") : "";
+      if (sLog !== null && logSig !== MONITOR_LAST_LOG_SIG) {
         MONITOR_LAST_LOG_SIG = logSig;
         didLog = true;
-        clog("[dsh-memory] 推送监控汇总:\n" + s);
+        clog("[dsh-memory] 推送监控汇总:\n" + sLog);
       }
       Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ monitorSummary: s }))
         .then(() => { if (didLog) clog("[dsh-memory] 监控汇总推送成功"); })  // v1.12.9：静默推送完全无声
@@ -1489,6 +1504,11 @@ export default {
         const rel = fileLine.replace(/^FILE:\s*/i, "").replace(/^~\/\.dsh\/memory\//, "").replace(/^\.\//, "").replace(/\\/g, "/").trim();
         const body = lines.filter((_, i) => i !== fi).join("\n").replace(/\n{3,}/g, "\n\n").trim();
         if (!rel || !body) continue;
+        // v2.3.1: 防御子代理把任务书里的模板示例复述进检查点（FILE: sessions/<会话归属日期>.md
+        // 这类占位路径）——含尖括号/占位中文必为模板，直接跳过，否则 ENOENT 崩掉整批归档；
+        // sessions/ 下只认「日期.md」真实格式，其余（如 <会话归属日期>.md、xx.md）视为模板/NULL 目标跳过
+        if (/[<>《》]/.test(rel)) continue;
+        if (/^sessions\//.test(rel) && !/^sessions\/\d{4}-\d{2}-\d{2}\.md$/.test(rel)) continue;
         if (!groups.has(rel)) groups.set(rel, []);
         groups.get(rel).push(body);
       }
@@ -1514,11 +1534,18 @@ export default {
           pending.push(b); // 含新条目则整块写入（同块混合新旧条目的情况极少，宁重复不丢失）
         }
         if (!pending.length) continue;
-        const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
-        fs.mkdirSync(dir, { recursive: true });
-        const block = pending.join("\n\n").trim();
-        fs.writeFileSync(fullPath, existing.replace(/\s+$/, "") + (existing ? "\n\n" : "") + block + "\n", "utf8");
-        written.push(rel + "(+" + block.length + ")");
+        // v2.3.1: 单目标写盘失败只跳过该目标（cwarn 记录），不整批判失败——防个别坏路径
+        // （如子代理复述的模板/NULL 路径漏网）拖垮全部真实检查点落盘
+        try {
+          const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
+          fs.mkdirSync(dir, { recursive: true });
+          const block = pending.join("\n\n").trim();
+          fs.writeFileSync(fullPath, existing.replace(/\s+$/, "") + (existing ? "\n\n" : "") + block + "\n", "utf8");
+          written.push(rel + "(+" + block.length + ")");
+        } catch (writeErr) {
+          cwarn("[dsh-memory] 归档检查点写盘失败，跳过该目标: " + rel + " - " + (writeErr && writeErr.message ? writeErr.message : String(writeErr)));
+          continue;
+        }
       }
       return { ok: true, mode: "written", wrote: written.length, written: written, skipped: skipped };
     }
@@ -1666,110 +1693,130 @@ export default {
         doneTid = setTimeout(() => doneResolveRef("timeout"), 25 * 60000);
         monitorEvent("archive", "started count=" + flowSessions.length + " overflow=" + overflow);
         const run = await subagents.start("spawn", spawnOpts);
-        run.result.then((result) => {
-          doneResolveRef(true);
-          let outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
-          // 2026-08-27 修复：子代理可能把 [ARCHIVE_BEGIN]…[ARCHIVE_END] 检查点埋在多个 run_code 工具调用的
-          // 参数/结果里（而非集中在最终 assistant 文本）——仅取 result.output 会拿到空/残缺 → unparsable 不落盘不消号。
-          // 兜底：从子代理完整会话日志（zstd JSONL）收集全部文本（assistant 消息 + 工具调用 + 工具结果），
-          // 重组出检查点文本；若重组结果含检查点块则优先采用。
+        // v2.3.1(B): 结算改为可重入函数——落盘/校验失败且属"子代理输出质量问题"时，
+        // 用 run.localAgent.followup 发修复指令让子代理重产出检查点（续跑通道），最多重试 2 次。
+        // 重试轮不依赖 run.result（promise 只 settle 一次），改为 followup + whenIdle + 重新重组
+        // 子代理会话日志作为新输出；插件自身解析/写盘 bug（已有防御）与不可修复失败不续跑。
+        const settleArchive = async (attempt) => {
           try {
+            let outText = "";
+            if (attempt === 0) {
+              const result = await run.result;
+              doneResolveRef(true);
+              outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
+            }
+            // 重组子代理会话日志（0 轮：与 result.output 择优；重试轮：以日志重组为准——子代理续跑后
+            // zstd 追加新帧，解压全文即含新输出）
+            try {
+              const sdir2 = findNewestSpawnedSession(startedAt);
+              if (sdir2) {
+                const jsonl = decompressSessionLog(path.join(sdir2, "session.jsonl.zstd"));
+                if (jsonl) {
+                  const texts = [];
+                  for (const line of jsonl.split("\n")) {
+                    let j = null; try { j = JSON.parse(line); } catch (e) { continue; }
+                    if (j.type === "user/message" || j.type === "agent/inbox/spliced") continue;
+                    const walk = (n) => {
+                      if (!n) return;
+                      if (typeof n === "string") { if (n.length > 20) texts.push(n); return; }
+                      if (Array.isArray(n)) { n.forEach(walk); return; }
+                      if (typeof n === "object") {
+                        if (typeof n.text === "string" && n.text.length > 20) texts.push(n.text);
+                        for (const k of Object.keys(n)) { if (k !== "id") walk(n[k]); }
+                      }
+                    };
+                    walk(j);
+                  }
+                  const logText = texts.join("\n");
+                  const hasCp = /\[ARCHIVE_BEGIN\][\s\S]*\[ARCHIVE_END\]/.test(logText);
+                  if (hasCp && (attempt > 0 || logText.length > outText.length)) {
+                    clog("[dsh-memory] 归档检查点从子代理会话日志重组（attempt=" + attempt + " 日志 " + logText.length + " 字符）");
+                    outText = logText;
+                  }
+                }
+              }
+            } catch (e) { /* 日志收集失败不影响主路径 */ }
+            let archOk = true;
+            let settleMode = "?";
+            try {
+              const ap = applyArchiveCheckpoints(outText, todayStr);
+              settleMode = ap.mode;
+              if (ap.ok) {
+                clog("[dsh-memory] 归档检查点落盘: mode=" + ap.mode + " wrote=" + ap.wrote + (ap.skipped && ap.skipped.length ? " skipped=" + ap.skipped.length : ""));
+              } else {
+                archOk = false;
+                cwarn("[dsh-memory] 归档检查点落盘失败（" + ap.mode + "），本批不消号留待下轮: msg=" + (ap.message || ""));
+              }
+              monitorEvent("archive", "settled mode=" + ap.mode + " wrote=" + ap.wrote + " ok=" + ap.ok);
+            } catch (e) {
+              archOk = false;
+              settleMode = "error";
+              monitorEvent("archive", "settled mode=error wrote=0 ok=false");
+              cwarn("[dsh-memory] 归档检查点异常:", e && e.message ? e.message : String(e));
+            }
+            if (archOk && flowSessions.length > 0) {
+              try {
+                const a5Declared = new Set();
+                const a5CheckRe = /[0-9a-f]{8}/g;
+                let a5m;
+                while ((a5m = a5CheckRe.exec(outText)) !== null) a5Declared.add(a5m[0]);
+                const a5Missing = flowSessions.filter((f) => !a5Declared.has(f.session.id.replace(/^session-/, "").slice(0, 8)));
+                if (a5Missing.length > 0) {
+                  archOk = false;
+                  cwarn("[dsh-memory] 归档 A5 完整性校验未过：以下会话未被子代理声明处置，" + a5Missing.length + " 个 → 本批不消号留待下轮: " + a5Missing.map((f) => f.session.id.slice(0, 12)).join(","));
+                  monitorEvent("archive", "settled unreported=" + a5Missing.length + " ok=false（A5 完整性拦截）");
+                } else {
+                  monitorEvent("archive", "settled a5-ok flow=" + flowSessions.length);
+                }
+              } catch (a5e) { /* A5 校验异常不阻断主流程 */ }
+            }
+            // 续跑重试判定：子代理输出质量问题（unparsable/no-blocks/error）且未达上限才续跑；
+            // boundary 越界等插件可识别问题与写盘防御失败不续跑
+            const retryable = !archOk && attempt < 2 && run.localAgent && typeof run.localAgent.followup === "function" &&
+              (settleMode === "unparsable" || settleMode === "no-blocks" || settleMode === "error");
+            if (retryable) {
+              const fixPrompt = "上一轮你产出的归档检查点未被插件完整解析（mode=" + settleMode + "，本批 " + flowSessions.length + " 个会话）。" +
+                "请按任务书的检查点格式重新产出，严格要求：1) 每个会话一个 [ARCHIVE_BEGIN]…[ARCHIVE_END] 块，FILE: 行必须指向真实目标（sessions/YYYY-MM-DD.md 或 projects/xxx.md），禁止复述任务书模板占位符（如 <会话归属日期>.md）；" +
+                "2) 块内必须含 ### 会话短id 条目；3) 最终报告每会话恰好一行 [短id] 处置。遗留问题：上一轮 " + (outText.length > 0 ? "输出 " + outText.length + " 字符未通过解析" : "无检查点输出") + "。";
+              clog("[dsh-memory] 归档检查点未达标，续跑修复（第 " + (attempt + 1) + " 次/上限2）: mode=" + settleMode);
+              run.localAgent.followup(makeMessage(fixPrompt));
+              await new Promise((r2) => { if (run.localAgent && typeof run.localAgent.whenIdle === "function") { run.localAgent.whenIdle().then(r2); } else { setTimeout(r2, 30000); } });
+              await settleArchive(attempt + 1);
+              return;
+            }
+            if (archOk) {
+              try { handledIds.forEach((id) => ARCHIVED_SESSIONS.add(id)); saveStaleNotified(); } catch (e) {}
+              try {
+                const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && !ARCHIVED_SESSIONS.has(s.id)).length;
+                if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") HOST_SETTINGS_SCOPE.update({ staleCount: remain }).catch(() => {});
+                saveStaleNotified();
+              } catch (e) {}
+              try {
+                const stI = readIntegrateState() || {};
+                if (!stI.lastIntegrateAt || Date.now() - stI.lastIntegrateAt > 86400000) {
+                  clog("[dsh-memory] 本轮新增摘要可用 /dream 整合进全局记忆。");
+                }
+              } catch (e) {}
+            }
+            clog("[dsh-memory] 漏网归档完成: " + label + "（attempt=" + (attempt + 1) + " 报告 " + outText.length + " 字符）");
             const sdir2 = findNewestSpawnedSession(startedAt);
             if (sdir2) {
-              const jsonl = decompressSessionLog(path.join(sdir2, "session.jsonl.zstd"));
-              if (jsonl) {
-                const texts = [];
-                for (const line of jsonl.split("\n")) {
-                  let j = null; try { j = JSON.parse(line); } catch (e) { continue; }
-                  const walk = (n) => {
-                    if (!n) return;
-                    if (typeof n === "string") { if (n.length > 20) texts.push(n); return; }
-                    if (Array.isArray(n)) { n.forEach(walk); return; }
-                    if (typeof n === "object") {
-                      if (typeof n.text === "string" && n.text.length > 20) texts.push(n.text);
-                      for (const k of Object.keys(n)) { if (k !== "id") walk(n[k]); }
-                    }
-                  };
-                  walk(j);
-                }
-                const logText = texts.join("\n");
-                const merged = logText.indexOf("\n[ARCHIVE_BEGIN]") >= 0 ? logText : logText;
-                // 若日志文本包含检查点块且比 result.output 更完整，则采用日志重组文本
-                const hasCp = /\[ARCHIVE_BEGIN\][\s\S]*\[ARCHIVE_END\]/.test(merged);
-                if (hasCp && merged.length > outText.length) {
-                  clog("[dsh-memory] 归档检查点从子代理会话日志重组（result.output 仅 " + outText.length + " 字符，日志含 " + merged.length + " 字符）");
-                  outText = merged;
-                }
+              const u2 = summarizeSubagentUsage(sdir2);
+              if (u2) {
+                clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟");
+                trackMaintain("arch", u2);
               }
             }
-          } catch (e) { /* 日志收集失败不影响 result.output 主路径 */ }
-          // v2.0.7/v2.0.8: 检查点落盘——落盘 ok 才消号；失配/越界不消号留待下轮
-          let archOk = true;
-          try {
-            const ap = applyArchiveCheckpoints(outText, todayStr);
-            if (ap.ok) {
-              clog("[dsh-memory] 归档检查点落盘: mode=" + ap.mode + " wrote=" + ap.wrote + (ap.skipped && ap.skipped.length ? " skipped=" + ap.skipped.length : ""));
-            } else {
-              archOk = false;
-              cwarn("[dsh-memory] 归档检查点落盘失败（" + ap.mode + "），本批不消号留待下轮: msg=" + (ap.message || ""));
+            if (outText.length > 0 && outText.length <= 1200) {
+              clog("[dsh-memory] 归档报告:\n" + outText);
             }
-            monitorEvent("archive", "settled mode=" + ap.mode + " wrote=" + ap.wrote + " ok=" + ap.ok);
           } catch (e) {
-            archOk = false;
-            monitorEvent("archive", "settled mode=error wrote=0 ok=false");
-            cwarn("[dsh-memory] 归档检查点异常:", e && e.message ? e.message : String(e));
+            cwarn("[dsh-memory] 漏网归档主子代理失败(attempt=" + (attempt + 1) + "): " + label + " - " + (e && e.message ? e.message : String(e)));
+            monitorEvent("archive", "failed reason=spawn");
+            doneResolveRef(false);
           }
-          // v2.1.0/v2.1.1 A5: 处置完整性校验——每个有流会话必须被子代理声明处置
-          // （检查点里 ### 短id 或报告里 [短id] 清单，任一处出现即算声明）。
-          // 未声明的会话 = 输出不完整 → 本批不消号留待下轮重送，堵「模型漏会话却照常消号」的静默丢失缝隙。
-          // 匹配用 uuid 前 8 位 hex（检查点短id/报告/完整 uuid 前缀均含），防 [0-9a-f]{6,12} 与完整 uuid 失配死循环。
-          if (archOk && flowSessions.length > 0) {
-            try {
-              const a5Declared = new Set();
-              const a5CheckRe = /[0-9a-f]{8}/g;
-              let a5m;
-              while ((a5m = a5CheckRe.exec(outText)) !== null) a5Declared.add(a5m[0]);
-              const a5Missing = flowSessions.filter((f) => !a5Declared.has(f.session.id.replace(/^session-/, "").slice(0, 8)));
-              if (a5Missing.length > 0) {
-                archOk = false;
-                cwarn("[dsh-memory] 归档 A5 完整性校验未过：以下会话未被子代理声明处置，" + a5Missing.length + " 个 → 本批不消号留待下轮: " + a5Missing.map((f) => f.session.id.slice(0, 12)).join(","));
-                monitorEvent("archive", "settled unreported=" + a5Missing.length + " ok=false（A5 完整性拦截）");
-              } else {
-                monitorEvent("archive", "settled a5-ok flow=" + flowSessions.length);
-              }
-            } catch (a5e) { /* A5 校验异常不阻断主流程（已落盘不因校验bug回滚） */ }
-          }
-          if (archOk) {
-            try { handledIds.forEach((id) => ARCHIVED_SESSIONS.add(id)); saveStaleNotified(); } catch (e) {}
-            try {
-              const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && !ARCHIVED_SESSIONS.has(s.id)).length;
-              if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") HOST_SETTINGS_SCOPE.update({ staleCount: remain }).catch(() => {});
-              saveStaleNotified();
-            } catch (e) {}
-            try {
-              const stI = readIntegrateState() || {};
-              if (!stI.lastIntegrateAt || Date.now() - stI.lastIntegrateAt > 86400000) {
-                clog("[dsh-memory] 本轮新增摘要可用 /dream 整合进全局记忆。");
-              }
-            } catch (e) {}
-          }
-          clog("[dsh-memory] 漏网归档完成: " + label + "（stopReason=" + result.stopReason + "，报告 " + outText.length + " 字符）");
-          const sdir2 = findNewestSpawnedSession(startedAt);
-          if (sdir2) {
-            const u2 = summarizeSubagentUsage(sdir2);
-            if (u2) {
-              clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟");
-              trackMaintain("arch", u2);
-            }
-          }
-          if (outText.length > 0 && outText.length <= 1200) {
-            clog("[dsh-memory] 归档报告:\n" + outText);
-          }
-        }).catch((e) => {
-          cwarn("[dsh-memory] 漏网归档主子代理失败: " + label + " - " + (e && e.message ? e.message : String(e)));
-          monitorEvent("archive", "failed reason=spawn");
-          doneResolveRef(false);
-        });
+        };
+        settleArchive(0);
         clog("[dsh-memory] 已发起漏网归档主子代理: " + label + "（后台执行中，完成后输出报告）");
         return { ok: true, count: flowSessions.length, overflow: overflow, done: done, handled: handledIds };
       } catch (e) {

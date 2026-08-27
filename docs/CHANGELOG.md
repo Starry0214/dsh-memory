@@ -3,6 +3,16 @@
 > 面向开发者/维护者。普通用户看 [README.md](../README.md) 即可。
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 
+## v2.3.1（2026-08-28）：监控汇总增量输出 + 归档检查点三防御 + 子代理续跑重试
+
+- **监控汇总增量输出**：每次只推送「标题 + 相对上次有变动的统计行」（行首 key 比对），首次全量建基线，无任何量变动完全静默（设置字段仍全量）。
+- **归档检查点三防御**：
+  ① FILE 含尖括号/模板占位（如 `sessions/<会话归属日期>.md`）跳过——防子代理复述任务书模板致 ENOENT 崩整批；
+  ② 单目标写盘失败仅 cwarn 跳过，不整批判失败；
+  ③ 会话日志重组时跳过 user 消息（任务书原文），只采 assistant 与工具结果。
+- **子代理续跑重试闭环**：结算重构为可重入 `settleArchive`——落盘失败且属子代理输出质量问题（unparsable/no-blocks/error）时，用 `run.localAgent.followup` 发修复指令续跑，最多 2 次；boundary 越界等插件自身问题不续跑留待下轮。
+- 修复实际案例：4 会话归档曾因模板路径 ENOENT 整批失败不消号 → 设置界面 staleCount 卡 4；修复后自动闭环。
+
 ## 版本（最新 v2.3.0）
 
 插件版本号在 `package.json` / `version.txt` / 插件 `PLUGIN_VERSION` 三处一致（测试会校验）。插件每天最多一次向发布源拉 `version.txt` 比对（4 秒超时，离线/内网失败静默），发现新版本时启动日志一行 + 会话注入升级提醒。升级动作=重跑安装命令（幂等、安全、改前有 .bak 备份）；升级后必须重启 DSH（宿主插件无热加载）。体检：`powershell -NoProfile -File install.ps1 -CheckOnly`。手动查新版：会话里输 `/memory-update`。镜像：`DSH_MEMORY_RAW` 指向内网镜像（index.js / version.txt / install 脚本同源）。
