@@ -1001,7 +1001,8 @@ const SPIRAL_REP_TH = 0.45;    // 窗口内打转占比阈值
 const SPIRAL_NEG_TH = 0.4;     // 窗口内负面结果占比阈值（S2）
 const SPIRAL_NEG_RE = /error|fail|exception|traceback|eperm|eacces|denied|not found|no such|不存在|失败|无法|超时|timeout|invalid|cannot|could not|refused|abort|证书|cert/i;
 const SPIRAL_SKIP = new Set(["job_output", "job_list", "job_kill", "memory_search", "skill", "todo_write"]);  // 轮询/元工具豁免
-let DREAM_TRACK = null;   // v1.12.17: dream 运行跟踪 { since, sessionId, steps }（跨层共享）
+let DREAM_TRACK = null;
+let LAST_DREAM_WROTE_AT = 0;   // v2.3.2(dream-tool): memory_dream_patch 成功落盘时间戳（settleDream 判成败用）   // v1.12.17: dream 运行跟踪 { since, sessionId, steps }（跨层共享）
 let DREAM_PATCH = null;   // v1.12.17: 进度落盘函数桥（闭包内注入，顶层监听调用）
 // v2.0.1: 按会话 id 分桶——原全局单例 TURN_CUR/SPIRAL_WIN 在多主会话并发时互相腰斩周期/清空滑窗（08-24 阈值标定实证）
 const SPIRAL_BUCKETS = new Map();  // sid -> { cur: 任务周期画像|null, win: 滑窗[], ws: 工作空间尾段 }
@@ -1550,6 +1551,167 @@ export default {
       return { ok: true, mode: "written", wrote: written.length, written: written, skipped: skipped };
     }
 
+    // v2.3.2(archive-tool)：结构化检查点交付（子代理通过 memory_archive_checkpoint 工具提交）——A5 完整性 + 条目级幂等 + 落盘
+    function applyArchiveBlocks(blocks) {
+      if (!LAST_ARCHIVE_FLOW) return { ok: false, mode: "no-batch", wrote: 0, errors: ["归档批次未初始化（插件侧问题）"] };
+      if (!Array.isArray(blocks) || blocks.length === 0) return { ok: false, mode: "bad-schema", wrote: 0, errors: ["blocks 必须是数组且非空"] };
+      const ids = LAST_ARCHIVE_FLOW.sessionIds;
+      const todayStr2 = LAST_ARCHIVE_FLOW.todayStr;
+      const declared = LAST_ARCHIVE_FLOW.declared;
+      const errors = []; const norm = [];
+      for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i]; const tag = "blocks[" + i + "]";
+        if (!b || typeof b !== "object") { errors.push(tag + " 必须是对象"); continue; }
+        if (typeof b.sessionId !== "string" || !b.sessionId.trim()) { errors.push(tag + ".sessionId 缺失（从短 id 清单逐字取用）"); continue; }
+        declared.add(b.sessionId.trim());
+        if (typeof b.file !== "string" || !b.file.trim()) { errors.push(tag + ".file 缺失"); continue; }
+        let rel = b.file.replace(/^~\/\.dsh\/memory\//, "").replace(/^\.\//, "").replace(/\\/g, "/").trim();
+        if (/[<>《》]/.test(rel)) { errors.push(tag + ".file 含占位符: " + rel); continue; }
+        if (rel.includes("..")) { errors.push(tag + ".file 越界: " + rel); continue; }
+        if (!/^(sessions|projects)\//.test(rel)) { errors.push(tag + ".file 越界（只允许 sessions/|projects/）: " + rel); continue; }
+        if (b.skip === true) { norm.push({ rel: rel, sid: b.sessionId.trim(), skip: true, reason: String(b.reason || "无价值跳过") }); continue; }
+        if (!Array.isArray(b.points) || b.points.length === 0) { errors.push(tag + " 非 skip 时必须提供 points（3-6 条要点数组）"); continue; }
+        norm.push({ rel: rel, sid: b.sessionId.trim(), title: String(b.title || ""), points: b.points.map((p) => String(p)).filter((p) => p.trim()) });
+      }
+      const missing = ids.filter((id) => !declared.has(id));
+      if (missing.length) errors.push("未声明处置的会话（每个要么 skip=true 要么提交归档块）: " + missing.join(", "));
+      if (errors.length) return { ok: false, mode: "bad-schema", wrote: 0, errors: errors };
+      const applied = []; const skipped = [];
+      for (const it of norm) {
+        if (it.skip) { skipped.push(it.sid + "(跳过:" + it.reason + ")"); continue; }
+        const fullPath = portable(MEMORY_ROOT + "/" + it.rel);
+        let existing = ""; try { existing = fs.readFileSync(fullPath, "utf8"); } catch (e) { existing = ""; }
+        if (existing.includes("### " + it.sid)) { skipped.push(it.sid + "(已在库)"); continue; }   // v2.0.8 条目级幂等
+        const header = "### " + it.sid + (it.title ? "（" + it.title + "）" : "");
+        const block = "## 漏网会话补档（" + todayStr2 + " 归档）\n" + header + "\n" + it.points.map((p) => "- " + p).join("\n") + "\n";
+        const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(fullPath, existing.replace(/\s+$/, "") + (existing ? "\n\n" : "") + block.trim() + "\n", "utf8");
+          applied.push(it.sid + "→" + it.rel);
+        } catch (e) {
+          cwarn("[dsh-memory] 归档块写盘失败（跳过）: " + it.sid + " - " + (e && e.message ? e.message : String(e)));
+          skipped.push(it.sid + "(写盘异常)");
+        }
+      }
+      LAST_ARCHIVE_A5_OK = missing.length === 0;
+      if (applied.length > 0) LAST_ARCHIVE_WROTE_AT = Date.now();
+      return { ok: true, mode: "written", wrote: applied.length, applied: applied, skipped: skipped };
+    }
+
+    // ═══════════ v2.3.2(dream-patch)：dream 整合检查点落盘（子代理只产文本，插件写盘） ═══════════
+    // 写入者永远是插件代码（node:fs、受控路径、单块容错）；子代理工具面 allow 白名单无任何写工具。
+    // v2.3.2(dream-json): 检查点 JSON 化——子代理产出 {"patches":[...]} JSON，插件提取+校验+落盘
+    // 校验失败返回精确错误清单（供反馈闭环让子代理修复）；JSON.parse 失败=明确失败，杜绝「半截当完整」
+    function extractDreamJson(outText) {
+      const s = String(outText || "");
+      const m = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (m) return m[1];
+      const m2 = s.match(/\[MEMORY_JSON\]([\s\S]*?)\[\/MEMORY_JSON\]/);
+      if (m2) return m2[1];
+      const t = s.trim();
+      if (t.startsWith("{") || t.startsWith("[")) return t;
+      return null;
+    }
+
+    // v2.3.2(dream-tool)：核心校验+落盘（输入已结构化的 patches 数组）——memory_dream_patch 工具与 applyDreamJson 共用
+    const applyPatches = (patches) => {
+      if (!Array.isArray(patches)) return { ok: false, mode: "bad-schema", wrote: 0, errors: ["patches 必须是数组"] };
+      if (patches.length === 0) return { ok: true, mode: "empty", wrote: 0 };
+      const errors = []; const seen = new Set(); const valid = [];
+      for (let i = 0; i < patches.length; i++) {
+        const p = patches[i];
+        const tag = "patches[" + i + "]";
+        if (!p || typeof p !== "object") { errors.push(tag + " 必须是对象"); continue; }
+        if (typeof p.file !== "string" || !p.file.trim()) { errors.push(tag + ".file 缺失或非字符串"); continue; }
+        let rel = p.file.replace(/^~\/\.dsh\/memory\//, "").replace(/^\.\//, "").replace(/\\/g, "/").trim();
+        if (/[<>《》]/.test(rel)) { errors.push(tag + ".file 含占位符: " + rel); continue; }
+        if (rel.includes("..")) { errors.push(tag + ".file 越界: " + rel); continue; }
+        if (!/^(sessions|projects|knowledge|tools)\//.test(rel) && !/^(global|index)\.md$/.test(rel)) { errors.push(tag + ".file 越界（只允许 sessions|projects|knowledge|tools/ 或 global.md|index.md）: " + rel); continue; }
+        if (!["replace", "append", "delete"].includes(p.action)) { errors.push(tag + ".action 非法（replace|append|delete）: " + String(p.action)); continue; }
+        if (typeof p.content !== "string" || !p.content.trim()) { errors.push(tag + ".content 缺失或空"); continue; }
+        if (p.content.length > 128 * 1024) { errors.push(tag + ".content 超 128KB"); continue; }
+        const key = rel + "|" + p.action;
+        if (seen.has(key)) { errors.push(tag + " 与更早条目重复（同一文件同动作只允许一条）: " + rel + " " + p.action); continue; }
+        seen.add(key);
+        valid.push({ rel: rel, action: p.action, content: p.content });   // v2.3.2-hotfix: 不污染入参（宿主冻结工具参数对象，挂 _rel 会抛 not extensible）
+      }
+      if (errors.length) return { ok: false, mode: "bad-schema", wrote: 0, errors: errors };
+      const applied = []; const skipped = [];
+      for (const it of valid) {
+        const fullPath = portable(MEMORY_ROOT + "/" + it.rel);
+        try {
+          if (it.action === "replace") {
+            const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
+            fs.mkdirSync(dir, { recursive: true });
+            const tmp = fullPath + ".tmp-dream";
+            fs.writeFileSync(tmp, it.content, "utf8");
+            fs.renameSync(tmp, fullPath);
+            const back = fs.readFileSync(fullPath, "utf8");
+            if (back !== it.content) { skipped.push(it.rel + "(回读不一致)"); continue; }
+            applied.push(it.rel + "(replace " + it.content.length + ")");
+          } else if (it.action === "append") {
+            let existing = ""; try { existing = fs.readFileSync(fullPath, "utf8"); } catch (e) { existing = ""; }
+            const payload = it.content.trim();
+            if (existing.includes(payload)) { skipped.push(it.rel + "(append内容已存在)"); continue; }
+            fs.writeFileSync(fullPath, existing.replace(/\s+$/, "") + (existing ? "\n\n" : "") + payload + "\n", "utf8");
+            applied.push(it.rel + "(append)");
+          } else if (it.action === "delete") {
+            let existing = ""; try { existing = fs.readFileSync(fullPath, "utf8"); } catch (e) { existing = ""; }
+            const idx = existing.indexOf(it.content);
+            if (idx < 0) { skipped.push(it.rel + "(delete未找到)"); continue; }
+            fs.writeFileSync(fullPath, existing.slice(0, idx) + existing.slice(idx + it.content.length).replace(/^\n+/, ""), "utf8");
+            applied.push(it.rel + "(delete)");
+          }
+        } catch (e) {
+          cwarn("[dsh-memory] DREAM patch 落盘失败（跳过）: " + (e && e.message ? e.message : String(e)));
+          skipped.push(it.rel + "(异常)");
+        }
+      }
+      return { ok: true, mode: "written", wrote: applied.length, applied: applied, skipped: skipped };
+    };
+
+    // 文本形态包装（兼容单测/非工具路径）：从会话文本提取 JSON 后走 applyPatches
+    function applyDreamJson(outText) {
+      const raw = extractDreamJson(outText);
+      if (raw === null) return { ok: false, mode: "no-json", wrote: 0, errors: ["未找到 JSON 检查点"] };
+      let obj;
+      try { obj = JSON.parse(raw); } catch (e) { return { ok: false, mode: "bad-json", wrote: 0, errors: ["JSON 解析失败: " + (e && e.message ? e.message : String(e))] }; }
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return { ok: false, mode: "bad-schema", wrote: 0, errors: ["顶层必须是对象 { patches: [...] }"] };
+      if (!Array.isArray(obj.patches)) return { ok: false, mode: "bad-schema", wrote: 0, errors: ["缺少 patches 数组字段"] };
+      return applyPatches(obj.patches);
+    }
+
+    // v2.3.2(dream-incremental): 增量候选——「上次成功整合后变化 + 最近 3 天」并集；每 4 轮一次全量
+    function listIntegrateCandidates(st0) {
+      const since = (st0 && st0.lastSuccessAt) || 0;
+      const day3 = Date.now() - 3 * 86400000;
+      const fullRound = ((st0 && st0.integrateCount) || 0) % 4 === 0;
+      const sessionCands = []; const otherCands = [];
+      try {
+        const sd = portable(MEMORY_ROOT + "/sessions");
+        if (fs.existsSync(sd)) {
+          for (const e of fs.readdirSync(sd, { withFileTypes: true })) {
+            if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(e.name)) continue;
+            const stt = fs.statSync(sd + "/" + e.name);
+            if (fullRound || stt.mtimeMs > since || stt.mtimeMs >= day3) sessionCands.push("sessions/" + e.name);
+          }
+        }
+        for (const dir of ["projects", "knowledge"]) {
+          const d = portable(MEMORY_ROOT + "/" + dir);
+          if (!fs.existsSync(d)) continue;
+          for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+            if (!e.isFile() || !e.name.endsWith(".md")) continue;
+            const stt = fs.statSync(d + "/" + e.name);
+            if (fullRound || stt.mtimeMs > since) otherCands.push(dir + "/" + e.name);
+          }
+        }
+      } catch (e) { sessionCands.length = 0; otherCands.length = 0; }
+      sessionCands.sort(); otherCands.sort();
+      return { sessionCands: sessionCands, otherCands: otherCands, fullRound: fullRound };
+    }
+
+
     // ═══════════ v2.0.7+ 漏网归档：检查点落盘语义（runStaleArchive 重植，2026-08-27 修复丢失的整函数块） ═══════════
     // 骨架源自 v2.0.6（git dbc571e）；按 v2.0.7/v2.0.8/v2.1.0/v2.1.1/v2.1.4 适配：
     //  - 子代理只产出 [ARCHIVE_BEGIN]…[ARCHIVE_END] 检查点（FILE: 行 + 正文），插件 applyArchiveCheckpoints 解析落盘（v2.0.7）
@@ -1584,6 +1746,10 @@ export default {
 
     // v2.0.5: 防重入——模型反复调 stale_archive 会重复提取消息流+重复 spawn 烧 token，不信任模型自觉
     let STALE_RUNNING = false;
+    // v2.3.2(archive-tool): memory_archive_checkpoint 交付状态——批初始化+累计声明集+落盘/完整性标志
+    let LAST_ARCHIVE_FLOW = null;            // { sessionIds: [], todayStr, declared: Set }
+    let LAST_ARCHIVE_WROTE_AT = 0;
+    let LAST_ARCHIVE_A5_OK = false;
     // v2.0.9/v2.1.4: 归档节流时间戳（跨重启持久化 .integrate.json archiveLastRunAt；发起即重置、窗内一律拒绝）
     let ARCHIVE_LAST_RUN_AT = 0;
     const ARCHIVE_THROTTLE_MS = 60 * 60000;
@@ -1657,26 +1823,25 @@ export default {
       ).join("\n\n");
       // v2.1.1 A5: 本批会话短 id 清单——任务书明令逐字取用，禁止子代理自行截取完整 uuid（防 [0-9a-f]{6,12} 失配致整批不消号死循环）
       const shortIdList = flowSessions.map((f) => f.session.id.replace(/^session-/, "").slice(0, 12)).join("\n");
+      // v2.3.2(archive-tool): 批次状态初始化——sessionIds 供 A5 完整性校验，declared 累计子代理多次工具调用的声明
+      LAST_ARCHIVE_FLOW = { sessionIds: flowSessions.map((f) => f.session.id.replace(/^session-/, "").slice(0, 12)), todayStr: todayStr, declared: new Set() };
+      LAST_ARCHIVE_WROTE_AT = 0; LAST_ARCHIVE_A5_OK = false;
       const promptText =
         "你是 dsh-memory 主归档子代理，独立完成本轮全部漏网会话的记忆归档（fresh 会话，上下文只含本任务说明与已提取的对话消息流）。\n" +
         "**禁止读取任何原始日志文件**——消息流已足够，读原始日志会消耗巨额 token。\n" +
-        "**禁止使用 write/edit 写任何文件**——你只产出下文规定的检查点文本，落盘由插件完成（写 ~/.dsh 会被沙箱拒绝且你无审批通道）。\n" +
+        "**禁止使用 write/edit 写任何文件**——落盘统一走 memory_archive_checkpoint 工具（插件现场校验+落盘；写 ~/.dsh 会被沙箱拒绝且你无审批通道）。\n" +
         "\n===== 待归档会话的对话消息流 =====\n" + flowBlocks + "\n" +
         "\n===== 本批会话短 id 清单（逐字取用，不得自行截取完整 uuid）=====\n" + shortIdList + "\n" +
         "\n===== 你的职权（完全自主决策）=====\n" +
         "1. 逐会话判断归档价值：无实质内容（寒暄/空会话/记忆库已覆盖）→ 跳过并在报告说明理由。\n" +
         "2. 内容少 → 你直接总结全部。\n" +
         "3. 会话多或部分内容重 → 若你的工具集中有发起子代理的能力（如 subagent 工具），可自行拆分并发处理；**二级子代理只让它返回摘要文本，落盘统一由你执行**（你只产出检查点，插件落盘）。\n" +
-        "4. **产出检查点（唯一交付物）**：对每个归档会话输出一个检查点块，格式：\n" +
-        "   [ARCHIVE_BEGIN]\n" +
-        "   FILE: sessions/<会话归属日期>.md\n" +
-        "   ### <会话短id>（一句话主题）\n" +
-        "   - 要点1\n" +
-        "   - 要点2\n" +
-        "   - 要点3\n" +
-        "   [ARCHIVE_END]\n" +
-        "   执行纪律：FILE: 目标路径只能是 sessions/ 或 projects/ 前缀；小节标题「## 漏网会话补档（" + todayStr + " 归档）」；每会话 3-6 条要点，精确字面量（文号/路径/命令/参数/报错串/数值）逐字保留绝不概括改写；与已有归档重叠时只记增量并标注；会话短 id 必须从上面清单逐字取用。当前日期 " + todayStr + "；归属日期从消息流内容推断，推断不出用最后交互日。\n" +
-        "5. 最终输出归档报告：**本批每一个会话必须恰好一行** `[<会话短id>] <处置>`（处置=档案已产/跳过+理由），短 id 从清单逐字取用、不得自行截取；行必须真实对应上面检查点或跳过决策，插件会核对清单，未声明的会话本批不算完成。不要复述摘要全文。\n";
+        "4. **交付（唯一方式）**：对每个会话调用 memory_archive_checkpoint 工具提交检查点，参数 { blocks: [ { file, sessionId, title, points[], skip?, reason? } ] }：\n" +
+        "   - file 只能是 sessions/|projects/ 前缀相对路径（归属日期从消息流推断，推断不出用最后交互日）；sessionId 必须从短 id 清单逐字取用；\n" +
+        "   - 有价值 → 填 title + points（3-6 条要点，精确字面量（文号/路径/命令/参数/报错串/数值）逐字保留绝不概括改写；与已有归档重叠只记增量并标注）；\n" +
+        "   - 无价值（寒暄/空会话/记忆库已覆盖）→ 填 skip=true + reason；\n" +
+        "   - 工具会校验完整性（含缺声明会话检查）+ 落盘（追加到目标文件，条目幂等）；失败会在工具结果返回错误清单，按清单修正后再次调用，可多次调用直到全部通过。\n" +
+        "5. 全部提交完成后，最终输出一行处置报告（[短id] 档案已产/跳过+理由）；插件以工具提交为准。**不要输出 [ARCHIVE_BEGIN] 等检查点格式文本**。\n";
       const label = "dsh-memory-漏网归档-" + flowSessions.length + "会话";
       const startedAt = Date.now();
       try {
@@ -1685,7 +1850,7 @@ export default {
           prompt: [{ type: "text", text: promptText }],
           signal: new AbortController().signal,
           // v1.12.8：放开 subagent 授权主子代理按需拆分；v2.1.0 E1：物理移除 write/edit（检查点模式下无需）
-          toolFilter: { allow: ["read", "grep", "glob", "memory_search", "subagent"] }
+          toolFilter: { allow: ["read", "grep", "glob", "memory_search", "subagent", "memory_archive_checkpoint"] }
         };
         if (LAST_TOP_AGENT) spawnOpts.parent = LAST_TOP_AGENT;
         let doneDone = false; let doneTid = null; let doneResolveRef = null;
@@ -1693,98 +1858,19 @@ export default {
         doneTid = setTimeout(() => doneResolveRef("timeout"), 25 * 60000);
         monitorEvent("archive", "started count=" + flowSessions.length + " overflow=" + overflow);
         const run = await subagents.start("spawn", spawnOpts);
-        // v2.3.1(B): 结算改为可重入函数——落盘/校验失败且属"子代理输出质量问题"时，
-        // 用 run.localAgent.followup 发修复指令让子代理重产出检查点（续跑通道），最多重试 2 次。
-        // 重试轮不依赖 run.result（promise 只 settle 一次），改为 followup + whenIdle + 重新重组
-        // 子代理会话日志作为新输出；插件自身解析/写盘 bug（已有防御）与不可修复失败不续跑。
-        const settleArchive = async (attempt) => {
+                // v2.3.2(archive-tool)：结算简化——落盘/A5 全部走 memory_archive_checkpoint 工具（现场校验+落盘），
+        // 无需提取/re组合/followup；成功与否由 LAST_ARCHIVE_WROTE_AT + LAST_ARCHIVE_A5_OK 判定。
+        const settleArchive = async () => {
           try {
-            let outText = "";
-            if (attempt === 0) {
-              const result = await run.result;
-              doneResolveRef(true);
-              outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
-            }
-            // 重组子代理会话日志（0 轮：与 result.output 择优；重试轮：以日志重组为准——子代理续跑后
-            // zstd 追加新帧，解压全文即含新输出）
-            try {
-              const sdir2 = findNewestSpawnedSession(startedAt);
-              if (sdir2) {
-                const jsonl = decompressSessionLog(path.join(sdir2, "session.jsonl.zstd"));
-                if (jsonl) {
-                  const texts = [];
-                  for (const line of jsonl.split("\n")) {
-                    let j = null; try { j = JSON.parse(line); } catch (e) { continue; }
-                    if (j.type === "user/message" || j.type === "agent/inbox/spliced") continue;
-                    const walk = (n) => {
-                      if (!n) return;
-                      if (typeof n === "string") { if (n.length > 20) texts.push(n); return; }
-                      if (Array.isArray(n)) { n.forEach(walk); return; }
-                      if (typeof n === "object") {
-                        if (typeof n.text === "string" && n.text.length > 20) texts.push(n.text);
-                        for (const k of Object.keys(n)) { if (k !== "id") walk(n[k]); }
-                      }
-                    };
-                    walk(j);
-                  }
-                  const logText = texts.join("\n");
-                  const hasCp = /\[ARCHIVE_BEGIN\][\s\S]*\[ARCHIVE_END\]/.test(logText);
-                  if (hasCp && (attempt > 0 || logText.length > outText.length)) {
-                    clog("[dsh-memory] 归档检查点从子代理会话日志重组（attempt=" + attempt + " 日志 " + logText.length + " 字符）");
-                    outText = logText;
-                  }
-                }
-              }
-            } catch (e) { /* 日志收集失败不影响主路径 */ }
-            let archOk = true;
-            let settleMode = "?";
-            try {
-              const ap = applyArchiveCheckpoints(outText, todayStr);
-              settleMode = ap.mode;
-              if (ap.ok) {
-                clog("[dsh-memory] 归档检查点落盘: mode=" + ap.mode + " wrote=" + ap.wrote + (ap.skipped && ap.skipped.length ? " skipped=" + ap.skipped.length : ""));
-              } else {
-                archOk = false;
-                cwarn("[dsh-memory] 归档检查点落盘失败（" + ap.mode + "），本批不消号留待下轮: msg=" + (ap.message || ""));
-              }
-              monitorEvent("archive", "settled mode=" + ap.mode + " wrote=" + ap.wrote + " ok=" + ap.ok);
-            } catch (e) {
-              archOk = false;
-              settleMode = "error";
-              monitorEvent("archive", "settled mode=error wrote=0 ok=false");
-              cwarn("[dsh-memory] 归档检查点异常:", e && e.message ? e.message : String(e));
-            }
-            if (archOk && flowSessions.length > 0) {
-              try {
-                const a5Declared = new Set();
-                const a5CheckRe = /[0-9a-f]{8}/g;
-                let a5m;
-                while ((a5m = a5CheckRe.exec(outText)) !== null) a5Declared.add(a5m[0]);
-                const a5Missing = flowSessions.filter((f) => !a5Declared.has(f.session.id.replace(/^session-/, "").slice(0, 8)));
-                if (a5Missing.length > 0) {
-                  archOk = false;
-                  cwarn("[dsh-memory] 归档 A5 完整性校验未过：以下会话未被子代理声明处置，" + a5Missing.length + " 个 → 本批不消号留待下轮: " + a5Missing.map((f) => f.session.id.slice(0, 12)).join(","));
-                  monitorEvent("archive", "settled unreported=" + a5Missing.length + " ok=false（A5 完整性拦截）");
-                } else {
-                  monitorEvent("archive", "settled a5-ok flow=" + flowSessions.length);
-                }
-              } catch (a5e) { /* A5 校验异常不阻断主流程 */ }
-            }
-            // 续跑重试判定：子代理输出质量问题（unparsable/no-blocks/error）且未达上限才续跑；
-            // boundary 越界等插件可识别问题与写盘防御失败不续跑
-            const retryable = !archOk && attempt < 2 && run.localAgent && typeof run.localAgent.followup === "function" &&
-              (settleMode === "unparsable" || settleMode === "no-blocks" || settleMode === "error");
-            if (retryable) {
-              const fixPrompt = "上一轮你产出的归档检查点未被插件完整解析（mode=" + settleMode + "，本批 " + flowSessions.length + " 个会话）。" +
-                "请按任务书的检查点格式重新产出，严格要求：1) 每个会话一个 [ARCHIVE_BEGIN]…[ARCHIVE_END] 块，FILE: 行必须指向真实目标（sessions/YYYY-MM-DD.md 或 projects/xxx.md），禁止复述任务书模板占位符（如 <会话归属日期>.md）；" +
-                "2) 块内必须含 ### 会话短id 条目；3) 最终报告每会话恰好一行 [短id] 处置。遗留问题：上一轮 " + (outText.length > 0 ? "输出 " + outText.length + " 字符未通过解析" : "无检查点输出") + "。";
-              clog("[dsh-memory] 归档检查点未达标，续跑修复（第 " + (attempt + 1) + " 次/上限2）: mode=" + settleMode);
-              run.localAgent.followup(makeMessage(fixPrompt));
-              await new Promise((r2) => { if (run.localAgent && typeof run.localAgent.whenIdle === "function") { run.localAgent.whenIdle().then(r2); } else { setTimeout(r2, 30000); } });
-              await settleArchive(attempt + 1);
-              return;
-            }
-            if (archOk) {
+            const result = await run.result;
+            doneResolveRef(true);
+            const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
+            clog("[dsh-memory] 漏网归档子代理完成（stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+            const doneOk = LAST_ARCHIVE_WROTE_AT >= startedAt && LAST_ARCHIVE_A5_OK;
+            const archNote = doneOk ? "落盘+A5 完整性通过" : (LAST_ARCHIVE_WROTE_AT >= startedAt ? "已落盘但 A5 未全覆盖（缺声明会话）——不消号留待下轮" : "未通过 memory_archive_checkpoint 落盘任何文件——留待下轮");
+            monitorEvent("archive", "settled mode=" + (doneOk ? "tool-ok" : "tool-incomplete") + " wrote=" + (LAST_ARCHIVE_WROTE_AT >= startedAt ? "Y" : "N") + " ok=" + doneOk);
+            if (!doneOk) cwarn("[dsh-memory] " + archNote);
+            if (doneOk) {
               try { handledIds.forEach((id) => ARCHIVED_SESSIONS.add(id)); saveStaleNotified(); } catch (e) {}
               try {
                 const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && !ARCHIVED_SESSIONS.has(s.id)).length;
@@ -1793,31 +1879,23 @@ export default {
               } catch (e) {}
               try {
                 const stI = readIntegrateState() || {};
-                if (!stI.lastIntegrateAt || Date.now() - stI.lastIntegrateAt > 86400000) {
-                  clog("[dsh-memory] 本轮新增摘要可用 /dream 整合进全局记忆。");
-                }
+                if (!stI.lastIntegrateAt || Date.now() - stI.lastIntegrateAt > 86400000) clog("[dsh-memory] 本轮新增摘要可用 /dream 整合进全局记忆。");
               } catch (e) {}
             }
-            clog("[dsh-memory] 漏网归档完成: " + label + "（attempt=" + (attempt + 1) + " 报告 " + outText.length + " 字符）");
+            clog("[dsh-memory] 漏网归档完成: " + label + "（" + archNote + "）");
             const sdir2 = findNewestSpawnedSession(startedAt);
             if (sdir2) {
               const u2 = summarizeSubagentUsage(sdir2);
-              if (u2) {
-                clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟");
-                trackMaintain("arch", u2);
-              }
+              if (u2) { clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟"); trackMaintain("arch", u2); }
             }
-            if (outText.length > 0 && outText.length <= 1200) {
-              clog("[dsh-memory] 归档报告:\n" + outText);
-            }
+            if (outText.length > 0 && outText.length <= 1200) clog("[dsh-memory] 归档报告:\n" + outText);
           } catch (e) {
-            cwarn("[dsh-memory] 漏网归档主子代理失败(attempt=" + (attempt + 1) + "): " + label + " - " + (e && e.message ? e.message : String(e)));
+            cwarn("[dsh-memory] 漏网归档主子代理失败: " + label + " - " + (e && e.message ? e.message : String(e)));
             monitorEvent("archive", "failed reason=spawn");
             doneResolveRef(false);
           }
         };
-        settleArchive(0);
-        clog("[dsh-memory] 已发起漏网归档主子代理: " + label + "（后台执行中，完成后输出报告）");
+        settleArchive();        clog("[dsh-memory] 已发起漏网归档主子代理: " + label + "（后台执行中，完成后输出报告）");
         return { ok: true, count: flowSessions.length, overflow: overflow, done: done, handled: handledIds };
       } catch (e) {
         cwarn("[dsh-memory] 漏网归档主子代理启动失败: " + label + " - " + (e && e.message ? e.message : String(e)));
@@ -2689,8 +2767,100 @@ ctx.on("session/event", (session, event) => {
       }
     });
 
-// 注册 memory_search：宿主插件必须用 ctx.tools 服务注册（harness 是动态插件沙箱专属，宿主插件拿不到）
+    
     const toolSvc = ctx.get("tools");
+    // v2.3.2(archive-tool)：归档交付工具——子代理提交结构化记忆检查点，插件现场校验（含 A5 完整性）+ 落盘，错误清单回显
+    if (toolSvc !== undefined && typeof toolSvc.register === "function") {
+      try {
+        toolSvc.register({
+          name: "memory_archive_checkpoint",
+          description: "提交漏网会话记忆归档检查点（仅 dsh-memory 归档子代理使用）：参数 { blocks: [ { file, sessionId, title, points[], skip?, reason? } ] }。file=记忆库相对路径（sessions/|projects/ 前缀）；sessionId=短 id 清单中的 id 逐字取用；有价值会话填 title+points（3-6 条要点，精确字面量逐字保留）；无价值会话填 skip=true+reason。插件现场校验完整性与落盘：缺声明会话、越界路径、缺 points 会返回错误清单，请修正后再次调用（可多次调用累计覆盖全部会话）。",
+          parameters: {
+            type: "object",
+            properties: {
+              blocks: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    file: { type: "string", description: "sessions/|projects/ 前缀相对路径" },
+                    sessionId: { type: "string", description: "短 id 清单中的 id（逐字取用）" },
+                    title: { type: "string", description: "一句话主题" },
+                    points: { type: "array", items: { type: "string" }, description: "3-6 条要点" },
+                    skip: { type: "boolean", description: "true=该会话跳过归档，需提供 reason" },
+                    reason: { type: "string", description: "跳过理由或归档理由" }
+                  },
+                  required: ["file", "sessionId"]
+                }
+              }
+            },
+            required: ["blocks"]
+          },
+          output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
+          async execute(args) {
+            let blocks = null;
+            try {
+              if (Array.isArray(args)) blocks = args;
+              else if (args && typeof args === "object" && Array.isArray(args.blocks)) blocks = args.blocks;
+              else if (args && typeof args === "object") { const v = Object.values(args).find((x) => Array.isArray(x)); if (v) blocks = v; }
+            } catch (e) {}
+            if (!Array.isArray(blocks)) return JSON.stringify({ ok: false, mode: "bad-schema", wrote: 0, errors: ["参数必须是 { blocks: [...] } 数组"] });
+            return JSON.stringify(applyArchiveBlocks(blocks));
+          }
+        });
+        clog("[dsh-memory] memory_archive_checkpoint 交付工具已注册（漏网归档专用）");
+      } catch (e) { cwarn("[dsh-memory] memory_archive_checkpoint 注册失败:", e && e.message ? e.message : String(e)); }
+    }
+   // v2.3.2(dream-tool)：声明提前（TDZ），memory_dream_patch 与 memory_search 共用
+    // 注册 memory_dream_patch（dream 整合交付工具）
+if (toolSvc !== undefined && typeof toolSvc.register === "function") {
+      try {
+        toolSvc.register({
+          name: "memory_dream_patch",
+          description: "提交记忆整合检查点（仅 dream 整合子代理使用）：把要写入记忆库的补丁装进 patches 参数。插件当场校验并落盘：成功返回 wrote 清单；失败返回错误清单（哪一条/哪个字段/为什么），请按清单修正后再次调用（可多次调用，直到全部通过）。file 必须是 ~/.dsh/memory/ 下相对路径（sessions|projects|knowledge|tools/ 或 global.md|index.md）；action ∈ replace|append|delete；content ≤128KB。",
+          parameters: {
+            type: "object",
+            properties: {
+              patches: {
+                type: "array",
+                description: "补丁数组，每个元素 { file, action, content, reason? }",
+                items: {
+                  type: "object",
+                  properties: {
+                    file: { type: "string", description: "记忆库相对路径" },
+                    action: { type: "string", enum: ["replace", "append", "delete"], description: "replace=整文件覆盖 / append=末尾追加 / delete=删除 content 精确原文" },
+                    content: { type: "string", description: "replace=新全文；append=追加内容；delete=要删除的精确原文块" },
+                    reason: { type: "string", description: "变更理由（留痕）" }
+                  },
+                  required: ["file", "action", "content"]
+                }
+              }
+            },
+            required: ["patches"]
+          },
+          output: {
+            schema: { type: "string" },
+            render(_a, v) { return [{ type: "text", text: String(v) }] }
+          },
+          async execute(args) {
+            let patches = null;
+            try {
+              if (Array.isArray(args)) patches = args;
+              else if (args && typeof args === "object" && Array.isArray(args.patches)) patches = args.patches;
+              else if (args && typeof args === "object") { const v = Object.values(args).find((x) => Array.isArray(x)); if (v) patches = v; }
+            } catch (e) {}
+            if (!Array.isArray(patches)) return JSON.stringify({ ok: false, mode: "bad-schema", wrote: 0, errors: ["参数必须是 { patches: [...] } 数组"] });
+            const r = applyPatches(patches);
+            if (r.ok && r.wrote > 0) LAST_DREAM_WROTE_AT = Date.now();
+            return JSON.stringify(r);
+          }
+        });
+        clog("[dsh-memory] memory_dream_patch 交付工具已注册（dream 整合专用）");
+      } catch (e) {
+        cwarn("[dsh-memory] memory_dream_patch 注册失败:", e && e.message ? e.message : String(e));
+      }
+    }
+    // 注册 memory_search（原工具，toolSvc 声明已提前共用）
     if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       try {
         toolSvc.register({
@@ -3118,13 +3288,25 @@ ctx.on("session/event", (session, event) => {
           calibStats = "spiralEvents 共 " + se.length + " 条；repRate 中位数=" + medRep + "，negRate 中位数=" + medNeg + "；近 " + tps.length + " 个周期中打转周期占 " + spiralPct + "%；当前生效阈值 rep≥" + curTh.rep + "/neg≥" + curTh.neg + "/sim≥" + curTh.sim + "/窗" + curTh.w + "/冷却" + curTh.cooldownMin + "分";
         }
       } catch (e) { /* 统计失败按数据不足处理 */ }
+      // v2.3.2(dream-incremental): 候选清单注入——读什么由代码决定，不靠模型自觉
+      const stI = readIntegrateState() || {};
+      const candI = listIntegrateCandidates(stI);
+      const scopeText = "## Input Scope（插件已按需算好，本轮只读下列文件）\n" +
+        "- 必读稳定层: global.md, index.md\n" +
+        (candI.sessionCands.length ? "- 候选会话: " + candI.sessionCands.join(", ") + "\n" : "- 候选会话: （无变化——旧会话已在上轮整合过，跳过）\n") +
+        (candI.otherCands.length ? "- 其他变动: " + candI.otherCands.join(", ") + "\n" : "") +
+        (candI.fullRound ? "- 本轮=全量轮（每 4 轮 1 次），可重审全部历史会话\n" : "- 本轮=增量轮（上次成功整合后的变动 + 最近 3 天）\n") +
+        "- 硬约束: 只 read 上述列出的文件；严禁 glob/read sessions/、projects/、knowledge/ 下未列出的文件；严禁读原始会话日志.\n";
+
       const promptText =
 "Run one automatic memory consolidation pass for the current DSH memory library (~/.dsh/memory/).\n" +
 "Consolidate only durable, VERIFIED information. Memory files (sessions/ summaries) are the working index.\n" +
 "\n" +
+scopeText +
+"\n" +
 "## Sources\n" +
-"- Primary: sessions/*.md 摘要（尤其最近几天、跨会话反复出现的信号）.\n" +
-"- 只读最近/重复信号，不要穷举每个文件.\n" +
+"- Primary: Input Scope 清单内的 sessions/*.md 摘要（尤其最近几天、跨会话反复出现的信号）.\n" +
+"- 只读 Input Scope 清单内的文件，不要穷举、不要探索清单外的记忆库文件.\n" +
 "\n" +
 "## Consolidate (D3: 跨会话归类 + 保留来源)\n" +
 "把跨会话成立、值得长期保留的条目提升为精确分节，逐条保留来源会话（追加 [ses YYYY-MM-DD] 或 [ses <id>]）：\n" +
@@ -3146,16 +3328,14 @@ ctx.on("session/event", (session, event) => {
 "3. 移除：被新决定取代的条目、仅与单个会话相关不再成立的细节、与更强记忆重复的低信号条目.\n" +
 "4. 只精简/合并/修剪，不删除仍有价值的事实；删除前 [unverified] 或明确标注.\n" +
 "\n" +
-"## Runtime Environment (run_code)\n" +
-"- run_code 是 ESM worker：没有 require、不能写顶层 import 语句；用 `const fsMod = await import('fs'); const fs = fsMod.default || fsMod;`（path 同理).\n" +
-"- `process` 全局可用；process.env 可能受限，不要靠 env 推导路径——记忆库根固定为 ~/.dsh/memory/.\n" +
+"## Write Path（交付工具——落盘走 memory_dream_patch，本子代理无写文件工具）\n" +
+"- 工具面：read/grep/glob/memory_search/dsh_spiral_thresh/memory_dream_patch；write/edit/pwsh/run_code 均不可用，不要尝试写文件.\n" +
+"- 凡需写入/修改记忆库文件：调用 memory_dream_patch 工具，参数 { patches: [ { file, action, content, reason? } ] }——action ∈ replace|append|delete；file 为 ~/.dsh/memory/ 下相对路径（sessions|projects|knowledge|tools/ 或 global.md|index.md）；content ≤128KB.\n" +
+"- 工具会当场校验并落盘：成功返回 wrote 清单；失败返回错误清单（哪一条/哪个字段/为什么）——按清单修正后再次调用，可多次调用直到全部通过.\n" +
+"- 不要输出 JSON 文本/代码块；一切写入只走 memory_dream_patch 工具.\n" +
 "\n" +
-"## Write Path\n" +
-"- write/edit 工具受工作区沙箱限制（~/.dsh 在外）→ 对记忆库的读写一律用 run_code 的 node:fs 直读直写.\n" +
-"- 字符串 replace 补丁前先确认目标尾部有无换行符（无尾换行是最常见失败原因）.\n" +
 "\n" +
-"## Efficiency\n" +
-"- 写入前先在内存拼好完整内容并量字符数（尤其 index.md <2000 上限），一次写对，避免写完再反复修剪.\n" +
+"## Efficiency\n" +"- 写入前先在内存拼好完整内容并量字符数（尤其 index.md <2000 上限），一次写对，避免写完再反复修剪.\n" +
 "- 不要花步骤试探运行时能力——本节已给出全部事实.\n" +
 "\n" +
 "- 每个文件 edit 前先 read 全量（禁止局部读+整体覆写）；不更新 global/index 的时间戳行（保前缀缓存）;\n" +
@@ -3168,7 +3348,7 @@ ctx.on("session/event", (session, event) => {
 "- 应用变更只准调用 dsh_spiral_thresh 工具并带 reason 参数（一句话理由，插件侧钳制校验+落盘+记变更日志；禁止直写 .monitor.json——会被插件内存态覆盖）.\n" +
 "- 无需调整就不调用工具。最终 Output 加一行 Thresholds: kept/changed + 一句理由.\n" +
 "## Output — brief summary only\n" +
-        "- Written files: 本次实际写入的记忆库文件相对路径列表（仅限 ~/.dsh/memory/ 内，供插件核对留痕）\n" +
+        "- Written files: 本次产出 DREAM_PATCH 检查点的目标文件相对路径列表（仅限 ~/.dsh/memory/ 内）\n" +
 "- Consolidated: n entries added (按节列出)\n" +
 "- Updated: n entries changed\n" +
 "- Deleted: n entries removed\n" +
@@ -3183,73 +3363,87 @@ ctx.on("session/event", (session, event) => {
           signal: new AbortController().signal,
           maxDepth: 2,   // v2.1.0(E2): 允许一级二级拆分并发，禁更深嵌套
                     // v2.1.0(E1): 移除 write/edit——Write Path 本就要求 run_code node:fs 直写，物理杜绝沙箱写路径
-          toolFilter: { allow: ["read", "grep", "glob", "memory_search", "dsh_spiral_thresh"] },
+          // v2.1.0(E1)+hotfix3 2026-08-28: 只物理移除 write/edit（写 ~/.dsh 必被沙箱拒）。
+          //          宿主 tools.restrict(filter) 直收 toolFilter，filter 形态必须 { allow?, deny? } 对象；
+          //          写 restrict: 数组会被解析成 {} → no-op 报错；写 allow: 会把 run_code 挤出工具集且不能点名补回。
+          //          deny 只移除 write/edit，run_code 保留传输默认在工具集（宿主源码 dsh-tools/lib/index.js restrict() 实证）。
+          // v2.3.2(dream-patch): 检查点模式后子代理零写需求 → 纯只读 allow 白名单（物理无 write/edit/pwsh），
+          //          避免再出现 run_code/pwsh 绕行不确定性；run_code 为保留传输不可点名，此处亦无需它。
+          toolFilter: { allow: ["read", "grep", "glob", "memory_search", "dsh_spiral_thresh", "memory_dream_patch"] },
         });
-        run.result.then(async (result) => {   // v2.1.0(B1): async 以支持容量复检 await
-          const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\\n");
-          clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
-          let u = null;
-          const sdir = findNewestSpawnedSession(startedAt);
-          if (sdir) {
-            u = summarizeSubagentUsage(sdir);
-            if (u) clog("[dsh-memory] 整合消耗: 总输入 " + (u.totalIn || u.input) + " tokens（其中缓存命中 " + u.cache + "）| 输出 " + u.output + (u.reasoning > 0 ? " | 推理 " + u.reasoning : "") + " tokens | 总时长 " + u.durMin + " 分钟");
-          }
-          // v1.12.17: 完成回执落盘（错过控制台也能事后查）
-          if (DREAM_PATCH) {
-            DREAM_PATCH({
-              status: result.stopReason === "end" ? "done" : ("stopped:" + (result.stopReason || "?")),
-              finishedAt: Date.now(),
-              durMin: u ? u.durMin : Math.round(((Date.now() - startedAt) / 60000) * 10) / 10,
-              tokens: u ? ("totalIn " + (u.totalIn || u.input) + " (cache " + u.cache + ") / out " + u.output) : null,
-              summary: outText.slice(0, 200)
-            });
-          }
-          DREAM_TRACK = null;
-          if (outText.length > 0 && outText.length <= 600) {
-            clog("[dsh-memory] 整合报告: " + outText.replace(/\\n/g, " | "));
-          }
-          // 刷新起始时间：无论结果如何都刷新（避免卡在同一周期反复触发）
-          const st = readIntegrateState() || {};
-          st.lastIntegrateAt = Date.now();
-          writeIntegrateState(st);
-          trackMaintain("integ", u);
-          // v2.0.5: 完成验收——容量上限与时间戳行是代码检查，不是模型自觉（超限/被改即报告并记入 progress.health）
+                // v2.3.2(dream-tool)：结算简化——写入全部走 memory_dream_patch 工具（现场校验+落盘），
+        // 无需提取/重组/followup；成功与否由 applyPatches 落盘时更新的 LAST_DREAM_WROTE_AT 判定。
+        const settleDream = async () => {
           try {
-            const health = [];
-            for (const df of ["global.md", "index.md"]) {
-              try {
-                const dt = fs.readFileSync(portable(MEMORY_ROOT + "/" + df), "utf8");
-                const lim = df === "global.md" ? 3000 : 2000;
-                if (dt.length >= lim) health.push(df + " " + dt.length + "字符未达精简目标(<" + lim + ")");
-                if (dreamSnap[df] && dreamSnap[df].stampLine && !dt.includes(dreamSnap[df].stampLine)) health.push(df + " 时间戳行被改动(前缀缓存失效)");
-              } catch (e2) {}
+            const result = await run.result;
+            const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
+            clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+            let u = null;
+            const sdir = findNewestSpawnedSession(startedAt);
+            if (sdir) {
+              u = summarizeSubagentUsage(sdir);
+              if (u) clog("[dsh-memory] 整合消耗: 总输入 " + (u.totalIn || u.input) + " tokens（其中缓存命中 " + u.cache + "）| 输出 " + u.output + (u.reasoning > 0 ? " | 推理 " + u.reasoning : "") + " tokens | 总时长 " + u.durMin + " 分钟");
             }
-            // v2.1.0(B1): 整合后全库容量复检——治理不再只靠模型自觉，超限并入 health 报告
+            const doneOk = LAST_DREAM_WROTE_AT >= startedAt;
+            if (DREAM_PATCH) {
+              DREAM_PATCH({
+                status: doneOk ? "done" : "stopped:incomplete",
+                finishedAt: Date.now(),
+                durMin: u ? u.durMin : Math.round(((Date.now() - startedAt) / 60000) * 10) / 10,
+                tokens: u ? ("totalIn " + (u.totalIn || u.input) + " (cache " + u.cache + ") / out " + u.output) : null,
+                summary: outText.slice(0, 200)
+              });
+            }
+            DREAM_TRACK = null;
+            if (outText.length > 0 && outText.length <= 600) {
+              clog("[dsh-memory] 整合报告: " + outText.replace(/\n/g, " | "));
+            }
+            const st = readIntegrateState() || {};
+            st.lastIntegrateAt = Date.now();
+            if (doneOk) { st.lastSuccessAt = Date.now(); st.integrateCount = (st.integrateCount || 0) + 1; }
+            else { st.lastFailAt = Date.now(); cwarn("[dsh-memory] 本次整合未通过 memory_dream_patch 落盘任何文件——2 小时后自动重试，请关注 progress.health"); }
+            writeIntegrateState(st);
+            trackMaintain("integ", u);
             try {
-            const so = await checkSizeOverflow();
-            for (const i9 of so || []) health.push((i9.label || i9.key || "?") + " 整合后仍超限（字节 " + i9.bytes + "/字符 " + i9.chars + "）");
-            } catch (e6) {}
-            if (health.length) {
-              cwarn("[dsh-memory] 整合验收未过: " + health.join("; ") + "——下次整合优先处理");
-              if (DREAM_PATCH) DREAM_PATCH({ health: health.join("; ").slice(0, 200) });
-            } else if (dreamSnap["global.md"]) {
-              clog("[dsh-memory] 整合验收通过: global/index 容量与时间戳行合规");
-            }
-          } catch (e2) { /* 验收失败不影响主流程 */ }
-          // v2.0.9(M2): 客观写入留痕——扫描整合期间 mtime 变化的记忆库文件（防误写/超范围写无可观测性）
-          try {
-            const touched = [];
-            const scanMem = (d0) => { for (const e of fs.readdirSync(d0, { withFileTypes: true })) { const p1 = d0 + "/" + e.name; if (e.isDirectory()) scanMem(p1); else if (fs.statSync(p1).mtimeMs >= startedAt - 2000) touched.push(p1.replace(portable(MEMORY_ROOT) + "/", "")); } };
-            scanMem(portable(MEMORY_ROOT));
-            if (touched.length > 0) { clog("[dsh-memory] 记忆文件变更于本次整合 (" + touched.length + " 个):"); for (const t1 of touched) clog("  - " + t1); }
-          } catch (e5) {}
-          clog("[dsh-memory] 下次自动整合：" + PLUGIN_CFG.integrateDays + " 天后");
-        }).catch((e) => {
+              const health = [];
+              for (const df of ["global.md", "index.md"]) {
+                try {
+                  const dt = fs.readFileSync(portable(MEMORY_ROOT + "/" + df), "utf8");
+                  const lim = df === "global.md" ? 3000 : 2000;
+                  if (dt.length >= lim) health.push(df + " " + dt.length + "字符未达精简目标(<" + lim + ")");
+                  if (dreamSnap[df] && dreamSnap[df].stampLine && !dt.includes(dreamSnap[df].stampLine)) health.push(df + " 时间戳行被改动(前缀缓存失效)");
+                } catch (e2) {}
+              }
+              try {
+                const so = await checkSizeOverflow();
+                for (const i9 of so || []) health.push((i9.label || i9.key || "?") + " 整合后仍超限（字节 " + i9.bytes + "/字符 " + i9.chars + "）");
+              } catch (e6) {}
+              if (health.length) {
+                cwarn("[dsh-memory] 整合验收未过: " + health.join("; ") + "——下次整合优先处理");
+                if (DREAM_PATCH) DREAM_PATCH({ health: health.join("; ").slice(0, 200) });
+              } else if (dreamSnap["global.md"]) {
+                clog("[dsh-memory] 整合验收通过: global/index 容量与时间戳行合规");
+              }
+            } catch (e2) {}
+            try {
+              const touched = [];
+              const scanMem = (d0) => { for (const e of fs.readdirSync(d0, { withFileTypes: true })) { const p1 = d0 + "/" + e.name; if (e.isDirectory()) scanMem(p1); else if (fs.statSync(p1).mtimeMs >= startedAt - 2000) touched.push(p1.replace(portable(MEMORY_ROOT) + "/", "")); } };
+              scanMem(portable(MEMORY_ROOT));
+              if (touched.length > 0) { clog("[dsh-memory] 记忆文件变更于本次整合 (" + touched.length + " 个):"); for (const t1 of touched) clog("  - " + t1); }
+              else { cwarn("[dsh-memory] 本次整合未观测到任何记忆库文件写入"); }
+            } catch (e5) {}
+            clog("[dsh-memory] 下次自动整合：" + PLUGIN_CFG.integrateDays + " 天后");
+          } catch (e) {
+            cwarn("[dsh-memory] 整合结算异常:", e && e.message ? e.message : String(e));
+            try { const st = readIntegrateState() || {}; st.lastIntegrateAt = Date.now(); st.lastFailAt = Date.now(); writeIntegrateState(st); } catch (e2) {}
+            DREAM_TRACK = null;
+          }
+        };
+        run.result.then(async () => { await settleDream(); }).catch((e) => {
           cwarn("[dsh-memory] 自动整合子代理失败:", e && e.message ? e.message : String(e));
           if (DREAM_TRACK && DREAM_PATCH) { DREAM_PATCH({ status: "failed", error: String((e && e.message) || e).slice(0, 120) }); }
           DREAM_TRACK = null;
-        });
-        // v2.2.4: DREAM_TRACK 占位已上移至 runDreamPipeline 入口（同步段），此处不再重设（避免刷新心跳基准）
+        });        // v2.2.4: DREAM_TRACK 占位已上移至 runDreamPipeline 入口（同步段），此处不再重设（避免刷新心跳基准）
         dreamProgressPatch({ status: "running", reason: reason, startedAt: Date.now(), steps: 0, lastTool: "-" });
         clog("[dsh-memory] 已发起自动整合子代理（" + reason + "，后台执行中；进度见 ~/.dsh/memory/.integrate.json progress 字段）");
         return true;
@@ -3323,9 +3517,12 @@ ctx.on("session/event", (session, event) => {
           return;   // v1.12.19.2: 首次初始化日志静默化
         }
         if (!PLUGIN_CFG.integrateEnabled) return;
-        const due = now - (st.lastIntegrateAt || st.installAt || 0) >= PLUGIN_CFG.integrateDays * 86400000;
+        // v2.3.2(dream): 正常 7 天周期 + 上次失败后 2 小时重试窗（失败不丢内容，定期轮次补齐）
+        const sinceTry = now - (st.lastIntegrateAt || st.installAt || 0);
+        const sinceFail = now - (st.lastFailAt || 0);
+        const due = sinceTry >= PLUGIN_CFG.integrateDays * 86400000 || (st.lastFailAt && sinceFail >= 120 * 60000 && sinceTry >= 120 * 60000);
         if (due) {
-          clog("[dsh-memory] 距上次整合已满 " + PLUGIN_CFG.integrateDays + " 天，触发自动整合");
+          clog("[dsh-memory] 触发整合检查：" + (sinceTry >= PLUGIN_CFG.integrateDays * 86400000 ? "距上次已满 " + PLUGIN_CFG.integrateDays + " 天" : "上次整合失败，2 小时重试窗到点") + "，触发自动整合");
           await runDreamPipeline("定期", null);
         }
       } catch (e) {
