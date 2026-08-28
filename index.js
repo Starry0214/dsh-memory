@@ -105,7 +105,7 @@ const PS_MEMORY = MEMORY_ROOT.replace(/\//g, "\\");
 const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 
 // v2.3.0：插件版本号——与仓库 package.json / version.txt 同步；升级检查以此比对远端版本
-const PLUGIN_VERSION = "2.3.1";
+const PLUGIN_VERSION = "2.3.2";
 // 远端发布基址（安装/升级命令同源）；DSH_MEMORY_RAW 可指向内网镜像
 const RAW_BASE_DEFAULT = "https://raw.githubusercontent.com/Starry0214/dsh-memory/main";
 

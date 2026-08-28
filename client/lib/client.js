@@ -151,7 +151,7 @@ window.__ModuleLoader__.load({
 						react.createElement("span", { style: { fontSize: "13px", color: "var(--dsw-alias-label-tertiary)" } }, "天/次")
 					)
 				),
-				// v2.3.0 行：版本与记忆库状态（只读，宿主 pushOnboardSummary 写入）
+				// v2.3.2 行：版本与记忆库状态（只读，宿主 pushOnboardSummary 写入）
 				react.createElement("div", { style: rowStyle },
 					react.createElement("div", { style: { width: "100%" } },
 						react.createElement("div", { style: labelStyle }, "版本与记忆库"),
