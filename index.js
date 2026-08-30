@@ -1,3 +1,25 @@
+// v2.4.0 定版对外（2026-08-30）：合并 v2.3.3~v2.3.8 六个内部增量——整合候选纯 hash 账本 / smartTrim 分节水填+归档全文+召回把手 /
+//  记录器输入 16000 全文直喂 / 检查点预算治理 L1-L3 / 多主会话竞态根治 F1-F4；版本号四处（index.js/version.txt/package.json/client 注释）对齐。
+// v2.3.8 多主会话竞态根治（真机 intent-756123d9 事故复盘：正确剪贴板检查点 898 字被丢弃、落盘 marker×内容错位配对）：
+//  - F1 注入守卫：稳定层/摘要注入与 A 类提醒改仅顶层会话——子代理收到【上次会话摘要】触发 ghost 第二轮，run.result 拿到跑题输出覆盖正解（55005cd4 转写实证）
+//  - F2 忙不吞事件：INTENT_RUNNING 时由「跳过」改 1-slot-per-id 队列，settle 后按序补火（29692b0d 重放事件被吞的根治）
+//  - F3 intent 块按母会话分位：marker 加 sid:<8字>，strip 只替换同 sid 旧块、全局保最近 3 块——跨会话互相挤占+幂等标记被删致重炒双根治
+//  - F4 格式护栏：sum 不以「## 本次目标」开头则拒写并埋点 malformed（防再吃跑题输出）
+// v2.3.7 预算治理三层（用户追问「改措辞+硬截是不是偷懒」后重设计，对标 mimocode renderSectionBudgets/readBudgetedSectionAware/checkpoint-retry 观察项）：
+//  - L1 任务书：废笼统「总长≤800」（模型数不清字符，实测 1132 超纲），改分节具体预算：本次目标≤120/下一步≤200/关键结论≤4条×≤140，超限删关键结论尾部整条（宁缺毋断）
+//  - L2 写侧硬护栏：sum>1000 时只从「## 关键结论」尾部整行删除至 ≤1000，绝不断句、前两节永不删，monitorEvent("intent","overshoot")埋点攒超纲率数据（够高再上重试轮）
+//  - L3 注入端解耦：摘要注入裸 slice(0,1500) → 既有 sectionAwareSlice（v1.12.0 造好未上膛的枪）——检查点超纲的代价不再转嫁为挤爆当日摘要；离线白盒实证：同预算下当日节 100% 幸存
+// v2.3.6 修正：意图记录器输入 3500→16000（与归档上限对齐）——真实宿主摘要 5681~14087 字全在预算内=全文直喂；
+//  - v2.3.5 分节水位仍只喂 21%（2996/14087），长节中段条目（Files 中部路径、KeyTech 后段结论）仍不可见；
+//  - 全文直喂每次压缩 +~4K token（<20% 压缩事件自身成本），换来「能召回的必已喂入」不变量；>16000 极端件才走水位+归档把手。
+// v2.3.5 升级：smartTrim 改「分节水位分配」（对标 mimocode readBudgetedSectionAware）——真实 14087 字宿主摘要实测：头尾字符截仍丢
+//  - Current Work/Optional Next Step 全部（尾部被末节 Critical Context 占满）；分节水位后三关键节 100%，长节头62%+尾38%节内取文，实喂 2996 字
+//  - 直写归档升为全文（预算 16000，超限才截）——归档即 memory_search 召回把手（mimocode「full body at file」同款）；截断标记内嵌归档指针
+//  - stripCompactionDumps 边界规则升级：dump 块内英文 H2 一律吞为正文（旧规则只认两节名，全文归档后会把 ## Files/## Errors 漏进注入）
+// v2.3.4 修复：宿主压缩摘要喂给「意图检查点/直写归档」时从头截断（slice(0,N)）把最可续接的尾部段整段丢弃
+//  - 实证：意图记录器输入在 2000 字符处断在 `sourceEventSeq 半 token，本次会话根因发现/修复状态全部未达记录器，检查点退化为上轮检查点复读
+//  - 新增 smartTrim 头+尾拼接截断：意图输入 2000→3000、直写归档 1500→2400、回退提醒 1500；中段省略标字符数、按行界对齐
+//  - 意图输出纪律 600→800 字符（注入头部预算 1500 不变，块头+800 仍可存活头部截断）
 // v2.2.11 新增：memory_search 工具描述补充调用契约（2026-08-27，会话日志实证：25 次相关调用中 5 次直接调用 100% 失败、白费一轮才改 run_code 包裹）
 // dsh-memory: 全局自动记忆插件 v1.12.0（v1.12.0: 自动提醒查记忆/查 skill——A/B/C 判据插件化；v1.11.0: /dream 命令 + active 开关 + 整合升级；v1.4.0: 设置界面）
 // v2.2.5 修复：memory_search 零命中根因——索引→检索断链三处
@@ -77,6 +99,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 // v1.2.0：node:fs 直写压缩检查点（宿主插件真实 Node 环境，绕过 ctx.fs 沙箱，无需审批）
 import fs from "node:fs";
+// v2.3.4：内容 hash 账本（dream 整合候选判定）——sha256 比对替代 mtime/全量轮
+import { createHash } from "node:crypto";
 // v1.8.0：node:zlib 原生 zstd 解压（Node 22.17+/23.3+）——漏网归档改为「提取会话 compaction 摘要」，子代理不读原始大日志
 import zlib from "node:zlib";
 // v2.0.9(M3): zstd 能力守卫——Node<22.17 无 zlib.zstdDecompressSync，消息流提取必失败，
@@ -105,7 +129,7 @@ const PS_MEMORY = MEMORY_ROOT.replace(/\//g, "\\");
 const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 
 // v2.3.0：插件版本号——与仓库 package.json / version.txt 同步；升级检查以此比对远端版本
-const PLUGIN_VERSION = "2.3.2";
+const PLUGIN_VERSION = "2.4.0";
 // 远端发布基址（安装/升级命令同源）；DSH_MEMORY_RAW 可指向内网镜像
 const RAW_BASE_DEFAULT = "https://raw.githubusercontent.com/Starry0214/dsh-memory/main";
 
@@ -1361,9 +1385,71 @@ function normalizeCfg(raw) {
   return cfg;
 }
 
+// ═══════════ v2.3.4(dream-hash)：整合候选改为「内容 sha256 账本比对」——替代 v2.3.2 的 mtime/最近3天/全量轮三套逻辑 ═══════════
+// 设计（用户拍板 2026-08-29）：值得提升的跨会话知识必然在新日志中反复出现 → 增量即可覆盖（总结错→新日志冲突/漏记→多次出现）；
+// 全量轮翻陈年旧账找的是"不该提升的一次性知识"。故候选判定 = 账本无记录 或 当前 hash ≠ 账本 hash：
+//   - 已 dream 且内容未变的文件：永不重读（读取成本与历史长度无关）
+//   - 任何内容变化的文件（无论谁改/何时改）：自动重读（兜底语义保留，mtime/touch 污染免疫）
+// 纯函数、零 ctx 依赖（fs/portable/MEMORY_ROOT 都是模块级）——单测用 marker 切区 eval（ONBOARD 同套路）。
+// >>> INT_HASH BEGIN
+function sha256FileText(p) {
+  try { return createHash("sha256").update(fs.readFileSync(p)).digest("hex"); }
+  catch (e) { return null; }
+}
+
+// 返回 { sessionCands, otherCands }：候选 = 账本无记录 || 当前 hash ≠ 账本 hash
+function hashListIntegrateCandidates(st0) {
+  const dreamed = (st0 && st0.dreamed) || {};
+  const sessionCands = []; const otherCands = [];
+  const scan = (relDir, isSession) => {
+    const d = portable(MEMORY_ROOT + "/" + relDir);
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of entries) {
+      if (!e.isFile || !e.isFile()) continue;
+      if (isSession && !/^\d{4}-\d{2}-\d{2}\.md$/.test(e.name)) continue;
+      if (!isSession && !e.name.endsWith(".md")) continue;
+      const rel = relDir + "/" + e.name;
+      const h = sha256FileText(d + "/" + e.name);
+      if (h === null) continue;
+      if (dreamed[rel] !== h) (isSession ? sessionCands : otherCands).push(rel);
+    }
+  };
+  scan("sessions", true);
+  scan("projects", false);
+  scan("knowledge", false);
+  sessionCands.sort(); otherCands.sort();
+  return { sessionCands: sessionCands, otherCands: otherCands };
+}
+
+// 整合成功后记账：全部相关文件当前 hash（已 dream 即记；未变的下次 hash 相同自动跳过）
+function recordDreamedHashes(st0) {
+  const dreamed = {};
+  const scan = (relDir, isSession) => {
+    const d = portable(MEMORY_ROOT + "/" + relDir);
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of entries) {
+      if (!e.isFile || !e.isFile()) continue;
+      if (isSession && !/^\d{4}-\d{2}-\d{2}\.md$/.test(e.name)) continue;
+      if (!isSession && !e.name.endsWith(".md")) continue;
+      const h = sha256FileText(d + "/" + e.name);
+      if (h !== null) dreamed[relDir + "/" + e.name] = h;
+    }
+  };
+  scan("sessions", true);
+  scan("projects", false);
+  scan("knowledge", false);
+  st0.dreamed = dreamed;
+  return dreamed;
+}
+// >>> INT_HASH END
+
 export default {
   inject: ["fs", "timer", "commands", "skills"],
   apply(ctx, config) {
+    // v2.3.4(dream-hash)：候选函数绑定模块级 hash 版本（纯函数，见 export default 前的 >>> INT_HASH BEGIN 区）
+    const listIntegrateCandidates = hashListIntegrateCandidates;
     // v1.4.0：设置机制 —— cordis.patch.yml config 作 base 默认层，settings.yaml 用户文档覆盖。
     // 手动 register 拿到宿主 scope（写只读统计 staleCount）；无 settings 服务时回退 cordis config。
     PLUGIN_CFG = normalizeCfg(config);
@@ -1682,34 +1768,8 @@ export default {
       return applyPatches(obj.patches);
     }
 
-    // v2.3.2(dream-incremental): 增量候选——「上次成功整合后变化 + 最近 3 天」并集；每 4 轮一次全量
-    function listIntegrateCandidates(st0) {
-      const since = (st0 && st0.lastSuccessAt) || 0;
-      const day3 = Date.now() - 3 * 86400000;
-      const fullRound = ((st0 && st0.integrateCount) || 0) % 4 === 0;
-      const sessionCands = []; const otherCands = [];
-      try {
-        const sd = portable(MEMORY_ROOT + "/sessions");
-        if (fs.existsSync(sd)) {
-          for (const e of fs.readdirSync(sd, { withFileTypes: true })) {
-            if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(e.name)) continue;
-            const stt = fs.statSync(sd + "/" + e.name);
-            if (fullRound || stt.mtimeMs > since || stt.mtimeMs >= day3) sessionCands.push("sessions/" + e.name);
-          }
-        }
-        for (const dir of ["projects", "knowledge"]) {
-          const d = portable(MEMORY_ROOT + "/" + dir);
-          if (!fs.existsSync(d)) continue;
-          for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-            if (!e.isFile() || !e.name.endsWith(".md")) continue;
-            const stt = fs.statSync(d + "/" + e.name);
-            if (fullRound || stt.mtimeMs > since) otherCands.push(dir + "/" + e.name);
-          }
-        }
-      } catch (e) { sessionCands.length = 0; otherCands.length = 0; }
-      sessionCands.sort(); otherCands.sort();
-      return { sessionCands: sessionCands, otherCands: otherCands, fullRound: fullRound };
-    }
+    // v2.3.4(dream-hash): 候选由模块级 hashListIntegrateCandidates 提供（见 export default 前定义）。
+    // 读什么由代码决定，不靠模型自觉；读取成本与 sessions/ 历史长度完全无关（已 dream 且未变更的文件永不重读）。
 
 
     // ═══════════ v2.0.7+ 漏网归档：检查点落盘语义（runStaleArchive 重植，2026-08-27 修复丢失的整函数块） ═══════════
@@ -1741,6 +1801,181 @@ export default {
       } catch (e) {
         cwarn("[dsh-memory] 压缩子代理失败(" + tag + "):", e && e.message ? e.message : String(e));
         return null;
+      }
+    }
+
+    // v2.3.5: 分节水位截断（对标 mimocode readBudgetedSectionAware + truncateVerbatimUserMsg）——宿主摘要按 ## 分节，
+    // 纯字符窗口（哪怕头+尾）在 14k 真实样本上仍整节丢 Current Work/Next Step。改为：每节按优先级权重水位分配预算
+    // （next/current/error/pending=3，intent/context/decision=2，其余=1），节内头 62%+尾 38% 取文、超长单行切断；
+    // 截断标记内嵌归档指针（pointer 传入），记录器可用 memory_search 自补全。预算=上限语义，行界对齐允许留白。
+    function smartTrim(txt, budget, pointer) {
+      const s = String(txt || "").trim();
+      if (s.length <= budget) return s;
+      const mTail = pointer ? "；全文归档 " + pointer : "";
+      const lines = s.split("\n");
+      const bounds = [0];
+      lines.forEach((ln, i) => { if (i > 0 && /^##\s/.test(ln)) bounds.push(i); });
+      bounds.push(lines.length);
+      const secs = [];
+      for (let bi = 0; bi + 1 < bounds.length; bi++) {
+        const body = lines.slice(bounds[bi], bounds[bi + 1]);
+        secs.push({ name: body[0] || "", body, len: body.join("\n").length });
+      }
+      const n = secs.length;
+      const prio0 = /^##\s.*(next|current|work|error|fix|pending|block)/i;
+      const prio1 = /^##\s.*(intent|request|goal|context|decision|resource)/i;
+      const wgt = secs.map((sc) => prio0.test(sc.name) ? 3 : prio1.test(sc.name) ? 2 : 1);
+      const work = Math.max(budget - (n * 90 + 40), n * 80);
+      const take = new Array(n).fill(0);
+      let rem = work;
+      let active = secs.map((_, i) => i);
+      for (let pass = 0; pass < 8 && active.length && rem > 0; pass++) {
+        const W = active.reduce((a, i) => a + wgt[i], 0);
+        const share = rem / W;
+        const next = [];
+        for (const i of active) {
+          const want = Math.floor(Math.min(share * wgt[i], secs[i].len - take[i]));
+          if (want > 0) { take[i] += want; rem -= want; }
+          if (take[i] < secs[i].len) next.push(i);
+        }
+        active = next;
+      }
+      for (const i of active) { if (rem <= 0) break; if (take[i] < secs[i].len) { take[i]++; rem--; } }
+      function gather(bodyArr, cap, fromEnd) {
+        const kept = []; let acc = 0;
+        const arr = fromEnd ? bodyArr.slice().reverse() : bodyArr;
+        for (const ln of arr) {
+          const room = cap - acc;
+          if (room <= 0) break;
+          if (ln.length + 1 <= room) { kept.push(ln); acc += ln.length + 1; continue; }
+          if (!kept.length || room > 60) { kept.push(ln.slice(0, Math.max(40, room))); acc = cap; break; }
+          break;
+        }
+        return fromEnd ? kept.reverse() : kept;
+      }
+      const out = [];
+      for (let i = 0; i < n; i++) {
+        const sc = secs[i];
+        if (take[i] >= sc.len) { out.push(sc.body.join("\n")); continue; }
+        if (take[i] >= 180) {
+          const hCap = Math.floor(take[i] * 0.62);
+          const h = gather(sc.body, hCap, false);
+          const t = gather(sc.body, take[i] - hCap, true);
+          out.push(h.join("\n") + "\n…[本节中省略 " + (sc.len - take[i]) + " 字" + mTail + "]…\n" + t.join("\n"));
+        } else {
+          out.push(gather(sc.body, take[i], false).join("\n") + "\n（本节截断" + mTail + "）");
+        }
+      }
+      let res = out.join("\n").replace(/\n{3,}/g, "\n\n");
+      if (res.length > budget) res = res.slice(0, budget - 12) + "…[预算截断]";
+      return res;
+    }
+
+    // ═══════════ v2.3.3(意图检查点)：压缩时提炼「本次目标/下一步行动」两节，prepend 到 sessions/今日.md 头部 ═══════════
+    // 对标 mimocode checkpoint-writer §1 Active intent / §2 Next action：
+    //   - 触发：宿主 compaction/summary 事件（上下文压缩时刻，与 mimocode token 阈值同语义）
+    //   - 写入：spawn 轻量子代理（工具仅 memory_search），输入=宿主压缩摘要，输出固定三节结构
+    //   - 位置：prepend 到文件头部的独立小节（注入端 latest.text.slice(0,1500) 从头截断，保证下会话可见）
+    //   - 幂等：marker `<!-- intent: <compactionId> -->`；防重入：INTENT_RUNNING 同步占位
+    const INTENT_INSTRUCTION =
+      "你是会话检查点记录器。基于以下「宿主压缩摘要」，提炼本次会话的续接状态，输出固定结构 Markdown（只输出下列三节，不要任何额外解释或开场白）：\n" +
+      "## 本次目标\n（用户最近一次明确请求或会话主线目标；尽量原文引用 verbatim，无则写「未明确」）\n" +
+      "## 下一步行动\n（续接时应该做的下一件具体事；含未决事项或衔接点；无则写「无明确下一步」）\n" +
+      "## 关键结论\n（3-6 条本次最有长期价值的要点：决策/踩坑/产物路径/命令/报错串/数值，精确字面量逐字保留绝不概括改写）\n" +
+      "纪律（分节预算，严格）：本次目标≤120字；下一步行动≤200字；关键结论≤4条、每条≤140字。\n" +
+      "超限处置：从「关键结论」尾部删整条——宁缺毋断，字面量禁止截半句，前两节永不删。不确定就写「未明确」，不编造。\n" +
+      "补全通道：摘要通常已全文直喂（≤16000 字原样入上下文）；仅超长时出现「本节截断/本节中省略」标记——见标记且需精确字面量时，先 memory_search 查今日归档（sessions/日期.md 自动检查点块）再定稿。\n\n===== 宿主压缩摘要 =====\n";
+    let INTENT_RUNNING = false;
+    // v2.3.3：移除文件头部堆积的旧意图块（只保留最新，对标 mimocode checkpoint.md 原位更新语义）。
+    // 意图块 = 从 `<!-- intent: ... -->` 行开始，到下一个 `<!-- `（compaction marker）行之前。
+    // v2.3.8 F3: intent 块按母会话分位（对标 mimocode per-session checkpoint.md）——marker 携带 sid:<8字>；
+    // 写新块只删同 sid 旧块（原位更新），他会话块不动；全局至多保最近 3 块，超出从最老处淘汰并埋点。
+    // 兼容：v2.3.7 及更早的无 sid 旧块视作 legacy，不占同会话替换，仅受 3 块上限挤退。
+    function stripOldIntentBlocks(txt, keepSid) {
+      const MARK = /^<!-- intent: [0-9a-zA-Z-]{8,}(?: sid:(\S+?))? -->/;   // 字符集放宽到字母数字-（真实为 uuid hex，测试夹具与非 hex id 兼容）
+      const lines = String(txt || "").split("\n");
+      const blocks = [];
+      const rest = [];
+      let cur = null;
+      for (const ln of lines) {
+        const m = ln.match(MARK);
+        if (m) { cur = { sid: m[1] || "legacy", lines: [ln] }; blocks.push(cur); continue; }
+        if (cur && /^\s*<!-- /.test(ln)) { cur = null; rest.push(ln); continue; }
+        if (cur) cur.lines.push(ln); else rest.push(ln);
+      }
+      const kept = [];
+      for (const b of blocks) {
+        if (keepSid && b.sid === keepSid) continue;
+        if (kept.length >= 2) { monitorEvent("intent", "cap-evict sid:" + b.sid); continue; }   // 保2+新块1=全局至多3
+        kept.push(b);
+      }
+      const head = kept.map((b) => b.lines.join("\n")).join("\n\n");
+      return (head ? head + "\n\n" : "") + rest.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+    }
+
+    const INTENT_PENDING = new Map();   // v2.3.8 F2: 忙时不吞事件——每 compactionId 一槽，settle 后按序补火（size>4 逐旧）
+    async function spawnIntentCheckpoint(compactionId, summaryText, fname, parentAgent, sessionId) {
+      if (INTENT_RUNNING) {
+        if (!INTENT_PENDING.has(compactionId)) {
+          INTENT_PENDING.set(compactionId, { summaryText, fname, parentAgent, sessionId });
+          if (INTENT_PENDING.size > 4) INTENT_PENDING.delete(INTENT_PENDING.keys().next().value);
+          monitorEvent("intent", "queued " + String(compactionId).slice(0, 8));
+          clog("[dsh-memory] 意图检查点：忙→入队 " + String(compactionId).slice(0, 8));
+        }
+        return;
+      }
+      const rawSum = String(summaryText || "").trim();
+      if (rawSum.length < 40) {
+        clog("[dsh-memory] 意图检查点：宿主压缩摘要为空或过短（" + rawSum.length + " 字符），跳过不落盘");
+        return;
+      }
+      INTENT_RUNNING = true;
+      try {
+        const subagents = ctx.get("subagents");
+        if (!subagents || typeof subagents.start !== "function") {
+          clog("[dsh-memory] 意图检查点：subagents 不可用，跳过");
+          return;
+        }
+        const targetPath = MEMORY_ROOT + "/sessions/" + fname;
+        const targetFull = portable(targetPath);
+        let existing = "";
+        try { existing = fs.readFileSync(targetFull, "utf8"); } catch (e) { existing = ""; }
+        if (existing.includes("<!-- intent: " + compactionId)) return;   // 幂等：前缀匹配（marker 已带 sid 后缀）
+        const sid8 = String(sessionId || "anon").replace(/^session-/, "").slice(0, 8);
+        let sum = await compactOnce(subagents, parentAgent, INTENT_INSTRUCTION + smartTrim(summaryText, 16000, "sessions/" + fname + "（memory_search 可查）"), "intent-" + String(compactionId).slice(0, 8));
+        if (!sum) { clog("[dsh-memory] 意图检查点：子代理无输出，跳过"); return; }
+        if (!/^##\s*本次目标/.test(sum.trim())) {   // v2.3.8 F4: 格式护栏——拒绝非检查点文本入正文（ghost 轮跑题回复曾顶替正解落盘）
+          monitorEvent("intent", "malformed " + String(compactionId).slice(0, 8) + " head=[" + sum.slice(0, 30).replace(/\n/g, " ") + "]");
+          cwarn("[dsh-memory] 意图检查点：输出非检查点格式，跳过落盘 " + String(compactionId).slice(0, 8));
+          return;
+        }
+        // v2.3.7 L2: 硬护栏——超 1000 只从「关键结论」尾部删整条（绝不断句、前两节不碰），埋点攒超纲率数据再定是否上重试轮
+        if (sum.length > 1000) {
+          const kIdx = sum.indexOf("## 关键结论");
+          if (kIdx >= 0) {
+            const head2 = sum.slice(0, kIdx);
+            const kLines = sum.slice(kIdx).split("\n").filter((l) => l.trim() !== "");
+            while (kLines.length > 2 && head2.length + kLines.join("\n").length > 1000) kLines.pop();
+            const kept = (head2 + kLines.join("\n")).trim();
+            monitorEvent("intent", "overshoot " + sum.length + "→" + kept.length + (kept.length > 1000 ? " residual（前两节自身超纲，交注入端 sectionAwareSlice 兜底）" : "（关键结论尾部整条删）"));
+            clog("[dsh-memory] 意图检查点超纲护栏：" + sum.length + " → " + kept.length + " 字");
+            sum = kept;
+          }
+        }
+        const block = "<!-- intent: " + compactionId + " sid:" + sid8 + " -->\n\n## 检查点（目标与下一步，压缩 " + String(compactionId).slice(0, 8) + "）\n\n" + sum.trim() + "\n";
+        fs.mkdirSync(targetFull.slice(0, Math.max(0, targetFull.lastIndexOf("/"))), { recursive: true });
+        fs.writeFileSync(targetFull, block + "\n" + stripOldIntentBlocks(existing, sid8), "utf8");
+        clog("[dsh-memory] 已写入意图检查点 sessions/" + fname + "（intent " + String(compactionId).slice(0, 8) + " sid " + sid8 + "，prepend " + sum.length + " 字符）");
+        try { refreshMemorySessionsIndex(); } catch (e2) {}
+      } catch (e) {
+        cwarn("[dsh-memory] 意图检查点失败:", e && e.message ? e.message : String(e));
+      } finally {
+        INTENT_RUNNING = false;
+        if (INTENT_PENDING.size > 0) {
+          const nxt = INTENT_PENDING.entries().next().value;
+          INTENT_PENDING.delete(nxt[0]);
+          setTimeout(() => { try { spawnIntentCheckpoint(nxt[0], nxt[1].summaryText, nxt[1].fname, nxt[1].parentAgent, nxt[1].sessionId); } catch (e) {} }, 0);
+        }
       }
     }
 
@@ -1934,9 +2169,35 @@ export default {
         d.setDate(now.getDate() - i);
         const fname = dateStr(d) + ".md";
         const text = await readText(MEMORY_ROOT + "/sessions/" + fname);
-        if (text) return { file: fname, text };
+        if (text) {
+          // v2.3.3: 剥离 compaction 原始英文 dump（宿主压缩摘要直写块）——那是给压缩重建看的历史 log，
+          // 与 intent 检查点同源重复、信息密度低，参与注入只会挤占预算挤掉当日真实工作摘要。
+          return { file: fname, text: stripCompactionDumps(text) };
+        }
       }
       return null;
+    }
+
+    // v2.3.3: 剥离 compaction 原始 dump 块（详见 latestSessionSummary）——纯文本变换，供注入/超限检查统一使用
+    function stripCompactionDumps(text) {
+      const lines = String(text || "").split("\n");
+      const out = [];
+      let skip = false;
+      for (const ln of lines) {
+        const isMarker = /^\s*<!-- /.test(ln);
+        const isH1 = /^#\s/.test(ln);
+        // v2.3.5: dump 全文归档后节名不可枚举——块内英文 H2 一律视作 dump 正文，中文 H2/H1/marker 才是边界
+        const isEnH2 = /^##\s*[A-Za-z]/.test(ln);
+        const isOtherH2 = /^##\s/.test(ln) && !isEnH2;
+        if (!skip) {
+          if (/^\s*<!-- compaction: /.test(ln)) { skip = true; continue; }
+          out.push(ln);
+          continue;
+        }
+        // 在 compaction dump 块内：吞普通行 + 英文 H2（v2.3.5 全文归档后节名不可枚举）；遇边界（marker / H1 / 中文 H2）停止吞
+        if (isMarker || isH1 || isOtherH2) { skip = false; out.push(ln); }
+      }
+      return out.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
     }
 
     // v7：UTF-8 字节数（沙箱无 Buffer，用 TextEncoder）
@@ -2423,6 +2684,7 @@ export default {
           agentsBySession.set(agent.session.id, agent);
         }
       }
+      const TOPSESSION = isTopLevelSession(agent);   // v2.3.8 F1: 子代理不吃记忆注入——防 ghost 轮+省 5K tok/次
       (async () => {
         try {
           const injectedParts = [];   // v1.12.19.2: 注入确认合并为单条日志
@@ -2449,7 +2711,7 @@ export default {
             const i = sectionAwareSlice(indexMd, CHAR_LIMIT["index.md"], "index");
             stableParts.push("【记忆索引】\n" + i.text);
           }
-          if (stableParts.length > 0) {
+          if (stableParts.length > 0 && TOPSESSION) {   // v2.3.8 F1: 子代理不吃稳定层注入（防 ghost 轮+省 5K tok/次）
             agent.inject(makeMessage(
               "<system-reminder>\n以下为跨会话持久记忆（dsh-memory 稳定层，自动注入）。按需引用；更具体细节请调用 memory_search 工具。\n" + stableParts.join("\n\n") + "\n</system-reminder>"
             ));
@@ -2460,24 +2722,22 @@ export default {
 
           // 消息B：动态层（最近摘要）
           const latest = await latestSessionSummary();
-          if (latest && latest.text) {
+          if (latest && latest.text && TOPSESSION) {   // v2.3.8 F1: 【上次会话摘要】进子代理曾直接诱发 ghost 轮重写（756123d9 事故）
             // v7：摘要超限预警
             if (utf8Bytes(latest.text) > SIZE_WARN.summary) {
               sizeWarnThrottled(latest.file, "摘要 " + latest.file + " 超限 " + utf8Bytes(latest.text) + "B（阈值 " + SIZE_WARN.summary + "B），建议精简[会话: " + SESSION_LABEL + "]");
             }
-            const sumText = latest.text.slice(0, CHAR_LIMIT.summary);
-            const sumNote = latest.text.length > CHAR_LIMIT.summary
-              ? "\n[注：摘要原文 " + latest.text.length + " 字符，已按注入预算截断；完整内容用 memory_search 查 " + latest.file + "]"
-              : "";
+            // v2.3.7 L3: 裸 slice → 分节感知截断（sectionAwareSlice 自带预算注释）——检查点超纲不再挤爆当日摘要
+            const sumSliced = sectionAwareSlice(latest.text, CHAR_LIMIT.summary, latest.file);
             agent.inject(makeMessage(
-              "<system-reminder>\n【上次会话摘要】（" + latest.file + "，衔接上次的下一步行动）\n" + sumText + sumNote + "\n</system-reminder>"
+              "<system-reminder>\n【上次会话摘要】（" + latest.file + "，衔接上次的下一步行动）\n" + sumSliced.text + "\n</system-reminder>"
             ));
             injectedParts.push("摘要(" + latest.file.slice(0, 40) + ")");
-          } else {
+          } else if (TOPSESSION) {
             cwarn("[dsh-memory] 未找到会话摘要");
           }
           // v1.12.19.2: 注入确认合并为单条（缺失项由上方各自 cwarn 说明）
-          clog("[dsh-memory] 记忆注入" + (injectedParts.length > 0 ? ": " + injectedParts.join("+") : "失败") + "[会话: " + SESSION_LABEL + "]");
+          clog("[dsh-memory] 记忆注入" + (injectedParts.length > 0 ? ": " + injectedParts.join("+") : (TOPSESSION ? "失败" : "（子代理跳过）")) + "[会话: " + SESSION_LABEL + "]");
 
           // 消息C：v9 维护提醒（备份到期 / 轮转到期 / 超限整理，只读检查后注入）
           // v10.3：同实例只对第一个顶层会话注入——避免多个主会话/子代理并发收到整理指令
@@ -2507,6 +2767,7 @@ export default {
         const decision = await next();
         // 判断 A：只在每轮第一条用户消息（step 1）做，命中已知领域才提醒
         if (step !== 1 || !agent || typeof agent.inject !== "function") return decision;
+          if (!isTopLevelSession(agent)) return decision;   // v2.3.8 F1: A 类提醒只发顶层会话——子代理转写不留提醒痕迹，也防诱导轮
         const sid = (agent.session && agent.session.id) || "?";
         // v1.12.15：新用户输入 = 上一任务周期结束——未决跟随窗口结算为 ignored（本周期无显式跟随信号）
         try {
@@ -2700,19 +2961,29 @@ ctx.on("session/event", (session, event) => {
             directWritten = true;
             clog("[dsh-memory] 整合完成（幂等跳过）sessions/" + fname + "，大小 " + fs.statSync(targetFull).size + "B (" + compactionId + ")");
           } else {
+            const archiveBlockBody = smartTrim(text, 16000, "");   // v2.3.5: 归档即全文（≤16000），memory_search 召回把手本体；注入前被 stripCompactionDumps 剥离不占预算
             const beforeLen = nodeFsWriteAppend(
               targetPath,
               "自动检查点（压缩归档）",
-              marker + "\n\n" + text.slice(0, 1500)
+              marker + "\n\n" + archiveBlockBody
             );
             directWritten = true;
-            clog("[dsh-memory] 完成整合 sessions/" + fname + "，大小 " + fs.statSync(targetFull).size + "B（新增摘要 " + text.slice(0, 1500).length + " 字符，追加前 " + beforeLen + " 字符）");
+            clog("[dsh-memory] 完成整合 sessions/" + fname + "，大小 " + fs.statSync(targetFull).size + "B（新增摘要 " + archiveBlockBody.length + " 字符，追加前 " + beforeLen + " 字符）");
             // v1.10.0：直写后刷新 sessions 索引缓存（新摘要立即可见，漏网检测不误判）
             refreshMemorySessionsIndex();
           }
         } catch (e) {
           cwarn("[dsh-memory] node:fs 直写失败，回退提醒制:", e && e.message ? e.message : String(e));
         }
+
+        // v2.3.3：意图检查点——压缩后异步 spawn 轻量子代理提炼「本次目标/下一步行动」，prepend 到今日摘要头部。
+        // 不依赖会话 agent（parent 可空，compactOnce 内部 if(parent) 才挂）：即使会话已结束/归档也照常落盘。
+        // 推迟到 setTimeout(0)，避开 session.append 发布窗口（子代理 spawn 经宿主 subagents 通道，fs 直写需窗口外）。
+        const parentAttempt = agentsBySession.get(session.id);
+        setTimeout(() => {
+          try { spawnIntentCheckpoint(compactionId, text, fname, parentAttempt, session.id); }
+          catch (e) { cerr("[dsh-memory] 意图检查点调度失败:", e && e.message ? e.message : String(e)); }
+        }, 0);
 
         // v9：找到该会话的 agent，注入落盘提醒（仅直写失败时）或刷新提示（直写成功时）
         const agent = agentsBySession.get(session.id);
@@ -2729,7 +3000,7 @@ ctx.on("session/event", (session, event) => {
           "sessions/" + fname + " 的末尾（若文件不存在则创建；已有内容先读全量再追加，禁止局部读+整体覆写）。\n" +
           "写入 ~/.dsh 若被沙箱拒绝，用 write/edit 工具带 sandbox_permissions danger-full-access + justification 升级重试（弹审批，点允许即可）。\n" +
           "小节标题建议：## 自动检查点（压缩归档）\n\n" +
-          text.slice(0, 1500) +
+          smartTrim(text, 1500, "sessions/" + fname + " 归档块") +
           "\n</system-reminder>";
 
         // v10.4：轻量记忆刷新提示——compact 是上下文重置点，记忆注入仍是会话开始快照；
@@ -3288,14 +3559,14 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
           calibStats = "spiralEvents 共 " + se.length + " 条；repRate 中位数=" + medRep + "，negRate 中位数=" + medNeg + "；近 " + tps.length + " 个周期中打转周期占 " + spiralPct + "%；当前生效阈值 rep≥" + curTh.rep + "/neg≥" + curTh.neg + "/sim≥" + curTh.sim + "/窗" + curTh.w + "/冷却" + curTh.cooldownMin + "分";
         }
       } catch (e) { /* 统计失败按数据不足处理 */ }
-      // v2.3.2(dream-incremental): 候选清单注入——读什么由代码决定，不靠模型自觉
+      // v2.3.4(dream-hash): 候选清单注入——内容 hash 比对（账本无记录或内容变更才读；已整合且未变的自跳过）
       const stI = readIntegrateState() || {};
       const candI = listIntegrateCandidates(stI);
-      const scopeText = "## Input Scope（插件已按需算好，本轮只读下列文件）\n" +
+      const scopeText = "## Input Scope（插件已按内容 hash 比对算好，本轮只读下列文件）\n" +
         "- 必读稳定层: global.md, index.md\n" +
-        (candI.sessionCands.length ? "- 候选会话: " + candI.sessionCands.join(", ") + "\n" : "- 候选会话: （无变化——旧会话已在上轮整合过，跳过）\n") +
+        (candI.sessionCands.length ? "- 候选会话: " + candI.sessionCands.join(", ") + "\n" : "- 候选会话: （无变化——已整合且内容未变的自动跳过）\n") +
         (candI.otherCands.length ? "- 其他变动: " + candI.otherCands.join(", ") + "\n" : "") +
-        (candI.fullRound ? "- 本轮=全量轮（每 4 轮 1 次），可重审全部历史会话\n" : "- 本轮=增量轮（上次成功整合后的变动 + 最近 3 天）\n") +
+        "- 本轮=hash 比对增量（只读「账本无记录或内容变更过」的文件；任何文件内容一变即自动回归候选）\n" +
         "- 硬约束: 只 read 上述列出的文件；严禁 glob/read sessions/、projects/、knowledge/ 下未列出的文件；严禁读原始会话日志.\n";
 
       const promptText =
@@ -3400,7 +3671,7 @@ scopeText +
             }
             const st = readIntegrateState() || {};
             st.lastIntegrateAt = Date.now();
-            if (doneOk) { st.lastSuccessAt = Date.now(); st.integrateCount = (st.integrateCount || 0) + 1; }
+            if (doneOk) { st.lastSuccessAt = Date.now(); st.integrateCount = (st.integrateCount || 0) + 1; delete st.lastFailAt; recordDreamedHashes(st); } // v2.3.3: 成功轮必须清除 lastFailAt，否则残留触发 2h 无限重试（每次烧数万 tokens）；v2.3.4: 成功即记全量 hash——下次只读内容变更过的
             else { st.lastFailAt = Date.now(); cwarn("[dsh-memory] 本次整合未通过 memory_dream_patch 落盘任何文件——2 小时后自动重试，请关注 progress.health"); }
             writeIntegrateState(st);
             trackMaintain("integ", u);
@@ -3416,7 +3687,8 @@ scopeText +
               }
               try {
                 const so = await checkSizeOverflow();
-                for (const i9 of so || []) health.push((i9.label || i9.key || "?") + " 整合后仍超限（字节 " + i9.bytes + "/字符 " + i9.chars + "）");
+                // v2.3.3: 只把「硬超字符预算（注入会被截断）」判为整合失败；软字节超是维护信号（中文 3000 字符≈5100B 恒 >4608B 软阈），当失败会永远验收不过
+                for (const i9 of so || []) { if (!i9.truncated) continue; health.push((i9.label || i9.key || "?") + " 整合后仍超限（字符 " + i9.chars + " ≥ 硬预算 " + i9.charLimit + "，注入会截断）"); }
               } catch (e6) {}
               if (health.length) {
                 cwarn("[dsh-memory] 整合验收未过: " + health.join("; ") + "——下次整合优先处理");

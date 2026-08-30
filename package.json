@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory",
-  "version": "2.3.2",
+  "version": "2.4.0",
   "private": false,
   "type": "module",
   "description": "DSH 全局自动记忆插件：会话开始注入记忆、memory_search 检索工具、压缩检查点自动落盘、漏网会话检测、设置界面配置（settings 命名空间 + client 半区）。",
