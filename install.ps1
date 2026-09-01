@@ -211,11 +211,7 @@ if (-not (Test-Path $profileDir)) {
   Write-Host "Set DSH_PROFILE (or pass -ProfileName) to one of them and retry." -ForegroundColor Yellow
   exit 1
 }
-# 3. Create plugin dir, version helpers and download index.js
-$pluginDir = Join-Path (Join-Path $profileDir 'plugins') 'memory'
-New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
-$target = Join-Path $pluginDir 'index.js'
-
+# --- version helper functions (defined before the -CheckOnly gate uses them) ---
 function Download-File($url, $dest) {
   try {
     Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 60
@@ -249,27 +245,9 @@ function Get-RemoteVersion($base) {
   }
 }
 
-# 3.3 Fetch the plugin file (local copy when DSH_MEMORY_LOCAL is set; network otherwise)
-if ($env:DSH_MEMORY_LOCAL) {
-  if (-not (Test-Path -LiteralPath $env:DSH_MEMORY_LOCAL -PathType Leaf)) {
-    Write-Host ("ERROR: DSH_MEMORY_LOCAL is set but is not a readable file: " + $env:DSH_MEMORY_LOCAL) -ForegroundColor Red
-    exit 1
-  }
-  Write-Host ("Copying index.js from " + $env:DSH_MEMORY_LOCAL + " ...")
-  Copy-Item -LiteralPath $env:DSH_MEMORY_LOCAL -Destination $target -Force
-}
-else {
-  Write-Host "Downloading index.js ..."
-  if (-not (Download-File ($RAW_BASE + "/index.js") $target)) {
-    Write-Host "GitHub raw failed, trying jsDelivr CDN ..." -ForegroundColor Yellow
-    if (-not (Download-File "https://cdn.jsdelivr.net/gh/Starry0214/dsh-memory@main/index.js" $target)) {
-      Write-Host "ERROR: failed to download index.js. Check your network / proxy, or pre-copy the file and set DSH_MEMORY_LOCAL to it." -ForegroundColor Red
-      exit 1
-    }
-  }
-}
-Write-Host ("  OK: " + $target) -ForegroundColor Green
 # 3.0 -CheckOnly: 只体检不改动（已装版本 / 远端版本 / 补丁层 / 记忆库状态）
+# [2026-09-01 修复] CheckOnly 必须在「下载/建目录」之前执行——旧版先下载覆盖 index.js 再体检，
+#   会把本地已修复/裁剪的 index.js 覆盖成远端版（实测 2026-09-01 覆盖掉 settle 修复）。
 if ($CheckOnly) {
   $ckPluginDir = Join-Path (Join-Path $profileDir 'plugins') 'memory'
   $ckTarget = Join-Path $ckPluginDir 'index.js'
@@ -313,6 +291,31 @@ if ($CheckOnly) {
   exit 0
 }
 
+# 3. Create plugin dir and download index.js
+$pluginDir = Join-Path (Join-Path $profileDir 'plugins') 'memory'
+New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
+$target = Join-Path $pluginDir 'index.js'
+
+# 3.3 Fetch the plugin file (local copy when DSH_MEMORY_LOCAL is set; network otherwise)
+if ($env:DSH_MEMORY_LOCAL) {
+  if (-not (Test-Path -LiteralPath $env:DSH_MEMORY_LOCAL -PathType Leaf)) {
+    Write-Host ("ERROR: DSH_MEMORY_LOCAL is set but is not a readable file: " + $env:DSH_MEMORY_LOCAL) -ForegroundColor Red
+    exit 1
+  }
+  Write-Host ("Copying index.js from " + $env:DSH_MEMORY_LOCAL + " ...")
+  Copy-Item -LiteralPath $env:DSH_MEMORY_LOCAL -Destination $target -Force
+}
+else {
+  Write-Host "Downloading index.js ..."
+  if (-not (Download-File ($RAW_BASE + "/index.js") $target)) {
+    Write-Host "GitHub raw failed, trying jsDelivr CDN ..." -ForegroundColor Yellow
+    if (-not (Download-File "https://cdn.jsdelivr.net/gh/Starry0214/dsh-memory@main/index.js" $target)) {
+      Write-Host "ERROR: failed to download index.js. Check your network / proxy, or pre-copy the file and set DSH_MEMORY_LOCAL to it." -ForegroundColor Red
+      exit 1
+    }
+  }
+}
+Write-Host ("  OK: " + $target) -ForegroundColor Green
 # 3.5 Seed the memory library (first-run prep; never overwrites user files):
 #     skeleton dirs + the read/write protocol AGENTS.md + empty global/index placeholders.
 $memRoot = Join-Path $DSH_HOME 'memory'
@@ -413,13 +416,55 @@ foreach ($f in @('global.md', 'index.md')) {
 
 # 4. Register the plugin in cordis.patch.yml (shape-aware, idempotent)
 $patchFile = Join-Path $profileDir 'cordis.patch.yml'
+# [2026-09-01 标准对齐] name 用包名 dsh-memory（非路径）——官方显示名标准：
+#   包名 → 插件清单显示 "memory"（moduleShortName 剥 dsh- 前缀）；路径 → 显示 file:// 长路径。
+#   依赖解析：ESM 按入口真实路径向上找 node_modules，勿把源码镜像到 ~/.dsh/plugins/<pkg>（会 ERR_MODULE_NOT_FOUND），
+#   junction profiles/node_modules/dsh-memory 应直指 profiles/<profile>/plugins/memory。
+#   config 给默认值（与插件默认一致）；skip 判定只看 id 行，与旧版路径 name 的注册兼容。
+
+# 4.0 包名加载前置：建 profiles/node_modules/dsh-memory junction → <profile>/plugins/memory。
+#     包名 registration（name: dsh-memory）要求该名可被 ESM 解析；junction 指向带依赖链的真实源码目录。
+#     默认块用包名（官方显示名标准）；junction 建不了时降级为路径块（保证可用性优先）。
 $MEMORY_BLOCK = @(
   '# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---',
   '- insert:',
   '    - id: dsh-memory',
-  '      name: ./plugins/memory/index.js',
-  '      config: {}'
+  '      name: dsh-memory',
+  '      config:',
+  '        staleSessionDays: 5',
+  '        staleAction: remind'
 )
+$nmTarget = Join-Path (Join-Path $DSH_HOME 'profiles') 'node_modules'
+if (Test-Path -LiteralPath $nmTarget) {
+  $nmLink = Join-Path $nmTarget 'dsh-memory'
+  if (Test-Path -LiteralPath $nmLink) {
+    $linkInfo = Get-Item -LiteralPath $nmLink -Force
+    if ($linkInfo.LinkType -eq 'Junction' -and $linkInfo.Target -eq $pluginDir) {
+      Write-Host "  dsh-memory junction already points at $pluginDir (skipped)." -ForegroundColor DarkGray
+    }
+    else {
+      Remove-Item -LiteralPath $nmLink -Recurse -Force
+      New-Item -ItemType Junction -Path $nmLink -Target $pluginDir | Out-Null
+      Write-Host ("  re-pointed dsh-memory junction -> " + $pluginDir) -ForegroundColor Green
+    }
+  }
+  else {
+    New-Item -ItemType Junction -Path $nmLink -Target $pluginDir | Out-Null
+    Write-Host ("  created dsh-memory junction -> " + $pluginDir) -ForegroundColor Green
+  }
+}
+else {
+  Write-Host ("WARNING: " + $nmTarget + " not found - package-name registration will fail to resolve dsh-memory; install will register the path form instead.") -ForegroundColor Red
+  $MEMORY_BLOCK = @(
+    '# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---',
+    '- insert:',
+    '    - id: dsh-memory',
+    '      name: ./plugins/memory/index.js',
+    '      config:',
+    '        staleSessionDays: 5',
+    '        staleAction: remind'
+  )
+}
 
 $merge = Merge-PatchFile -Path $patchFile -Block $MEMORY_BLOCK -IdName 'dsh-memory'
 

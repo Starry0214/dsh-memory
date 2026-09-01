@@ -159,14 +159,50 @@ done
 
 # 4. Register the plugin in cordis.patch.yml (shape-aware, idempotent)
 patch_file="$profile_dir/cordis.patch.yml"
-block_file=$(mktemp)
-cat > "$block_file" <<'BLOCK'
+
+# 4.0 [2026-09-01 标准对齐] 包名加载前置：建 profiles/node_modules/dsh-memory 符号链接 → <profile>/plugins/memory。
+#     包名 registration（name: dsh-memory）要求该名可被 ESM 解析；符号链接指向带依赖链的真实源码目录。
+#     profile 结构形如 ~/.dsh/profiles/{web,headless,...}，node_modules 在 profiles 根级。
+nm_target="$DSH_HOME/profiles/node_modules"
+have_nm="no"
+if [ -d "$nm_target" ]; then
+  have_nm="yes"
+  nm_link="$nm_target/dsh-memory"
+  if [ "$(readlink "$nm_link" 2>/dev/null)" = "$plugin_dir" ]; then
+    echo "  dsh-memory symlink already points at $plugin_dir (skipped)."
+  else
+    rm -rf "$nm_link"
+    ln -s "$plugin_dir" "$nm_link"
+    echo "  created dsh-memory symlink -> $plugin_dir"
+  fi
+fi
+
+# 默认注册块用包名（官方显示名标准）：包名 → 插件清单显示 "memory"（moduleShortName 剥 dsh- 前缀）；
+# 路径 → 显示 file:// 长路径。node_modules 缺失时降级路径块保证可用性。
+if [ "$have_nm" = "yes" ]; then
+  block_file=$(mktemp)
+  cat > "$block_file" <<'BLOCK'
+# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---
+- insert:
+    - id: dsh-memory
+      name: dsh-memory
+      config:
+        staleSessionDays: 5
+        staleAction: remind
+BLOCK
+else
+  echo "WARNING: $nm_target not found - package-name registration will fail to resolve dsh-memory; registering the path form instead."
+  block_file=$(mktemp)
+  cat > "$block_file" <<'BLOCK'
 # --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---
 - insert:
     - id: dsh-memory
       name: ./plugins/memory/index.js
-      config: {}
+      config:
+        staleSessionDays: 5
+        staleAction: remind
 BLOCK
+fi
 
 # Rewrite $1 into $2, dropping column-0 "[]" lines; append the block when $3 is "append".
 apply_merge() {

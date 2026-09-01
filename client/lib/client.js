@@ -6,7 +6,7 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let react = require("react");
-		let runtime_client = require("@deepseek-ai/dsh-client-runtime/client");
+		let runtime_client = require("@deepseek-ai/dsh-client-store");
 
 		// 设置命名空间（与宿主插件 installSettingsSection 注册的一致）
 		const NS = "dsh-memory";
@@ -22,9 +22,6 @@ window.__ModuleLoader__.load({
 					staleCount: 0,
 					monitorEnabled: true,
 					monitorSummary: "",
-					initGuideEnabled: true,
-					updateCheckEnabled: true,
-					onboardSummary: "",
 					revision: -1,
 					status: "loading"
 				}),
@@ -38,9 +35,6 @@ window.__ModuleLoader__.load({
 						if (typeof next.staleCount === "number") d.staleCount = next.staleCount;
 						if (typeof next.monitorEnabled === "boolean") d.monitorEnabled = next.monitorEnabled;
 						if (typeof next.monitorSummary === "string") d.monitorSummary = next.monitorSummary;
-						if (typeof next.initGuideEnabled === "boolean") d.initGuideEnabled = next.initGuideEnabled;
-						if (typeof next.updateCheckEnabled === "boolean") d.updateCheckEnabled = next.updateCheckEnabled;
-						if (typeof next.onboardSummary === "string") d.onboardSummary = next.onboardSummary;
 						d.status = next.status || "ready";
 						d.revision = revision;
 					}
@@ -60,17 +54,13 @@ window.__ModuleLoader__.load({
 
 		// 通用设置 → 记忆（一行一项：每个配置项独立一行，左标签右控件 + 分割线）
 		function MemorySettingsRow(props) {
-			const { useStore, setStaleSessionDays, setStaleAction, setIntegrateEnabled, setIntegrateDays, setMonitorEnabled, setInitGuideEnabled, setUpdateCheckEnabled } = props;
+			const { useStore, setStaleSessionDays, setStaleAction, setIntegrateEnabled, setIntegrateDays } = props;
 			const days = useStore((s) => s.staleSessionDays);
 			const action = useStore((s) => s.staleAction);
 			const integrateEnabled = useStore((s) => s.integrateEnabled);
 			const integrateDays = useStore((s) => s.integrateDays);
 			const staleCount = useStore((s) => s.staleCount);
 			const monitorEnabled = useStore((s) => s.monitorEnabled);
-			const monitorSummary = useStore((s) => s.monitorSummary);
-			const initGuideEnabled = useStore((s) => s.initGuideEnabled);
-			const updateCheckEnabled = useStore((s) => s.updateCheckEnabled);
-			const onboardSummary = useStore((s) => s.onboardSummary);
 			const status = useStore((s) => s.status);
 
 			// 每行：水平 flex + 下方分割线（对齐 DSH 原生行）
@@ -151,50 +141,25 @@ window.__ModuleLoader__.load({
 						react.createElement("span", { style: { fontSize: "13px", color: "var(--dsw-alias-label-tertiary)" } }, "天/次")
 					)
 				),
-				// v2.3.3 行：版本与记忆库状态（只读，宿主 pushOnboardSummary 写入）
-				react.createElement("div", { style: rowStyle },
-					react.createElement("div", { style: { width: "100%" } },
-						react.createElement("div", { style: labelStyle }, "版本与记忆库"),
-						react.createElement("div", { style: { fontSize: "13px", lineHeight: "22px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", overflowWrap: "break-word" } },
-							onboardSummary || "读取中…（说「初始化记忆」可立即开始引导；/memory-update 可立即查新版）"
-						)
-					)
-				),
-				// 行：新装初始化引导开关
-				itemRow("初始化引导",
-					react.createElement("input", {
-						type: "checkbox", checked: !!initGuideEnabled,
-						title: "记忆库未初始化/不完整时，自动在会话里引导模型带你完成初始化（一天最多提一次）。关掉后仍可用 /memory-init 手动开始",
-						style: { width: "16px", height: "16px", cursor: "pointer" },
-						onChange: (e) => setInitGuideEnabled(e.target.checked)
-					})
-				),
-				// 行：检查新版开关
-				itemRow("检查新版",
-					react.createElement("input", {
-						type: "checkbox", checked: !!updateCheckEnabled,
-						title: "每天最多一次向发布源核对 version.txt，有新版本在会话里提示一次；离线/内网失败静默。内网可把 DSH_MEMORY_RAW 指向镜像",
-						style: { width: "16px", height: "16px", cursor: "pointer" },
-						onChange: (e) => setUpdateCheckEnabled(e.target.checked)
-					})
-				),
 				// 行：使用监控开关
 				itemRow("使用监控",
 					react.createElement("input", {
 						type: "checkbox", checked: !!monitorEnabled,
-						title: "记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总；用于使用一段时间后优化",
+						title: "记录提醒/查询/错误事件到 .monitor.json，供统计面板实时展示；用于使用一段时间后优化",
 						style: { width: "16px", height: "16px", cursor: "pointer" },
 						onChange: (e) => setMonitorEnabled(e.target.checked)
 					})
 				),
-				// 行：监控统计（只读汇总）—— 垂直布局（label 在上、内容在下），避免横向 flex 挤压重叠
+				// 行：统计面板入口（v2.4.3 起设置页不再内嵌汇总文本，详情由面板实时展示）
 				react.createElement("div", { style: rowStyle },
-					react.createElement("div", { style: { width: "100%" } },
-						react.createElement("div", { style: labelStyle }, "记忆使用统计"),
-						react.createElement("div", { style: { fontSize: "13px", lineHeight: "22px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "pre-wrap", overflowWrap: "break-word", marginTop: "4px" } },
-							monitorSummary || "暂无统计（使用记忆/触发提醒后更新）"
-						)
-					)
+					react.createElement("div", { style: labelStyle }, "记忆使用统计"),
+					// 同源相对路径=端口/host 变化不失效；插件 webServer 路由注册，降级时点了 404 不报错
+					react.createElement("a", {
+						href: "/dsh-memory/stats",
+						target: "_blank",
+						rel: "noopener noreferrer",
+						style: { fontSize: "13px", color: "var(--dsw-alias-link, #3b82f6)", textDecoration: "underline", cursor: "pointer", whiteSpace: "nowrap" }
+					}, "📊 打开详细统计面板")
 				)
 			);
 		}
@@ -231,9 +196,7 @@ window.__ModuleLoader__.load({
 					setStaleAction: (value) => { if (scope) scope.set("staleAction", value); },
 					setIntegrateEnabled: (value) => { if (scope) scope.set("integrateEnabled", value); },
 					setIntegrateDays: (value) => { if (scope) scope.set("integrateDays", value); },
-					setMonitorEnabled: (value) => { if (scope) scope.set("monitorEnabled", value); },
-					setInitGuideEnabled: (value) => { if (scope) scope.set("initGuideEnabled", value); },
-					setUpdateCheckEnabled: (value) => { if (scope) scope.set("updateCheckEnabled", value); }
+					setMonitorEnabled: (value) => { if (scope) scope.set("monitorEnabled", value); }
 				};
 			};
 

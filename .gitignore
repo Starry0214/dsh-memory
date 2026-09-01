@@ -15,3 +15,6 @@ node_modules/
 # OS
 Thumbs.db
 .DS_Store
+
+# harness gate/boot test artifacts (_ctr-boot-*, _inc-boot-*, _inj-boot-*)
+_*-boot-*.mjs
