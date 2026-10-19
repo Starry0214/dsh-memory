@@ -153,11 +153,21 @@ window.__ModuleLoader__.load({
 				// 行：统计面板入口（v2.4.3 起设置页不再内嵌汇总文本，详情由面板实时展示）
 				react.createElement("div", { style: rowStyle },
 					react.createElement("div", { style: labelStyle }, "记忆使用统计"),
-					// 同源相对路径=端口/host 变化不失效；插件 webServer 路由注册，降级时点了 404 不报错
+					// [logpane 20260930] 桌面端（dsh-app://）里 `<a target="_blank">` 被 Electron 的 setWindowOpenHandler
+					//   拦掉，且页面 fetch /dsh-memory/* 也到不了插件路由（协议处理器只服务 app 文档/资源，实测 HTTP 400）
+					//   ⇒ 桌面端只能由宿主进程拉起系统浏览器，入口是宿主命令 /memory-panel。
+					//   注：本文件（dev 副本）早于线上版本，无 setSaveState，故用 alert 反馈。
 					react.createElement("a", {
 						href: "/dsh-memory/stats",
 						target: "_blank",
 						rel: "noopener noreferrer",
+						onClick: (e) => {
+							try {
+								if (typeof location === "undefined" || location.protocol !== "dsh-app:") return;
+								e.preventDefault();
+								alert("桌面端请发 /memory-panel 打开（宿主调用系统浏览器；dsh-app:// 源访问不到插件路由，实测 400）");
+							} catch (err) { /* 非浏览器环境忽略 */ }
+						},
 						style: { fontSize: "13px", color: "var(--dsw-alias-link, #3b82f6)", textDecoration: "underline", cursor: "pointer", whiteSpace: "nowrap" }
 					}, "📊 打开详细统计面板")
 				)

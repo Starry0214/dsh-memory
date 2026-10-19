@@ -108,7 +108,7 @@ const run = async () => {
   console.log("");
   console.log("场景一：新装用户（空记忆库）");
   const agent = s.ctx.makeAgent("newbie");
-  await s.ctx.handlers["agent/session-start"][0]({ agent });
+  await s.ctx.handlers["agent/created"][0]({ agent });
   await sleep(150);
   const guide = s.ctx.injected.map((i) => JSON.stringify(i.msg)).find((t) => t.includes("首次初始化引导"));
   report("首个会话收到初始化引导", guide ? null : new Error("没注入引导：" + s.ctx.injected.length + " 条消息"));
@@ -116,7 +116,7 @@ const run = async () => {
   report("骨架目录已由插件补齐", ["sessions", "projects", "tools", "knowledge"].every((d) => fs.existsSync(path.join(s.mem, d))) ? null : new Error("目录没建"));
   report("引导节流状态已落盘 .onboard.json", fs.existsSync(path.join(s.mem, ".onboard.json")) ? null : new Error("没写状态文件"));
   const before = s.ctx.injected.length;
-  await s.ctx.handlers["agent/session-start"][0]({ agent: s.ctx.makeAgent("second") });
+  await s.ctx.handlers["agent/created"][0]({ agent: s.ctx.makeAgent("second") });
   await sleep(150);
   report("同一天第二个会话不再重复引导", s.ctx.injected.filter((i) => JSON.stringify(i.msg).includes("首次初始化引导")).length === 1 ? null : new Error("重复提醒了"));
 
@@ -130,7 +130,7 @@ const run = async () => {
   const st2 = JSON.parse(fs.readFileSync(path.join(s.mem, ".onboard.json"), "utf8"));
   report("snooze 已落盘（约 3 小时后到期）", st2.snoozeUntil - Date.now() > 2.5 * 3600000 && st2.snoozeUntil - Date.now() <= 3 * 3600000 ? null : new Error(JSON.stringify(st2)));
   const n0 = s.ctx.injected.filter((i) => JSON.stringify(i.msg).includes("首次初始化引导")).length;
-  await s.ctx.handlers["agent/session-start"][0]({ agent: s.ctx.makeAgent("third") });
+  await s.ctx.handlers["agent/created"][0]({ agent: s.ctx.makeAgent("third") });
   await sleep(150);
   report("暂缓期内新会话不再被打扰", s.ctx.injected.filter((i) => JSON.stringify(i.msg).includes("首次初始化引导")).length === n0 ? null : new Error("snooze 没生效"));
   const initTxt = await t.execute({ action: "init" });
@@ -142,7 +142,7 @@ const run = async () => {
   const r2 = await startPlugin(true);
   const memTxt = await tool(r2.ctx, "memory_onboard").execute({ action: "status" });
   report("status 报 ready", /记忆库：ready/.test(memTxt) ? null : new Error(memTxt));
-  await r2.ctx.handlers["agent/session-start"][0]({ agent: r2.ctx.makeAgent("old") });
+  await r2.ctx.handlers["agent/created"][0]({ agent: r2.ctx.makeAgent("old") });
   await sleep(150);
   report("就绪用户不会被初始化引导打扰", !r2.ctx.injected.some((i) => JSON.stringify(i.msg).includes("首次初始化引导")) ? null : new Error("误报了"));
 
@@ -158,7 +158,7 @@ const run = async () => {
   report("镜像地址走 DSH_MEMORY_RAW（内网可换源）", calls.every((u) => u.startsWith("https://example.invalid/mirror")) ? null : new Error(calls.join(",")));
   report("同时向会话注入一次升级提醒", s.ctx.injected.some((i) => JSON.stringify(i.msg).includes("升级提醒")) ? null : new Error("没注入升级提醒"));
   const nUp = s.ctx.injected.filter((i) => JSON.stringify(i.msg).includes("升级提醒")).length;
-  await s.ctx.handlers["agent/session-start"][0]({ agent: s.ctx.makeAgent("upd2") });
+  await s.ctx.handlers["agent/created"][0]({ agent: s.ctx.makeAgent("upd2") });
   await sleep(150);
   report("同一天不重复提升级（一天一次）", s.ctx.injected.filter((i) => JSON.stringify(i.msg).includes("升级提醒")).length === nUp ? null : new Error("重复提醒"));
   globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => "0.0.1" });
@@ -181,7 +181,7 @@ const run = async () => {
   stObj.update.checkedAt = Date.now();   // 伪装"今天已经查过了"
   fs.writeFileSync(obFile, JSON.stringify(stObj));
   calls = [];
-  await s4.ctx.handlers["agent/session-start"][0]({ agent: s4.ctx.makeAgent("t4") });   // 会话开始会带一次每日检查
+  await s4.ctx.handlers["agent/created"][0]({ agent: s4.ctx.makeAgent("t4") });   // 会话开始会带一次每日检查
   await sleep(150);
   report("当天已查过 → 会话开始不再发版本请求（省流量）", calls.length === 0 ? null : new Error("又发了 " + calls.length + " 次请求"));
   calls = [];

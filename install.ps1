@@ -1,4 +1,4 @@
-﻿# dsh-memory installer for Windows (Windows PowerShell 5.1 and PowerShell 7+)
+# dsh-memory installer for Windows (Windows PowerShell 5.1 and PowerShell 7+)
 #
 # One-line install:
 #   irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex

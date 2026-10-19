@@ -1,3 +1,81 @@
+// v2.8.4（2026-09-18「遥测与账本」修复批次 T1–T5，用户裁决「都搞，搞完发组验收」）：
+//   动因（用户重启后读日志的实测）：新构建**确实加载了**（20:44:11 打出本版独有字符串），但日志里两行"看起来像证据"的东西
+//   都在说谎 ——「就绪 v2.5.6」的版本号是**硬编码旧值**（代码里早已是 v2.8.4），且该行配置值是 **cordis base 默认层**
+//   （5 / remind / integrate=关），而 settings.yaml 真值是 **2 / silent / true**；行为侧硬证据：20:44:13 的自动归档 tick
+//   在账本里留下 `archiveAutoLast.why = "未发起：上次归档发起失败未满 15 分…"` —— 而 `archiveAutoLast` 的**唯一写入者**是
+//   `archiveAutoNote`（调用点全部在 `runStaleSilentTick` 内），且该 why 的前缀「**未发起：**」只在**silent 闸之后**那一行
+//   生成（此前已过"候选非空"与"指纹闸"，并真的调用了 `runStaleArchive`）⇒ 生效值 = silent（若为 not-silent，why 会写成
+//   「非 silent 档或无 zstd」，与此不符）。
+//   ★ 论证链更正（根因席 2026-09-18 复核）：我原先写的是"走到 `runStaleArchive` 内部的 15 分闸 ⇒ 必先过 silent 检查" ——
+//     **顺序说反了**：15 分闸在 `runStaleArchive`（更靠前的行）里，silent 检查在调用方 `runStaleSilentTick`（更靠后的行），
+//     而 `runStaleArchive` 有 ≥4 个调用方 ⇒ **非 silent 档同样能撞上那条 15 分闸**，单凭它推不出 silent。上面按"写入者 + 前缀
+//     生成点"的链条才是唯一路径（且对"该键后来又被写过一次"免疫）。
+//   即：横幅把"自动归档 + 自动消号 = 开着"报成了"只提醒"（方向最危险的那种错，用户据此会以为没有任何自动写入）。
+//   ① T1 构建指纹：加载时自读本文件（fileURLToPath + sha256 前 8 位 + 字节数）打进就绪行 ⇒「哪份字节生效」可当场核验；
+//      `PLUGIN_VERSION` 2.5.6→2.8.4，与 package.json / version.txt 三处对齐（旧注释自称"四处对齐"，实际长期未 bump）。
+//   ② T2 生效配置行：`cfgEffectiveLine()` 在 settings 层真身就位处再报一行并标"以本行为准"；横幅标注"本行 = 默认层"。
+//   ③ T3 跳过理由落盘：`summarizeArchiveWitness` 增 `skipReasons`（旧实现只记字数 ⇒「有内容却声明跳过」事后无法审计），
+//      读者行（心跳 / 启动自检）显示前 2 条理由；旧账本无该字段时**如实说"未记"**，不伪造。
+//   ④ T4 外部补账不被洗：`writeIntegrateState` 的磁盘并集补 `overLimitStuck` / `overLimitHint`（该键"未被 state 携带"时取磁盘值）
+//      —— 实测 2026-09-18 16:46:24 一次性下沉脚本写入的账本在其后的插件写之后消失；若 B 的"连续 N 轮"计数被洗，
+//      自动下沉就永远攒不够 2 轮 ⇒ 形同虚设。
+//   ⑤ T5 白轮退避按**指纹作用域**：退避判定从"纯时间闸"改为"针对同一份候选集"（`untilFp`），且 whiteRun **也**记指纹
+//      —— 修掉两处「注释与代码不符」：设计注释自称"整轮无消息流 ⇒ 候选集不变 ⇒ 不再重复起火"，但旧代码只在 `r.ok` 时记指纹；
+//      并修掉实测危害：两个**每轮都判"整轮无消息流"的僵尸候选**（红队复核更正：它们**不是**"1 字节日志" —— 全库 `*.zstd`
+//      最小 5322 B；我早先把 `sessions/<项目>/session-<id>` 这类**目录项**在 PowerShell 里的空长度误读成"1 字节文件"。
+//      实况 = `session-574b8af7…` 目录下 `session.jsonl.zstd` 8263 B、水位 frames=3747（来自 v3 半段），属"劈开会话"残留）
+//      每轮触发全局 24h 退避，把**新会话**的自动归档一起压住。
+//      「不消号 / 宁重试不静默丢」（P0-1）语义不变 —— 新候选到达即放行，僵尸候选仍每轮重试。
+//   验证：node --check 0；新增门 _test-t1t2-telemetry.mjs / _test-t3-skip-reason.mjs / _test-t4-ledger-keep.mjs /
+//      _test-t5-white-scope.mjs；每门含 [鉴别] 条目且在旧字节上必须全红（`--baseline` 自断言）。
+// v2.6.6（2026-09-16 归档并发真闸门 + 手动 dream 撞车兜底，用户拍板）：
+//   ① 并发真闸门：ARCHIVE_MAX_CONCURRENT 2→5，语义从「发起协程数」修正为「**在跑子代理数**」。
+//      旧实现只在发起循环里限制协程数，而 startOneBatch 秒级返回（不等在跑）→ 协程瞬间把全部批发起
+//      （实测 2026-09-16 17:06:19：7 批在**同一秒**全部创建，"并发上限"形同虚设、token 一次性放大）。
+//      新实现两段式不变：首批只发起 N 批（保住 r.ok 与节流戳立即落盘）→ 其余进等待队列 →
+//      settle 内每完成一批补发起下一批（runner 链），在跑数恒 ≤ N；发起失败只记 startErrs、不卡队列。
+//   ② 手动 /dream 撞车兜底：会话启动时的 silent 自动归档与手动 /dream 常同刻相撞，旧行为被防重入拒后
+//      直接 spawnIntegrate → 归档与整合并行、「先归档后整合」静默失效（实证 17:06:17→19）。
+//      新增 STALE_ACTIVE_DONE 句柄（发起成功即暴露、settle finally 复位）；撞车时等其结算 → 重扫剩余 → 补一轮。
+//   ③ 等待放宽：新增 DREAM_ARCHIVE_WAIT_MS = 45 分钟（原两处硬编码 25 分钟）——并发闸生效后队列清空更慢。
+//   验证：node --check 0；加载门 _gate-plugin-load.mjs 25/0（新增 7 条 v2.6.6 断言；对 v2.6.5 运行处副本 FAIL 7，
+//     鉴别仪式成立）；回归门 _test-sessionlog-path 19 / _test-fmt-selftest 11 / _test-project-boot 23 /
+//     _test-docstatus 8 / _test-pointer-closure 31 / smoke 30 / onboard 31 / patch-merge 11 全绿。
+//     注：并发峰值需下轮 /dream 真机日志实证（「归档并发闸：首批 5/N 批」+ 子代理创建时间错开）。
+//   未 bump（沿用 2.4.24 发布惯例）。
+// v2.6.5（2026-09-16 会话日志改名致漏网检测静默失效根治 + 格式漂移自检 + 手动 dream 口径，用户拍板）：
+//   事故：DSH 自 2026-09-10 20:10 起把会话日志改名 session.jsonl.zstd → session.v3.jsonl.zstd（zstd 多帧格式不变）。
+//     插件 6 处读日志点硬编码旧名 → statSync 失败即 continue：漏网检测 / 水位帧数 / used 判定 / 归档提取 /
+//     消耗统计对该类会话全链静默失效且零报错。实测 283 个 v3 会话从未进入候选、归档账本停在 09-10、
+//     积压 63 个未落档会话（09-10~09-16，含 09-16 当天 19 个）——与 v2.6.3 的 agent/session-start→agent/created 事故同型。
+//   ① 自适配：新增 `resolveSessionLogPaths(dir)`（v2.8.4/P21 起为**复数**：返回同目录**全部**日志，
+//     按**时间顺序** `[legacy, v3]`），5 处调用点统一走它（findStaleSessions 扫描 / archivePendingEntry 水位 /
+//     resolveInjectUsedOnce 的 used / 归档提取 / summarizeSubagentUsage 消耗统计）；归档提取遇空数组明确记「无流跳过」不白提一轮。
+//     （v2.6.5 的单数版只返回**优先级最高的一个文件**，双名目录里整类看不见另一个 —— 见 P21 段注释。）
+//   ② 自检（防再次静默）：扫描时顺带 probeUnknownLogNames 采集未识别的 *.jsonl.zstd 名 → 维护提醒 parts 注入
+//     对话一次（按名去重，持久化 .integrate.json fmtNotified）——DSH 再改名时当场可见，不再 6 天后才发现。
+//   ③ 手动 dream 口径（用户拍板）：手动 /dream 不吃 settings.staleSessionDays，改固定活跃下限
+//     MANUAL_STALE_MIN_IDLE_MS = 30 分钟（诉求：阈值 1 天但会话 12 小时就结束时，手动触发就该收走它；
+//     保留下限是为不把仍在写入的半截会话当完整会话归档）。自动定时整合与 stale_archive 工具仍按 settings；note 带口径。
+//   验证：node --check 0；新增 _test-sessionlog-path.mjs（v3 优先 / legacy 回退 / 未知名 null+采集 / 提示去重账本 /
+//     手动口径常量与调用点）；回归门 _gate-plugin-load.mjs / _test-project-boot.mjs / _test-docstatus.mjs /
+//     _test-pointer-closure.mjs / test/*.mjs + patch-merge.tests.ps1 全绿。未 bump（沿用 2.4.24 发布惯例）。
+// v2.6.4（2026-09-15 dream 悬空指针根治，用户拍板「按修正版实施」）：诊断见桌面《dsh-memory-dream悬空指针-根因诊断与约束方案.md》。
+//   ① L1 写时闭合校验（applyPatches）：本批新增库内指针必须同批建目标或指向已存在文件，否则整批拒写（+ allowDangling 逃生 + 描述性豁免）；
+//   ② L3 settle 反向核对（scanDanglingPointers）：本轮写入的悬空指针进 health（阻塞），存量只进 progress.dangling 非阻塞提示；
+//   ③ L0 任务书去矛盾：删掉「先写指针行续期」诱导，补「放弃不得留悬空指针」；
+//   ④ 顺带修既有缺陷：health 转播此前因 DREAM_LISTENER 提前置 null 而从未送达 → 改用 settleListener 落 notice。
+//   共用判据（MEM_PTR_RE / memPointerHits / scanDanglingPointers）在模块层，正则对现库 120 个 md 实测选型。
+//   测试 _test-pointer-closure.mjs 31 断言（含真 settle 驱动 J/K）+ 既有门全绿；未 bump（沿用 2.4.24 发布惯例）。
+// v2.6.2（2026-09-14 工作空间自动建档，用户拍板）：顶层会话 cwd 未命中任何项目记忆 → 自动补建——
+//   ① projects/<目录名>.md 缺失写最小骨架（标题+五标准节，dream/归档/「## 归档」锚点直接兼容）；
+//   ② _index.json 登记 cwd/root（同名条目已存在只补登记不覆盖文件；改名条目 file≠目录名时登记进原条目防双条目打架）；
+//   ③ 种 ~dsh/project.json 标记 → 下轮起 matchProjectByCwd 正常命中注入；本轮摘要分格/项目切片即刻按新项目生效。
+//   护栏：isDeepEnoughRoot（≥4 段）+ ONE_DRIVE_CONFLICT_RE + `_` 前缀目录名跳过；已命中或标记已存在不动作；
+//   注入一行建档提示（用户选「注入提示条」）。子代理跳过（TOPSESSION 闸）。
+//   挂点在 injectMode 三档分支**之前**（首部署 2026-09-15 实证缺陷：old 位置在 full 分支内，续会话 notice/silent 档永不建档，
+//   已移正 + 先建档再算 hP 防快照下发假「项目有更新」）；测试 _test-project-boot.mjs 23 断言（S7 覆盖该缺陷回归点）。
+//   未 bump（沿用 2.4.24 发布惯例，发布动作留给用户）。
 // v2.4.31（2026-09-07 合并维护「字数打转」根治，用户拍板）：真机 2026-09-07 16:51 maint-slim 精简轮 15 分钟
 // 硬停 abort（LLM 数不清混合中文字符，被逼「精确 ≤1100/1320」→ 来回数 → 空转烧 token）。根因=三处提示词把
 // 「精确字数达标」责任推给模型且无「禁止数数」安抚（对照意图检查点 L4044 早已有 v2.4.28 同款口径）；且输入
@@ -156,7 +234,7 @@
 //  - 后果：压缩检查点提醒 + 记忆刷新提示注入失败（archivedCompactionIds 已标记，摘要不重试 → 永久丢失）。
 //  - 修复：处理器同步段只做只读校验/组装，所有 agent.inject 推迟到 setTimeout(0)（发布窗口之外）执行。
 // v10.4 新增：compact 后轻量记忆刷新提示
-//  - compact 是上下文重置点，但记忆注入仍是会话开始快照（agent/session-start 只触发一次，compact 不重发）。
+//  - compact 是上下文重置点，但记忆注入仍是会话开始快照（会话开始事件一次性注入，compact 不重发）。
 //  - compact 时追加一条轻提示：记忆可能已更新 → 用 memory_search 实时读盘；写入前先读全量避免覆盖他会话改动。
 //  - 不做全量重注入：文件多数时候没变，全量重注入浪费 token 且破坏前缀缓存；轻提示成本≈0。
 // v10.3 新增：多主会话去重 + 子代理精确判定
@@ -202,12 +280,24 @@
 //  - Windows/Unix 通用：homedir() 跨平台；路径统一正斜杠（ctx.fs 可解析）
 import { homedir } from "node:os";
 import path from "node:path";
+// v2.8.4（T1）：构建指纹要自读本文件 ⇒ 必须用 `fileURLToPath` 把 `import.meta.url` 转成本地路径。
+//   本机插件路径含 CJK（`E:\工具\插件开发调整\…`），`new URL(import.meta.url).pathname` 是**百分号编码**的
+//   ⇒ readFileSync 直接 ERR_MODULE_NOT_FOUND（同类坑本会话已实测一次）。
+import { fileURLToPath } from "node:url";
 // v1.2.0：node:fs 直写压缩检查点（宿主插件真实 Node 环境，绕过 ctx.fs 沙箱，无需审批）
 import fs from "node:fs";
 // v2.3.4：内容 hash 账本（dream 整合候选判定）——sha256 比对替代 mtime/全量轮
 import { createHash } from "node:crypto";
 // v1.8.0：node:zlib 原生 zstd 解压（Node 22.17+/23.3+）——漏网归档改为「提取会话 compaction 摘要」，子代理不读原始大日志
 import zlib from "node:zlib";
+// v2.8.4（P26）：会话原文检索工具要**复用** `~/.dsh/tools/session-search/session-search.mjs` 这一份实现
+//   （不复制逻辑）⇒ 以子进程方式调用它。
+// v3.1.0（索引自动刷新）：自动路径**必须**用异步 `execFile` —— `execFileSync` 会同步冻结整个宿主
+//   event loop（Web GUI / 其他会话 / 定时器一起停）；本机实测全库增量 3~9s、冷建最坏 115.2s，
+//   哪怕 3s 也不该压在宿主上。既有工具路径继续用 execFileSync（超时/语义逐字不变）。
+import { execFileSync, execFile } from "node:child_process";
+// v3.1.1：/memory-panel 探活用——拉起浏览器前先 HTTP GET 面板路由，避免"浏览器打开了但页面 404/连不上"的假成功。
+import http from "node:http";
 // v2.0.9(M3): zstd 能力守卫——Node<22.17 无 zlib.zstdDecompressSync，消息流提取必失败，
 // silent 模式会走 skippedNoFlow 照常消号=批量静默丢失；探测失败则 silent 强制降级 remind（只提醒不消号）。
 const ZSTD_OK = typeof zlib.zstdDecompressSync === "function";
@@ -218,6 +308,118 @@ const ZSTD_OK = typeof zlib.zstdDecompressSync === "function";
 //   settingsNamespace/installSettingsSection 均为源码包符号，npm-build 无此命名导出 → 工作副本 127 行原 import 加载即崩
 //   （门 2026-08-31 实证：工作副本 9 FAIL / 运行处 62 PASS）。register 的 namespace 本就是字符串，直传 "dsh-memory"。
 import z from "@deepseek-ai/schemastery";
+
+// ═══ §9.12④（用户「都搞」）：**有界重试读取器**（模块级 ⇒ 门可直测重试策略本身，不必造真子代理）═══
+//   `readFn` 返回 null/假值 或 `isDone(v)===false` 时按 `gapMs` 间隔重试，至多 `attempts` 次；
+//   返回 `{ value, tries }`（`tries` 是真实尝试次数 ⇒ 调用方把它记进账本，供"到底读了几次"事后核对）。
+async function retryReadUsage(readFn, opts) {
+  const o = opts || {};
+  const attempts = Math.max(1, Number(o.attempts) || 4);
+  const gapMs = Math.max(0, Number(o.gapMs) || 0);
+  const isDone = typeof o.isDone === "function" ? o.isDone : ((v) => !!(v && ((v.totalIn || 0) > 0 || (v.output || 0) > 0 || (v.reasoning || 0) > 0)));
+  const sleep = typeof o.sleep === "function" ? o.sleep : ((ms) => new Promise((r) => setTimeout(r, ms)));
+  let value = null, tries = 0;
+  for (let i = 0; i < attempts; i++) {
+    tries = i + 1;
+    try { value = await readFn(tries); } catch (e) { value = null; }
+    if (isDone(value)) break;
+    if (i < attempts - 1) await sleep(gapMs);
+  }
+  return { value: value, tries: tries, ok: isDone(value) };   // ★ B2：把"最终值是否合格"的结论带出去（旧实现只用于 break，调用方只能靠 !value 区分）
+}
+export { retryReadUsage };
+
+// ═══ §9.12③（用户「都搞」）：**`literals[]` 独立通道** ═══
+// 为什么：用户诉求的核心是"精确字面量能查到来源"（GUID/URL/路径/文号/命令/参数），而实测**GUID 召回最差**（5.5%）——
+//   因为要点（`points`）是**概括句**，字面量在概括里会被自然丢掉。通道设计（三条约束，评审时先看）：
+//   ① **非注入层**：写到 `knowledge/字面量.md`（**首版我落在记忆库根目录** —— 评审指出根目录**不在 `memory_search` 的候选扫描面**里，
+//      "天然可检索"那句话当时是错的；改到 `knowledge/` 后由目录扫描自动进候选集）。它**不进** global/index/摘要那三层 ⇒ 不占注入预算（用户口径：现有 md 文档基本不动）；
+//   ② **幂等**：按"字面量 + 会话"去重追加，同一轮/跨轮重复提交不会写两遍；
+//   ③ **可检索**：它是 `knowledge/` 下的 `.md` ⇒ `memory_search` 的目录扫描覆盖它（不需要新工具、也**不靠**加白名单特例）。
+// §9.12③ 的字面量通道实现在下方（`LITERALS_FILE` 依赖 `MEMORY_ROOT`，必须放在它之后 —— 模块级 TDZ 会当场炸）
+function sanitizeLiterals(arr) {
+  const out = [];
+  for (const raw of (Array.isArray(arr) ? arr : [])) {
+    const s = String(raw === null || raw === undefined ? "" : raw).replace(/[\r\n]+/g, " ").trim();
+    if (!s) continue;
+    if (s.length > LITERALS_MAX_CHARS) continue;              // 过长 ⇒ 静默丢（不是字面量，多半是被塞了一整段正文）
+    if (s.indexOf("|") >= 0) continue;                        // 结构字符（表格/管道）会破坏 md 行结构
+    // 评审整改（红队 R-4）：① ` ← ` 是**来源段的分隔符** ⇒ 字面量里出现它就能**伪造一条来源**（`X ← fake（2026-01-01）`）；
+    //   ② ` 反引号/尖括号 ` 会在 md 里改变渲染（代码段/HTML）。
+    if (s.indexOf("←") >= 0) continue;
+    if (/[`<>]/.test(s)) continue;
+    if (out.indexOf(s) >= 0) continue;                        // 同一块里去重
+    out.push(s);
+    if (out.length >= LITERALS_MAX_PER_SESSION) break;
+  }
+  return out;
+}
+function writeLiteralsIdempotent(root, entries, opts) {
+  const o = opts || {};
+  const fsz = o.fs || fs;
+  const file = portable(String(root || MEMORY_ROOT)) + "/knowledge/字面量.md";
+  const list = Array.isArray(entries) ? entries : [];
+  if (!list.length) return { ok: true, wrote: 0, existed: 0 };
+  let old = ""; try { old = fsz.readFileSync(file, "utf8"); } catch (e) { old = ""; }
+  const lines = [];
+  for (const e of list) {
+    const lit = sanitizeLiterals([e && e.literal])[0];
+    if (!lit) continue;
+    const sid = unitSid(e && e.sid);
+    const day = String((e && e.date) || "").slice(0, 10);
+    if (old.indexOf("← " + sid + "（") >= 0 && old.indexOf("- " + lit + " ← " + sid) >= 0) continue;   // 幂等：同字面量+同会话已存在
+    lines.push("- " + lit + " ← " + sid + (day ? "（" + day + "）" : ""));
+  }
+  if (!lines.length) return { ok: true, wrote: 0, existed: list.length };
+  const header = old ? "" : "# 精确字面量索引（dsh-memory §9.12③）\n\n"
+    + "> 一行一条：`- <字面量> ← <会话短id>（日期）`。**不进注入层**（不占前缀缓存），供 `memory_search` 检索精确串。\n\n";
+  const next = (old ? old.replace(/\s+$/, "") + "\n" : header) + lines.join("\n") + "\n";
+  try {
+    fsz.mkdirSync(portable(String(root || MEMORY_ROOT)) + "/knowledge", { recursive: true });
+    // ★ 评审整改（工程席 / 红队）：原来是裸 `writeFileSync` —— 而 `literals.md` 是这些字面量的**唯一副本**
+    //   （见证里只留 points，不留字面量）⇒ 崩在中途即截断且无处重建。改用仓内既有的 tmp+rename 原子写。
+    writeFileAtomic(file, next, { tag: "literals" });
+    // ★★ §9.11.4-13：**全局上限 / 轮转**（在写盘之后做，且**失败不影响已落盘的写入**）。
+    //   顺序刻意如此：**先保证"新字面量已落盘"**，再做轮转 —— 轮转只是"搬家"，
+    //   绝不能因为它出错而丢掉刚刚写进去的内容（本批反复的纪律：宁可少做一步，不可丢数据）。
+    let rotated = null;
+    try { rotated = rotateLiteralsIfNeeded(fsz, portable(String(root || MEMORY_ROOT))); } catch (e) { rotated = null; }
+    return { ok: true, wrote: lines.length, existed: list.length - lines.length, rotated: rotated };
+  } catch (e) { return { ok: false, why: "write-failed:" + (e && e.message), wrote: 0, existed: 0 }; }
+}
+// ★★ §9.11.4-13：字面量**分片轮转**（纯函数式判定 + 文件级搬迁；**不删任何条目**）。
+//   触发：`knowledge/字面量.md` 的条目数 ≥ `LITERALS_ROTATE_AT`。
+//   动作：把**整个当前分片**改名为 `知识库/字面量-<YYYYMMDD-HHmmss>.md`，并让主文件从空开始。
+//   安全性要点（逐条）：
+//     ① **用重命名而非"复制+清空"** ⇒ 不存在"复制成功、清空失败 ⇒ 两份都缺"的中间态（原子性来自 fs.rename）。
+//     ② 目标名带时间戳 + **存在即不覆盖**（`while (exists) n++`）⇒ 绝不覆盖既有分片。
+//     ③ 归档分片**留在 `knowledge/`** ⇒ 目录扫描自动把它收进 `memory_search` 候选（**仍可检索**，见常量处注释）。
+//     ④ **不删任何条目**（`LITERALS_ARCHIVE_KEEP = 0`）：这些字面量是唯一副本（见证只留 points）。
+//     ⑤ 轮转失败 ⇒ 返回 null 并**保持原样**（调用方已把新内容写进主文件 ⇒ 最坏是"这次没搬"）。
+function rotateLiteralsIfNeeded(fsz, rootAbs) {
+  const dir = rootAbs + "/knowledge";
+  const main = dir + "/字面量.md";
+  let cur = "";
+  try { cur = fsz.readFileSync(main, "utf8"); } catch (e) { return null; }
+  const n = (cur.match(/^- /gm) || []).length;
+  if (n < LITERALS_ROTATE_AT) return null;
+  // 目标分片名（时间戳；冲突则加序号 —— 绝不覆盖）
+  const d = new Date();
+  const pad = (x) => String(x).padStart(2, "0");
+  const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + "-" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+  let arc = dir + "/字面量-" + stamp + ".md", k = 0;
+  while (fsz.existsSync(arc)) { k++; arc = dir + "/字面量-" + stamp + "-" + k + ".md"; }
+  try {
+    fsz.renameSync(main, arc);                    // ① 原子搬迁（原文件消失了 = 已归档）
+  } catch (e) { return null; }                    // ⑤ 失败 ⇒ 原样保留
+  // ② 主文件重建为新分片（带头部说明），**不写任何旧条目**（它们已在归档分片里）
+  const head = "# 精确字面量索引（dsh-memory §9.12③）\n\n"
+    + "> 一行一条：`- <字面量> ← <会话短id>（日期）`。**不进注入层**（不占前缀缓存），供 `memory_search` 检索精确串。\n"
+    + "> 本文件是**当前分片**；旧分片见同目录 `字面量-<时间戳>.md`（同样可被 `memory_search` 检索）。\n\n";
+  try { writeFileAtomic(main, head, { tag: "literals-rotate" }); } catch (e) { return { arc: arc.split("/").pop(), entries: n, recreated: false }; }
+  return { arc: arc.split("/").pop(), entries: n, recreated: true };
+}
+export { sanitizeLiterals, writeLiteralsIdempotent, rotateLiteralsIfNeeded, LITERALS_FILE };
 
 function portable(p) { return String(p).replace(/\\/g, "/"); }
 
@@ -230,7 +432,7 @@ function resolveMemoryPath(rel, opts) {
   const errors = [];
   const o = opts || {};
   const scopes = Array.isArray(o.scopes) ? o.scopes : ["sessions", "projects", "knowledge", "tools"];
-  const rootFiles = Array.isArray(o.rootFiles) ? o.rootFiles : ["global.md", "index.md"];
+  const rootFiles = Array.isArray(o.rootFiles) ? o.rootFiles : ROOT_FILES;   // v2.6.8：默认根文件走单源常量（v2.7.0 起不再含耐久层）
   let r = String(rel || "").replace(/\\/g, "/").trim();
   r = r.replace(/^~\/(\.dsh\/)?memory\//, "").replace(/^\.\//, "").trim();
   if (!r) { errors.push("file 为空"); return { ok: false, errors }; }
@@ -282,6 +484,29 @@ function assertMemoryWrite(rel, content, opts) {
 
 const DSH_HOME = portable(process.env.DSH_HOME || path.join(homedir(), ".dsh"));
 const MEMORY_ROOT = portable(process.env.DSH_MEMORY_ROOT || path.join(DSH_HOME, "memory"));
+// ★ §9.12③：`LITERALS_FILE` 必须定义在这里（`MEMORY_ROOT` 之后）—— 放在文件更靠前的位置会命中模块级 TDZ，加载即炸。
+// ★ §9.12③（评审整改 · 提案人席）：字面量落点从**记忆库根目录**改到 **`knowledge/字面量.md`**。三条理由：
+//   ① `loadKnowledgeTargets()` 对 `knowledge/` 是**目录扫描**（`listMdNames("knowledge")`）⇒ 新文件**自动**进
+//      `memory_search` 候选集，不需要再往白名单里加特例；而根目录文件必须**逐个显式登记**（L7565 那个
+//      `fixed.md` 就是先例：v2.7.0 从候选集里删掉后，它既不被注入、也搜不到 ⇒ 静默失效）。
+//   ② 目录扫描顺带给 label（搜索结果里可读）；③ 将来要按月/按主题轮转，新文件同样自动入候选集。
+//   ★ 另：**不要**给它加 `MEMORY-` 前缀 —— `knowledge/MEMORY-<x>-<y>.md` 会被"提取一致性"健康检查
+//     按 `projects/<x>.md` 反查指针，从而误报「无指针」。
+const LITERALS_FILE = MEMORY_ROOT + "/knowledge/字面量.md";
+const LITERALS_MAX_PER_SESSION = 20, LITERALS_MAX_CHARS = 200;
+// ★★ §9.11.4-13（**队列末项：字面量通道的全局上限 / 轮转**）。
+//   【为什么需要】该文件**只增不减**（幂等追加，无删除路径）：现场实测 281 条 / 19327 B，
+//     按当前增速约数月后到 MB 级 ⇒ `memory_search` 每次要读它、注入候选也变重，而**旧条目价值随时间衰减**。
+//   【为什么按"会话数"而不是"字节数"轮转】口径要**可预测、可测试**：字节数受字面量长度影响（1~200 字不等），
+//     同一条数在不同数据下触发时机差异大；而"每个会话贡献 ≤ 20 条"是既有硬约束 ⇒ 按条目数最稳。
+//   【轮转去向 —— 这是关键设计点】**必须留在 `knowledge/` 里**（不是删、不是移出扫描面）：
+//     该目录是**目录扫描**进候选集（`listMdNames("knowledge")`）⇒ 轮转出的文件**自动仍可检索**
+//     （同 L450 早已写下的设计："将来要按月/按主题轮转，新文件同样自动入候选集"）。
+//     ⇒ 轮转 = **分片**，不是丢弃：老字面量照样能被 `memory_search` 搜到，只是不再占"当前分片"。
+//   【不引入 `MEMORY-` 前缀】同 L451 的理由：`knowledge/MEMORY-<x>-<y>.md` 会被"提取一致性"健康检查
+//     按 `projects/<x>.md` 反查指针 ⇒ 误报「无指针」。
+const LITERALS_ROTATE_AT = 500;            // 当前分片超过这个条目数 ⇒ 轮转（现场 281，留约 1 倍余量）
+const LITERALS_ARCHIVE_KEEP = 0;           // 归档分片不清理（**它们是唯一副本**；要清理须人工判定）
 const PLUGIN_NAME = "dsh-memory";
 // v8：知识库根目录（index.md 索引指向的 21 个主题文件）
 // v10：知识库迁入 MEMORY_ROOT/knowledge/（自包含，备份完整；与 mimocode 解耦）
@@ -295,9 +520,226 @@ const PS_MEMORY = MEMORY_ROOT.replace(/\//g, "\\");
 const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 
 // v2.3.0：插件版本号——与仓库 package.json / version.txt 同步；升级检查以此比对远端版本
-const PLUGIN_VERSION = "2.5.4";   // v2.5.4：/dream 卡顿+「无参数」残留修复——(A) 去 input.hint 走 bare 即时清空；(B) runDreamPipeline 后台化（同步段仅互斥+占位，归档→整合 fire-and-forget，「已发起」经 notice 落表）；(C) findStaleSessions 60s TTL 缓存+dream force 重扫（cutoff 入键）（四处对齐 index.js/package.json/version.txt/docs/CHANGELOG.md）；发版时与线上 version.txt 同步防 compareVersions 误报可升级
+// v3.0.0（2026-09-20 用户拍板「定版收尾，定为 3.0」）：本批（§9.11.4 系列）整改后**定版**。
+//   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
+//   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
+//   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
+const PLUGIN_VERSION = "3.2.0";
+// v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
+//   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
+//   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
+const SELF_FP = (() => {
+  try {
+    const self = fs.readFileSync(fileURLToPath(import.meta.url));
+    return self.length + "B/" + createHash("sha256").update(self).digest("hex").slice(0, 8).toUpperCase();
+  } catch (e) { return "?(自读失败)"; }
+  // v2.8.4（T1·评审整改 工程席④/红队 R-6）：不要只写 "?"（用户会读成占位符/加载失败）。
+  //   注意此处**不能** clog/cwarn —— SELF_FP 在模块加载期求值，而 clog/cwarn 是更靠后的模块级 const ⇒ TDZ 会让它变成加载期 ReferenceError。
+  //   另注：指纹只回答"**被 import 的是哪份字节**"，**不等于**"三 profile 一致"（历史结论：三者经 junction 指向同一目录）。
+})();
+// ═══════════ v2.8.4（评审整改 · 根因席 A/B）：**单元 sid 宽度的唯一所有者** ═══════════
+// 为什么必须有它：R-5 的根因就是"宽度**没有所有者**、各处各写自己那一份" —— CLI 侧 4 处（12/8/8/8）、
+//   插件写方 6+ 处（12）、读方 2 处（8）⇒ 于是"检索那处漏改归一"这种事**必然**会发生（红队实测：12 位短 id 全 0 命中）。
+// ⇒ 现在：**产物由谁创建，宽度就由谁持有**。单元文件名与全部 sid 派生键都走下面这两个函数；
+//   CLI 侧的 `normSidLong`（12）是**镜像值** ⇒ 由 `_gate-freeze-sync.mjs` 的 GR23 断言两边相等（不再靠注释自律）。
+//   ★ 附带禁令（同一道门会查）：index.js 里**不得**再出现裸的 `slice(0, 12)` 作用于 sid（只许数组/无关字符串，见门里的允许清单）。
+const UNIT_SID_LEN = 12;
+const unitSid = (id) => String(id || "").replace(/^session-/, "").slice(0, UNIT_SID_LEN);
+// 仅用于**打印**：日志行显示 `session-xxxxxxxx` 那种带前缀短形（与 unitSid 的键口径不同，故单独一个函数、单独的名字）
+const sidLabel = (id) => String(id || "").slice(0, UNIT_SID_LEN);
+// v2.8.4（T4·**外部补账并账**）：`~/.dsh/memory/.integrate.json` 是**多写者**文件 —— 插件进程写它，外部工具也写它
+//   （如一次性下沉脚本 `_apply-sink-stuck.mjs` 记 `overLimitStuck`）。插件的内存态可能是在外部写**之前**读的
+//   ⇒ 整对象写回就会把外部刚写的键抹掉。既有 v2.0.9(M1) 已为 `archivedSessions`/`archiveWatermarks`/`staleNotified`
+//   建了同样的并集保障；本函数把**同类保障**抽成**可门直测的纯函数**（不抽出来就只能靠源码正则，那是假绿温床）。
+//   语义 = **「state 是否携带该键」**：携带（含空对象 = 有意清空）以 state 为准；未携带则取磁盘值。
+//   ★ 诚实标注（重要）：2026-09-18 16:46:24 那 3 条 `overLimitStuck` 记录**不是**被插件写洗掉的 —— 真因是那个一次性
+//     脚本自身（计划调用漏了 `dryRun: true` ⇒ **首调即真写**；第二个调用因文件已达标返回 `not-over` ⇒ `results` 为空
+//     ⇒ 记账分支被整个跳过，账本**从未写入**）。本函数防的是**这一类多写者覆盖**（外部工具写入不再被插件写回洗掉），
+//     **不是**那次事故的根因修复；根因修复是那个脚本（同批已改）。
+const LEDGER_EXTERNAL_KEYS = ["overLimitStuck", "overLimitHint"];
+// ★★ 工程席 rev8k A1 整改：`WM_SKIP_MAX_ROUNDS` 原先只是**函数内局部**（L7274），
+//   而判定它的三处（`shouldReArchive` / `hasWmSkipCand` / 健康行计数）**跨函数**引用不了它 ⇒ 各自写**裸 `3`**
+//   ⇒ 常量"名存实亡"（这与我本批反对的"字段表两处各写一遍"是同一类缺陷）。现**上提为模块级单点所有者**。
+const WM_SKIP_MAX_ROUNDS = 3;
+// ★★ §9.11.4-8：单元缓存**淘汰顺序决策**（纯函数，模块级 ⇒ 门可直调、断言由产品字节决定）。
+//   规则（**现场取证驱动**：186 个单元里 51 个是"唯一副本"、合计 345673 字，且恰好最旧）：
+//     ① **优先淘汰"已落库"的**（`onlyCopy !== true`：正文在记忆库还有一份，删了仍搜得到），组内按 `at` 升序（旧先删）；
+//     ② **唯一副本**（正文只此一份）排在最后，**只在超出硬上限 `hard`** 时才动它们；
+//     ③ 读不出来的单元视同"唯一副本"（**不得当成可删** —— 它可能正是唯一副本、只是文件损坏）。
+//   返回 `{ evict: [meta…], fromOnlyCount }`。
+function evictUnitCachePlan(metas, keep, hard) {
+  const list = Array.isArray(metas) ? metas : [];
+  const need = list.length - (Number(keep) || 0);
+  if (!(need > 0)) return { evict: [], fromOnlyCount: 0 };
+  const evictable = list.filter((m) => m && m.onlyCopy !== true).sort((a, b) => (a.at || 0) - (b.at || 0));
+  const onlyCopies = list.filter((m) => m && m.onlyCopy === true).sort((a, b) => (a.at || 0) - (b.at || 0));
+  const pick = evictable.slice(0, need);
+  let fromOnly = [];
+  if (pick.length < need && list.length > (Number(hard) || 0)) {
+    fromOnly = onlyCopies.slice(0, Math.min(need - pick.length, list.length - (Number(hard) || 0)));
+  }
+  const evict = pick.concat(fromOnly);
+  return { evict: evict, fromOnlyCount: fromOnly.length };
+}
+export { evictUnitCachePlan };
+// ★★ §9.11.4-3 修正十（**工程席 rev8f B**：`archiveWatermarks` 的字段表在**加载端**与**保存端**各写一遍
+//   —— 本批正是在这两处同时加 `empty`/`skipped` 才暴露该耦合，漏改一处就会静默丢字段）：
+//   把字段表收成**单点所有者**。两处语义差异（加载端要容错归一化 / 保存端要落盘投影）用 `mode` 参数表达，
+//   避免"抽了函数反而改变行为"。
+//   `mode="load"`  ：`frames` 非数字 ⇒ null；`round`/`at` 补默认；`byFile`/`witness` 非对象 ⇒ null；布尔取 `=== true`
+//   ★ 修法要点（**我实测踩到的坑，症状=「消号了但水位不存在」**）：内存里的 watermark 对象**不含 `id`**
+//   （存法是 `ARCHIVE_WATERMARK.set(sid, {…})`），所以 `save` 分支**不能**从 `src.id` 取 id ——
+//   那会落盘成 `id: undefined`，加载端 `if (w && w.id)` 直接丢弃 ⇒ 表现为 T8a/T8b/T8j 全红。
+//   ⇒ `save` 分支的 `id` 由**调用方**传入（`idForSave`）。
+function normalizeWatermark(w, mode, idForSave) {
+  const src = (w && typeof w === "object") ? w : {};
+  const b = (v) => v === true;                                  // 布尔一律"严格是 true 才算"，与旧写法逐字一致
+  const obj = (v) => (v && typeof v === "object") ? v : null;
+  if (mode === "save") {
+    return { id: idForSave, frames: src.frames, round: src.round, at: src.at, incomplete: b(src.incomplete),
+      byFile: src.byFile || null, witness: src.witness || null, empty: b(src.empty), skipped: b(src.skipped),
+      wmSkip: b(src.wmSkip), wmSkipRounds: Number(src.wmSkipRounds) || 0, wmSkippedFiles: Number(src.wmSkippedFiles) || 0,
+      wmSkippedFrames: Number(src.wmSkippedFrames) || 0, wmSkipAt: Number(src.wmSkipAt) || 0 };
+  }
+  return { frames: typeof src.frames === "number" ? src.frames : null, round: src.round || 1, at: src.at || 0,
+    incomplete: b(src.incomplete), byFile: obj(src.byFile), witness: obj(src.witness), empty: b(src.empty), skipped: b(src.skipped),
+    wmSkip: b(src.wmSkip), wmSkipRounds: Number(src.wmSkipRounds) || 0, wmSkippedFiles: Number(src.wmSkippedFiles) || 0,
+    wmSkippedFrames: Number(src.wmSkippedFrames) || 0, wmSkipAt: Number(src.wmSkipAt) || 0 };
+}
+export { normalizeWatermark };
+// ★★ §9.11.4-7 修正二（**红队 rev8c B① 实测抓出的门力缺口**）：把"记/清超限提示"这条**写侧**语义抽成**纯函数**。
+//   动因：墓碑替代 `delete` 之后，写侧唯一的看门人是一条**源码正则** ⇒ 对"语义等价改写"完全假绿
+//   （红队实测：把调用改成 `if (false) hintObj[rel] = {…cleared:true}` —— 字面量还在、墓碑永不写 ⇒
+//    sink 门 25/25 全绿、T4 门 21/0 全绿、矩阵变体也"正常判红"）。抽成纯函数后，门可以**按输出**断言：
+//   "该文件本轮已写好 ⇒ 必须得到 `{cleared:true}`" —— 无论写侧怎么改写，只要语义不对就红。
+//   参数：`hint` = 现有提示表；`rel` = 文件相对路径；`entry` = `null` 表示"清掉提示"，否则为活条目对象。
+function applyOverLimitHintEntry(hint, rel, entry) {
+  const out = Object.assign({}, hint || {});
+  if (entry === null) {
+    // ✓ 墓碑（**不是** `delete`）：`writeIntegrateState` 的逐路径并账无法区分"state 从不知道"与"state 有意删除"
+    //   ⇒ `delete` 会被磁盘上那条尚未删除的旧条目**复活**（陈旧差数/分节表永久留在 dream prompt 里）。
+    //   墓碑带 `at` ⇒ 时间戳规则让 state 胜出；读者按 `cleared` 跳过（`renderOverLimitHint` 首行过滤）。
+    out[rel] = { at: Date.now(), cleared: true };
+  } else {
+    out[rel] = entry;   // 文件仍超限 ⇒ 记下新的差数/分节表（新 `at` 会自然压过旧值/旧墓碑）
+  }
+  return out;
+}
+export { applyOverLimitHintEntry };
+// ★★ B5：活动预算的**唯一判据**（纯函数 ⇒ 门可直测，不必造真子代理/真定时器）
+//   返回 "none"（未达标）| "remind"（首触：提醒，不杀）| "grace"（再攒满一个预算窗 ⇒ 进 3 分钟宽限）
+function guardBudgetVerdict(actN, budget, extra) {
+  const n = Number(actN) || 0, b = Number(budget) || 0, e = Number(extra) || 0;
+  if (b <= 0 || n < b) return "none";
+  return n < b + e ? "remind" : "grace";
+}
+export { guardBudgetVerdict };
+// v2.8.4（评审整改 · 回归门席）：**可观测调用计数** —— 唯一用途是让"接线"能被**行为**验证，而不是只能靠源码 grep。
+//   门里那条 grep 断言在变异 `merge-not-wired` 下确实会红，但"抽了函数忘了接线"这类缺陷本该由行为兜住；
+//   计数在模块级（每次进程 +0 起），门跑一次真 tick 后断言 ≥1 即为行为证据。
+let MERGE_LEDGER_CALLS = 0;
+function ledgerMergeCallCount() { return MERGE_LEDGER_CALLS; }
+function mergeLedgerExternalKeys(state, disk) {
+  MERGE_LEDGER_CALLS++;
+  if (!state || typeof state !== "object" || !disk || typeof disk !== "object") return state;
+  // ═══ §9.11.4-7（用户 2026-09-19 拍板「按你推荐的来」）：**携带旧值的 state 不得覆盖外部较新的值** ═══
+  // 旧实现只做一件事：`if (!(kEx in state)) state[kEx] = disk[kEx]` —— 只防"**键被整体抹掉**"，
+  //   防不住"state 带着**旧条目**把外部刚写进去的新条目压回去"（工程席①指出的过度声明）。
+  // 两个外部键的**数据形状都是「路径 → 条目」的对象**（实证：`overLimitStuck[path] = {rounds,lastAction}`、
+  //   `overLimitHint[path] = {chars,…}`）⇒ 逐条按时间戳（`lastAt`/`at`/`ts`）取较新者：
+  //   · state 缺该条 ⇒ 收下外部的；
+  //   · 时间戳可比 ⇒ 较新者胜（**外部更新时以外部为准** —— 这正是要修的方向）；
+  //   · 时间戳不可比（两边都没有/等同且为 0）⇒ **保留 state**（= 旧行为，绝不因此把插件自己刚写的内容弄丢；
+  //     而插件此后写这两类条目时会带 `lastAt`，使后续比较都可比）。
+  const stampOf = (x) => Number((x && (x.lastAt !== undefined ? x.lastAt : (x.at !== undefined ? x.at : x.ts))) || 0);
+  const isPathMap = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+  for (const kEx of LEDGER_EXTERNAL_KEYS) {
+    const dv = disk[kEx];
+    if (dv === undefined) continue;
+    if (!(kEx in state)) { state[kEx] = dv; continue; }
+    const sv = state[kEx];
+    if (isPathMap(sv) && isPathMap(dv)) {
+      const merged = Object.assign({}, sv);
+      for (const p of Object.keys(dv)) {
+        if (!(p in sv)) { merged[p] = dv[p]; continue; }
+        const se = sv[p], de = dv[p];
+        const ts = stampOf(se), td = stampOf(de);
+        if (ts && td && td > ts) merged[p] = de;          // 外部条目更新 ⇒ 采纳外部
+      }
+      state[kEx] = merged;
+    }
+  }
+  return state;
+}
+export { mergeLedgerExternalKeys, ledgerMergeCallCount };
+// 历史（v2.5.6 口径，保留备查）：面板会话层口径修复——旧按 mtime 取「最近 3 份」时，轮转清空原文件会刷新 mtime，
+//   0 字节的已轮转文件（实证 sessions/2026-08-14.md）挤占名额把真日文件顶掉，叠加当日文件尚未生成，
+//   表现为「日记忆文件只剩这两天」；改为排除空文件 + 按文件名日期倒序 + 会话层总量提示（共 N 个日文件 / 已轮转为空数）。
 // 远端发布基址（安装/升级命令同源）；DSH_MEMORY_RAW 可指向内网镜像
 const RAW_BASE_DEFAULT = "https://raw.githubusercontent.com/Starry0214/dsh-memory/main";
+
+// ═══════════ v2.6.4：记忆库指针「指向 → 目标存在」判据（L1 写时闭合校验 / L3 settle 反向核对 / 体检 三处共用）═══════════
+// 背景（2026-09-15 悬空指针事故，诊断见桌面《dsh-memory-dream悬空指针-根因诊断与约束方案.md》）：
+//   dream 在主文件写了 `See knowledge/…` 指针，但目标分册从未落盘——校验方向只有「内容→指针」，缺「指针→目标」。
+// 写法覆盖（对现库 120 个 md 全量回归选型，选型证据见 _test-pointer-closure.mjs 的 G 场景）：
+//   `- See knowledge/…`、`详见 knowledge/…`、`详见：knowledge/…`、`→ knowledge/…`、
+//   `→ 分册 knowledge/…`（关键词与路径间夹中文词——旧「关键词紧跟路径」写法必漏，实证 sessions/2026-09-15.md L24）。
+//   [^\n]{0,10}? 桥接上限 10 字符且不跨行；目标限记忆库四类前缀 → 天然豁免库外路径（~/.dsh/skills/…、08_工具资源\…）。
+// 两个 g 正则**只用 matchAll**（matchAll 不消费 lastIndex；日后若写 MEM_PTR_RE.test() 会因 g 的 lastIndex 状态随机失灵）。
+// 路径字符类排除 < 《 * | { 等占位符字符 → 命名约定示例（knowledge/MEMORY-<项目>-<topic>.md、tools/*.md）不误判为指针。
+const MEM_PTR_RE = /(?:See|see|参见|详见|参考|见|→)[^\n]{0,10}?((?:knowledge|projects|tools|sessions)\/[^\s)）(（,，;；、"'`<>《》*|{}]+?\.md)/g;
+// 描述性提及豁免：事故记录/待办标注会**逐字复述**一个未落盘文件名（如「…分册 knowledge/X.md 未落盘」）——
+// 那是有意为之的诚实标注，不是指针意图；若不豁免，此类条目会永久挂在 health 上（现库实测 2 处，永远修不掉）。
+const MEM_PTR_DESC_RE = /未落盘|未成功|待补|尚未|未建立|未生成|暂缺|不存在|缺失|已移入|已轮转|已归档|已删除/;
+function memPointerTargetExists(rel) {
+  try { return fs.existsSync(portable(MEMORY_ROOT + "/" + rel)); } catch (e) { return false; }
+}
+// 已轮转判定：sessions/<日>.md 缺失但 sessions/archive/<同名> 在 → 内容没丢只是搬家（v2.5.6 轮转策略），不算悬空
+function memPointerArchived(rel) {
+  const m = /^sessions\/([^/]+\.md)$/.exec(rel);
+  if (!m) return false;
+  try { return fs.existsSync(portable(MEMORY_ROOT + "/sessions/archive/" + m[1])); } catch (e) { return false; }
+}
+// 文本 → 指针命中清单 [{rel, desc}]；desc = 命中所在行含描述性豁免词（视为复述/标注，不作指针判据）
+function memPointerHits(text) {
+  const out = [];
+  const s = String(text || "");
+  if (!s) return out;
+  for (const m of s.matchAll(MEM_PTR_RE)) {
+    const ls = s.lastIndexOf("\n", m.index) + 1;
+    let le = s.indexOf("\n", m.index); if (le < 0) le = s.length;
+    out.push({ rel: m[1], desc: MEM_PTR_DESC_RE.test(s.slice(ls, le)) });
+  }
+  return out;
+}
+// 全库只读扫描 → 悬空指针 [{src, rel}]（排除：描述性豁免、目标存在、sessions 已轮转进 archive）
+function scanDanglingPointers() {
+  const out = [];
+  const seen = new Set();
+  const walk = (dir) => {
+    let ents = [];
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+    for (const e of ents) {
+      const p = dir + "/" + e.name;
+      if (e.isDirectory()) { walk(p); continue; }
+      if (!e.name.endsWith(".md")) continue;
+      let t = "";
+      try { t = fs.readFileSync(p, "utf8"); } catch (e2) { continue; }
+      const src = p.slice(MEMORY_ROOT.length + 1);
+      for (const h of memPointerHits(t)) {
+        if (h.desc) continue;
+        if (memPointerTargetExists(h.rel)) continue;
+        if (memPointerArchived(h.rel)) continue;
+        const key = src + "|" + h.rel;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ src: src, rel: h.rel });
+      }
+    }
+  };
+  walk(MEMORY_ROOT);
+  return out;
+}
 
 // ===========================================================================
 // v2.3.0 新增：新装用户「记忆初始化」引导 + 插件「升级检查」
@@ -670,12 +1112,10 @@ function snoozeInitGuide(hours) {
 // 把版本/初始化状态推到设置界面（只读字段，跟 monitorSummary 同一通道）
 function pushOnboardSummary() {
   try {
-    if (!HOST_SETTINGS_SCOPE || typeof HOST_SETTINGS_SCOPE.update !== "function") return;
     const line = onboardStatusLine();
     if (line === ONBOARD_LAST_SUMMARY_LINE) return;
     ONBOARD_LAST_SUMMARY_LINE = line;
-    Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ onboardSummary: line }))
-      .catch((e) => cwarn("[dsh-memory] onboardSummary 推送失败:", e && e.message ? e.message : String(e)));
+    LIVE_STATS.onboardSummary = line;   // [2026-09-23] scope 通道退役，随 stats.json 下发
   } catch (e) { /* 界面回显失败不影响功能 */ }
 }
 let ONBOARD_LAST_SUMMARY_LINE = "";
@@ -707,7 +1147,7 @@ function makeMessage(text) {
     id: makeId(),
     role: "user",
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: PLUGIN_NAME }
+    source: { kind: "plugin:dsh-memory" }
   };
 }
 
@@ -718,8 +1158,59 @@ function makeNoticeMessage(text, summary) {
     id: makeId(),
     role: "user",
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: PLUGIN_NAME, form: "notice", summary: summary || String(text).slice(0, 120) }
+    source: { kind: "plugin:dsh-memory", form: "notice", summary: summary || String(text).slice(0, 120) }
   };
+}
+
+// ═══════════ [400guard 20260927] **400 事故根治**：surface 落表安全闸 ═══════════
+//   同一处 `session.append("user/message", …, { surfaceOp: "append" })` 有**两种**致命形态，本闸同时挡：
+//
+//   形态①「步骤中途落表 ⇒ 请求 400」：
+//     落点插进 assistant(tool_calls) 与其 tool 结果之间 ⇒ 下一次请求被网关拒：
+//       400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'
+//     实证：`session-40d57ebb` seq 625（2026-09-27 04:24:30）一条 dream 进度转播正好插在 step29 的
+//     assistant(3 tool-call) 与两个 tool/result 之间 ⇒ turn3 step30、turn4 step1 连报两次 400
+//     （request_id 167cd2ea-…／f32cad98-…）。
+//     宿主纪律（app.asar:839128）：注入的 user/message 必须落在**本步工具结果之后**；core 自身也只在
+//     step 起点 append `decision.messages`（app.asar:289113）。
+//
+//   形态②「新会话抢在 system 头之前落表 ⇒ 整个日志读不出来」（比 400 更狠：不是某一轮失败，是会话永久损坏）：
+//     宿主读取期不变量 = surface **首个节点必须是 system/message**（受保护头）。若在**新会话第一次请求之前**
+//     落一条 user/message，之后第一轮的 system 头就再也落不进去，读取期直接抛
+//     `SessionFormatError: system/message requires a protected first surface head` ⇒ GUI 报
+//     「历史加载失败：stored session … is corrupt」。
+//     实证：`session-40d57ebb` 04:06:00 建会话 → 04:06:22 收到 dream 进度转播（seq=11，append）
+//     → 04:06:53 第一轮 system 头（seq=19）⇒ 日志自 04:06:53 起不可读。
+//     修前备份可复现：`session.v4.jsonl.zstd.bak-corrupt-20260927-112639`（seq=11 user/message 早于 seq=19 system/message）。
+//   同源扫库（sweep-session-logs.mjs，近 7 天 149 个 v4 日志）：形态②命中 2 例、形态①命中 1 例 ⇒ ②更常见。
+//
+//   兜底规则（两条都满足才允许直接落表，否则一律退回 `inject`）：
+//     a) 确定空闲：`status === "idle"`（= 没有 open step，不会打断 tool_calls/tool 配对）；
+//     b) 已有 surface 头：会话里已经落下过 `system/message`（新会话/判定失败一律不落表）。
+//   `inject`（= send(msg, "next-step", wake=false)，app.asar:288879）由宿主在 **step 边界**投递，
+//   天然既不会打断配对、也不会抢在 system 头前面。空闲且已有头时才落表，v2.5.1 的「空闲也可见」初衷不变。
+function sessionHasSurfaceHead(listener) {
+  try {
+    const s = listener && listener.session;
+    const nodes = s && s.surface && s.surface.nodes;
+    if (!nodes || typeof s.eventAt !== "function") return false;   // 拿不到 ⇒ 保守：不冒写坏日志的险
+    for (const seq of nodes) {
+      const ev = s.eventAt(seq);
+      if (ev && ev.type === "system/message") return true;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+// 返回 "" = 允许落表；否则返回阻断原因（"midstep" = 回合进行中；"nohead" = 尚无 system 头）
+function surfaceAppendBlock(listener) {
+  if (!listener || listener.status !== "idle") return "midstep";
+  if (!sessionHasSurfaceHead(listener)) return "nohead";
+  return "";
+}
+function canSurfaceAppend(listener) {
+  return surfaceAppendBlock(listener) === "";
 }
 
 // v2.5.1(P3-1): 终态 summary 取 outText.slice(0,200)。模型输出末尾若残留未闭合的 markdown 标记，会被原样
@@ -739,9 +1230,30 @@ function tidyTruncatedMarkdown(s) {
 // v1.10.1：控制台输出统一时间戳（HH:MM:SS）。本文件内 console 调用已批量替换为 clog/cwarn/cerr。
 // v1.12.4：pad 提升为模块级（原来只在 ts() 内部，updateMonitorSummary 引用时报 pad is not defined，监控统计推送从未生效）
 const pad = (n) => String(n).padStart(2, "0");
-const clog = (...a) => console.log(ts(), ...a);
-const cwarn = (...a) => console.warn(ts(), ...a);
-const cerr = (...a) => console.error(ts(), ...a);
+// [logpane 20260930] 本次启动以来的插件日志环形缓冲：桌面端（dsh.exe）看不到宿主控制台、也不便翻日志文件，
+//   故每条 clog/cwarn/cerr 同时进内存环，由 GET /dsh-memory/logs.json 增量下发，面板「实时日志」卡每 2 秒轮询。
+//   上限 2000 行、重启即清空——正是「本次启动 dsh 以后」的语义。写环失败绝不反噬调用方。
+const LOG_BOOT_AT = Date.now();
+const LOG_RING_CAP = 2000;
+const LOG_RING = [];
+function _logPush(level, args) {
+  try {
+    let text = "";
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      let s;
+      if (typeof a === "string") s = a;
+      else if (a instanceof Error) s = (a && a.stack) || String(a);
+      else { try { s = JSON.stringify(a); } catch (e) { s = String(a); } }
+      text += (i ? " " : "") + (s === undefined ? "undefined" : s);
+    }
+    LOG_RING.push({ t: Date.now(), level: level, text: text.length > 4000 ? text.slice(0, 4000) + "…" : text });
+    if (LOG_RING.length > LOG_RING_CAP) LOG_RING.splice(0, LOG_RING.length - LOG_RING_CAP);
+  } catch (e) { /* 记日志失败不影响主流程 */ }
+}
+const clog = (...a) => { _logPush("info", a); console.log(ts(), ...a); };
+const cwarn = (...a) => { _logPush("warn", a); console.warn(ts(), ...a); };
+const cerr = (...a) => { _logPush("error", a); console.error(ts(), ...a); };
 function ts() {
   const d = new Date();
   return "[" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) + "]";
@@ -754,10 +1266,136 @@ function ts() {
 const STALE_NOTIFIED = new Set();  // 本实例内已提醒过的会话 id（v1.12.19 起仅防重复注入提醒文案）
 const ARCHIVED_SESSIONS = new Set(); // v1.12.19: 归档流程已处置的会话 id（含"验证已覆盖跳过"与无流跳过），持久化 .integrate.json archivedSessions；pending 过滤与 staleCount 收敛以此为准
 // v2.4.3（续聊增量重档）：消号从「id 一次性」升级为「轮次水位」——归档后又有新帧的会话重入候选，提取只喂水位后增量
-const ARCHIVE_WATERMARK = new Map();   // id → { frames: 消号时总帧数, round: 已归档轮次, at: 时间戳 }，持久化 .integrate.json archiveWatermarks
+const ARCHIVE_WATERMARK = new Map();   // id → { frames: **已消费帧数**(P14；非文件总帧数), round: 已归档轮次, at: 时间戳, incomplete: 是否被墙钟掐断 }，持久化 .integrate.json archiveWatermarks
 let ARCHIVE_WM_DIRTY = false;          // 懒置基线产生的脏标记（下次 saveStaleNotified 顺带落盘）
+// ★ B1′ 回归门可观测面：把账本句柄与回填入口导出，让门能**行为**直测「盘面强证据 ⇒ 回填」（而非只靠源码 grep）。
+//   函数声明提升 ⇒ 从本行导出后面定义的函数合法；这些导出只增不减，不影响 unwrapExports（本模块 default 仍胜出）。
+export { archiveBlockOnDisk, backfillArchivedFromDisk };
+// ★★ B1″：见证 → "是否已被处置"（纯函数 ⇒ 门可直测；**只收紧不放松**：无法判定一律 false）
+//   written / declared-skip / dropped(已在库、本轮已记) = 已处置 ⇒ 可记账
+//   dropped(写盘异常) / 无见证 = 未处置 ⇒ **不记账**（留待下轮，绝不静默消号）
+function archiveWitnessDisposed(w) {
+  if (!w || typeof w !== "object") return false;
+  if (w.mode === "written") return true;
+  if (w.mode === "declared-skip") return true;
+  if (w.mode === "dropped") return w.reason !== "写盘异常";
+  return false;
+}
+export { archiveWitnessDisposed };
 let staleNotifiedLoaded = false;
+// ★ §9.11.4-3 修正六/七/十五（红队 rev8c B② → rev8d P1 → **工程席 rev8k A2**）：账本**存在但读不出来**时，
+//   归档轮每轮**现问**（`ledgerUnreadableNow()`）⇒ **不需要**"粘滞状态"变量。
+//   ★★ 工程席 rev8k 抓出我**同一形态第三次复发**：我给他加了"警告每次都打"之后，`LEDGER_UNREADABLE_TOLD`
+//   本身退化成**只被赋值、再无读取点**的死变量（两处 `if (!TOLD) { TOLD = true; }` 是恒真空操作）——
+//   而**就在这段注释里**我原先还写着"上一版 `LEDGER_UNREADABLE` 只被赋值、无读取点 ⇒ 已删"。**原样复发**。
+//   ⇒ 现**整条删除**（变量+两处 guard），并改用**账本计数器**（`ledgerUnreadableRefuses`/`ledgerUnreadableAt`）做
+//     "守卫确实走过"的证据 —— 比抓 stdout 日志串稳健（不跟措辞耦合）、且跨轮跨进程可查（同 `archiveWmEmpty` 范式）。
 const SESSIONS_ROOT = portable(path.join(DSH_HOME, "sessions"));
+// ★ 工程席 rev8k A2：**"账本不可读 ⇒ 拒绝写盘"的可观测证据**（供门 `T9h` 与健康行读）。
+//   放在**内存**里而不落损坏账本（后者是要保护的对象 —— 我第一版写进账本 ⇒ 把损坏账本覆盖了，被门当场抓住）。
+let REFUSE_WRITE_SEEN = 0;
+// ★★ §9.11.4-11（B4）**单元写失败**的计数（同 REFUSE_WRITE_SEEN 范式：**内存 + 旁路账本**，
+//   **绝不写进 `.integrate.json`** —— 那是 fail-closed 要保护的对象，本批已因写进去栽过一次）。
+//   用途：让"盘上没单元"这一现象**能区分成因**（写失败 / 被淘汰 / 从未写 —— 下游读侧三者同貌）。
+//   ★ 与 `REFUSE_WRITE_SEEN` 的区别：那个是"**账本**被拒写"，这个是"**单元**写不成"，两者不同对象、不同处置。
+let UNIT_WRITE_FAIL_SEEN = 0;
+
+// ══════════ v2.6.5（2026-09-16 会话日志文件名自适配 + 格式漂移自检，用户报障）═══════════
+// 事故：DSH 于 2026-09-10 20:10 起把会话日志由 session.jsonl.zstd 改名为 session.v3.jsonl.zstd
+//   （zstd 多帧格式不变、magic 仍 28b52ffd，只是文件名变）。插件 6 处读日志点全部硬编码旧名 →
+//   statSync 失败即 continue，漏网检测/水位帧数/used 判定/归档提取全链对该类会话**静默失效**：
+//   实测 283 个 v3 会话（09-10~09-16，含当天 19 个）从未进入候选，归档账本最后一批停在 09-10，
+//   积压 63 个未落档会话；控制台零报错——与 v2.6.3 的 agent/session-start→agent/created 改名事故同型。
+// 修法①（自适配）：`resolveSessionLogPaths(dir)` 按**时间顺序**返回同目录全部日志（v2.8.4/P21 起为复数），
+//   5 处调用点统一走它。⚠ 单数版（只取优先级最高的一个）已在 P21 删除 —— 双名目录会整类漏读。
+// 修法②（自检）：扫描时顺带采集未识别的 *.jsonl.zstd 名 → 维护提醒注入对话一次（按名去重，
+//   持久化 .integrate.json fmtNotified）——DSH 若再改名，用户当轮就能看见，而不是 6 天后才发现。
+const SESSION_LOG_CANDIDATES = ["session.v4.jsonl.zstd", "session.v3.jsonl.zstd", "session.jsonl.zstd"];   // 顺序=优先级（新→旧）
+const KNOWN_LOG_NAMES = new Set(SESSION_LOG_CANDIDATES);
+const UNKNOWN_LOG_NAMES = new Map();   // 未识别名 → { count, sample, at }（进程内累积，扫描时采集）
+const UNKNOWN_LOG_DIRS = new Set();    // 已采样目录（防同一目录重复计数）
+let FMT_NOTIFIED = new Set();          // 已提示过的未识别名（持久化，防刷屏）
+let fmtNotifiedLoaded = false;
+
+// v2.8.4（P21）：单数版 `resolveSessionLogPath` 已**删除** —— 它"首个命中即返回"，
+//   在双名目录（实测 7 个）里整类看不见第二个文件。全部调用点改走 `resolveSessionLogPaths`（见下）。
+// ═══════════ v2.8.4（P21）：**同目录多日志** —— 旧实现"首个命中即返回"会整类看不见第二个文件 ═══════════
+// 实测（2026-09-18，`_probe-21-order.mjs`）：
+//   ① **7 个目录两个名都在**（`session.jsonl.zstd` 与 `session.v3.jsonl.zstd` 并存）；
+//   ② **7/7 满足 `mtime(legacy) < mtime(v3)`** ⇒ 正确的**时间顺序**是 `[legacy, v3]`
+//      （DSH 在 09-10 20:10 前后改名，改名当天正在进行的会话**两侧都留了内容**）。
+//   ③ 危害：`resolveSessionLogPath` 按**优先级**返回 v3，而账本水位是**改名之前**用 legacy 记下的
+//      ⇒ 6/7 个会话出现 `cur(216) > wm(9838)` 为**假** ⇒ **永不重入**；两文件共 66262 帧中
+//      **53734 帧（81.1%）**对插件整类不可见（≈41.0 M 字符，与「7 个劈开 sid」的实测吻合）。
+// 量纲（P22）：帧水位一律用 **sum(frames)**；`readUnitCache` 的 `curFrames` 必须传同一个 sum，
+//   否则出现"存 sum 读单文件 ⇒ 恒判陈旧（每轮全量重提取）"或"存单文件读 sum ⇒ 前半段永不进单元"。
+const SESSION_LOG_CHRONO = ["session.jsonl.zstd", "session.v3.jsonl.zstd", "session.v4.jsonl.zstd"];   // **时间顺序**（旧的在前）—— 由 mtime 实测 7/7 判定
+function resolveSessionLogPaths(dir) {
+  const out = [];
+  for (const n of SESSION_LOG_CHRONO) {
+    const p = path.join(dir, n);
+    try { if (fs.statSync(p).isFile()) out.push(p); } catch (e) { /* 试下一个 */ }
+  }
+  return out;
+}
+// 会话总帧数（sum）——**唯一量纲**；任一文件读不到 ⇒ null（调用方按「读不到日志」保守处理）
+function sessionFramesTotal(paths) {
+  let n = 0;
+  for (const p of paths) { const c = countZstdFrames(p); if (c === null) return null; n += c; }
+  return n;
+}
+// 把**聚合水位**分摊成逐文件偏移（P21 的核心，纯函数 ⇒ 可被门直接行为断言）：
+//   ① 有账本 `byFile` 记录 ⇒ **精确**用记录；
+//   ② 否则若水位**恰好等于某一个文件**的帧数 ⇒ 全部归给它。实测校准（`_probe-merge-overflow.mjs`）：
+//      7 个双名会话里 `574b8af7` 的水位 3747 恰等于 **v3** 的帧数（旧码按优先级只读 v3）⇒ 前缀和会误判成
+//      "legacy 已消费"，把 legacy 的 2 帧永久当成已读；本规则 6/7 与前缀和同解、第 7 个被修正。
+//   ③ 其余（水位不对应任何单文件）⇒ 按**时间顺序前缀和**分摊（实测 6/7 的形态正是"legacy 全归档、v3 全新"
+//      ⇒ 得到 `[9838, 0]`，正确地**从 v3 头开始**）。
+function distributeOffsets(names, perFile, wm) {
+  const total = perFile.reduce((a, b) => a + (Number(b) || 0), 0);
+  let S = (wm && typeof wm.frames === "number" && wm.frames > 0) ? wm.frames : 0;
+  if (S > total) S = total;                    // 日志被外部重写/缩水 ⇒ 夹到当前总量，**绝不越界**
+  const byFile = (wm && wm.byFile && typeof wm.byFile === "object") ? wm.byFile : null;
+  if (byFile) {
+    // ★★ 修正十四（**红队 rev8h C-2**）：byFile 分支原先**完全忽略 `S`（wm.frames）** ⇒ 账本自相矛盾时
+    //   没有任何交叉校验：若各项之和 > `S`，就会把某文件"整文件跳过"（→ 靠修正十一兜底 = 静默挂起）。
+    //   现改为**在 `S` 的约束内**取用：逐项累加，一旦用满 `S` 就停（其余记 0）—— byFile 与 frames 互为校验。
+    const acc = []; let used = 0;
+    for (let i = 0; i < names.length; i++) {
+      const want = Math.max(0, Math.min(Number(byFile[names[i]]) || 0, perFile[i]));
+      const take = Math.max(0, Math.min(want, S - used));
+      acc.push(take); used += take;
+    }
+    return acc;
+  }
+  if (S > 0) {
+    const exact = [];
+    for (let i = 0; i < perFile.length; i++) if (perFile[i] === S) exact.push(i);
+    if (exact.length === 1) {                  // ② 唯一精确匹配 ⇒ 全部归给它，其余为 0
+      const one = perFile.map(() => 0);
+      one[exact[0]] = S;
+      return one;
+    }
+  }
+  const out = [];                              // ③ 前缀和
+  let left = S;
+  for (let i = 0; i < perFile.length; i++) { const take = Math.min(left, perFile[i]); out.push(take); left -= take; }
+  return out;
+}
+// 目录内是否藏着未识别的日志名（*.jsonl.zstd 且不在已知表）——仅供自检提示，不参与任何判定
+function probeUnknownLogNames(dir) {
+  if (UNKNOWN_LOG_DIRS.has(dir)) return null;
+  UNKNOWN_LOG_DIRS.add(dir);
+  try {
+    for (const fn of fs.readdirSync(dir)) {
+      if (!/\.jsonl\.zstd$/.test(fn) || KNOWN_LOG_NAMES.has(fn)) continue;
+      const cur = UNKNOWN_LOG_NAMES.get(fn);
+      if (cur) cur.count++; else UNKNOWN_LOG_NAMES.set(fn, { count: 1, sample: dir, at: Date.now() });
+      return fn;
+    }
+  } catch (e) { /* 目录读不到：不报 */ }
+  return null;
+}
 
 // v1.12.0：自动提醒查记忆/查 skill（判断 A/B/C 插件化）——
 // 不靠模型自觉，插件在 pre-step/request-error 事件里量化判断触发条件，命中才注入提醒。
@@ -772,6 +1410,9 @@ const MEMORY_HINT_ECHO = new Map();      // v2.2.10: sessionId -> {sig,t} 上次
 const MEMORY_HINT_BC_LAST = new Map();   // v2.2.10: sessionId -> {t,sig} 上次 B/C 注入时刻——异签名字段 10 分钟冷却
 const HINT_BC_COOLDOWN_MS = 10 * 60000;  // v2.2.10: B/C 冷却窗（同签名升级 B→C 不受限）
 const SPIRAL_REMIND_AT = new Map();      // v2.0.6: sessionId -> { ts: 上次注入时刻, streak: 连续未奏效次数 }——指数退避+跟进复位+2h 自然归零
+// v3.2.0（2026-10-02 Wave 1）：**E 类独立冷却桶**——旧实现 D/E 共用 SPIRAL_REMIND_AT（L9863/L9887），
+//   一次 E 投递会把 D 的冷却窗一起吃掉、反之亦然（口径污染 + 互相当刹车）。语义与 D 桶完全对称。
+const SPIRAL_REMIND_E_AT = new Map();    // v3.2.0: sessionId -> { ts, streak }（E 类专用冷却桶）
 // v2.4.30（W 类）：看门狗独立冷却桶——与 D/E 分开（语义不同：W 不依赖同质，避免被 D/E 触发挤占、也避免 W 稀释 D/E 的 streak 复位语义）
 const WATCH_REMIND_AT = new Map();       // sessionId -> { ts: 上次 W 注入时刻 }（冷却 = watchCooldownMin，无 streak 指数——W 弱提醒一次即可）
 // ── v0.5 回归闭环（P0a 数据层）：被动监测账本 ─────────────────────────────
@@ -809,6 +1450,15 @@ let LESSON_PENDING_DIRTY = false;          // 变更防抖标记
 let LESSON_PENDING_DIRTY_SINCE = 0;        // 状态迁移即时落盘用的最后迁移时间戳（无需单独字段，见 scheduleLessonSave）
 let RETRIEVAL_SELF = null;               // v2.2.6: 检索层启动自检状态——null=未跑；{ok,msg,detail,at}（模块级：activate 闭包内自检写入、监控汇总读取）
 
+// v2.8.5（2026-09-27）：指针「何时读」触发语通道。
+//   动因：index.md 是注入层**唯一路由表**，但全部条目都是 Blind References（只给目标、不说何时该读）——
+//   学术侧《Configuration Smells in AGENTS.md》(arXiv 2606.15828, 100 个热门仓库抽样 **91% 含此异味**) 单列此项。
+//   设计（约定+代码双保险，防 dream 覆盖）：括号内用 **`何时:`** 前缀切出触发语部分，触发语**不进 kws**
+//   （否则「当用户问…时」这类自然语言会被 bigram 匹配污染 A 类提醒——v2.0.4「空关键词无条件命中」同类事故），
+//   只随命中结果一并回传作**模型可读的路由依据**；其后的部分仍按原语义作关键词。
+//   语法：`- 主题（关键词1/关键词2 何时:触发场景）→ 文件.md`；无 `何时:` 时行为与旧版**逐字一致**。
+const TRIGGER_MARK_RE = /何时[:：]/;
+
 // 从 index.md 自动提取"领域→记忆文件→关键词"匹配表
 function buildMemoryHintTable() {
   try {
@@ -823,11 +1473,35 @@ function buildMemoryHintTable() {
       for (const seg of line.split("｜")) {
       //   v2.2.5b：描述组整体可选 (?:...)?——旧形态 \s*（([^）]*)）? 中全角开括号是必需项，
       //     无「（描述）」的行全部失配（当前 index.md 恰好全部无描述 → A 类表恒空，08-26 调试实证）。
-      const m = seg.match(/^(?:-\s*)?(.+?)\s*→\s*(MEMORY-[^\s（）()|]+|[^\s（）()|]+\.md)(?:\s*[（(]([^）)]*)[)）])?/);
+      //   v2.8.5：name 组收紧为 `[^｜→]+?`——必须**禁 ｜ 与 →**（争用时会把整个后续条目吞进 name）；
+      //     **不可**写成 `[^（(]+?`：本库绝大多数行的括号在 `→` **之前**（如 `发改委项目归档（…）→文件`），
+      //     禁括号会让这些行整条失配（gate 实测 4 条 fixture 全灭、真库 42→1）。
+      //   括号剥离：本库括号位于 name 尾部，故 desc 组（`→` 之后）实际吃不到 ⇒ 从 name 尾部剥括号。
+      const m = seg.match(/^(?:-\s*)?([^｜→]+?)\s*→\s*(MEMORY-[^\s（）()|]+|[^\s（）()|]+\.md)(?:\s*[（(]([^）)]*)[)）])?/);
       if (!m) continue;
-      const name = m[1].trim();
       const file = m[2].trim();
-      const desc = (m[3] || "").trim();
+      let name = m[1].trim();
+      let rawParen = (m[3] || "").trim();
+      // v2.8.5：只从 name 尾部剥括号——但**仅当括号能给出触发语**时才剥，否则原样留回 name，
+      //   保证「无 何时: 标记」的行与旧版**逐字等价**（旧版把括号留在 name，括号内容照旧参与关键词）。
+      //   真库实测：6 条括号含自然语言（如徕卡行「工作目录与原始包/交付物/逆向工作区见该档」），
+      //   无条件剥离会让「见该档」这类叙述词变成 A 类提醒关键词——故按标记收紧。
+      const tail = name.match(/[（(]([^（()）]*)[)）]\s*$/);
+      let parenFromName = "";
+      if (tail && !rawParen) parenFromName = tail[1].trim();
+      const parenText = rawParen || parenFromName;
+      const trigMark = parenText.match(TRIGGER_MARK_RE);
+      let desc = "", trigger = "";
+      if (trigMark) {
+        // 带 `何时:` 的行才启用新语义：左＝关键词（旧语义），右＝触发语（不进 kws）
+        desc = parenText.slice(0, trigMark.index).trim();
+        trigger = parenText.slice(trigMark.index + trigMark[0].length).trim();
+        if (parenFromName) name = name.slice(0, tail.index).trim();
+      } else if (rawParen) {
+        desc = rawParen;   // → 之后的括号（旧版 desc 语义，保持原样）
+      } else {
+        name = m[1].trim();   // 无标记：name 原样（含括号），与旧版逐字等价
+      }
       const kws = [];
       // name 除整串外，按斜杠切子领域（如 "REST API/推送" → 追加 "推送"）——混合词的中文主体可独立命中
       const nameParts = [name, ...name.split(/[/／]+/).map((s) => s.trim()).filter((s) => s.length >= 2)];
@@ -837,7 +1511,7 @@ function buildMemoryHintTable() {
         const k = splitKw(part);
         if (k.hanGrams.length || k.lats.length) kws.push({ part: String(part), hanGrams: k.hanGrams, lats: k.lats });   // v2.2.1: 保留原文，命中时展示触发词
       }
-      rows.push({ kws, file, name });
+      rows.push({ kws, file, name, trigger });
       } // v2.2.5: 闭合 seg 循环
     }
     MEMORY_HINT_TABLE = rows;
@@ -923,7 +1597,7 @@ function matchMemoryHints(userText) {
       if (latHit) { hit = true; if (kw.part) hitParts.push(kw.part); break; }
     }
     if (hit) {
-      hits.push({ file: row.file, name: row.name, parts: hitParts.slice(0, 3) });   // v2.2.1: 触发词随行返回（最多 3 个）
+      hits.push({ file: row.file, name: row.name, parts: hitParts.slice(0, 3), trigger: row.trigger || "" });   // v2.2.1: 触发词随行返回（最多 3 个）；v2.8.5: 携「何时读」触发语
       if (hits.length >= 3) break;
     }
   }
@@ -1026,6 +1700,12 @@ function defaultMonitorData() {
     spiralEvents: [],                   // v1.12.16: 打转触发样本 [{t,tool,repRate,negRate,sample}]（v2.0.2 起可注入D类提醒；v2.4.30 加 kind:"D"/"E" 分流，样本仍全量保留供调优）
     watchEvents: [],                    // v2.4.30: W 类看门狗触发样本 [{t,ws,steps,wallSecs,topTool}]（独立数组——无同质/重复语义，不混入 spiralEvents 防污染 D/E 校准）
     breakerEvents: [],                  // v2.6.0: D 级熔断动作样本 [{t,level,tool,reason,action}]（滚动100，独立于 spiralEvents 防污染校准；供面板/调优）
+    // v3.2.0（2026-10-02 Wave 0 埋点）：**闸门决策留痕** [{t,n,cls,reason,rep,neg,winLen,streak,cdMs}]
+    //   动因（2026-10-01 事故）：D 类 7 次命中全被 batchLike 静默，而"命中却无投递"**没有任何证据**，
+    //   只能靠"排除冷却 ⇒ 只剩 batch"反推（红队复核 03 §1.3）。可观测性缺口必须由埋点闭合。
+    //   独立数组（不写 events：events 尾部 cap 2000 且 tool 事件占 97.7%，塞进去会被挤掉/挤掉别人）；
+    //   段合并见 recordGate()——同一 (sid,cls,reason) 10 分钟内就地累加 n，不追加条目。
+    gateEvents: [],
     spiralThresh: null,                 // v2.0.3: D 类阈值覆盖层 {rep,neg,sim,w,cooldownMin}——null=用内置默认；/dream 自校准写入；v2.4.30 增 E/W 字段
     spiralThreshLog: [],
     // v0.5：回归闭环统计（P0a，B5：lessons 计数不经 monitorEvent、独立落盘；lessonEvents 经 monitorEvent 受 monitorEnabled）
@@ -1109,6 +1789,24 @@ function backoffAllowed(bucket, cooldownBaseMs, nowMs, batchLike) {
   if (batchLike === true) return { allowed: false, streak, cdMs, reason: "batch" };
   if (nowMs - b.ts < cdMs) return { allowed: false, streak, cdMs, reason: "cooldown" };
   return { allowed: true, streak, cdMs, reason: "ok" };
+}
+
+// v3.2.0（2026-10-02 Wave 2 候选 C）：D 闸门决策抽成**纯函数**（便于单测；调用点只剩副作用）。
+//   为什么必须抽出来：候选 C 改变了"batchLike 与冷却"的相对顺序——旧实现 `backoffAllowed(..., batchLike)`
+//   在**冷却检查之前**短路返回 not-allowed ⇒ batchLike 一旦变成"可投递"，若照抄旧顺序就会**每次命中都投**（刷屏）。
+//   新语义：**冷却永远先判**；批量样态命中在冷却通过时"降级投递"（soft），并把冷却**加倍**（streak 多跳一档）；
+//   冷却没过则记 `batch-cooldown`（与普通 `cooldown` 分开，便于事后区分"被冷却拦的批量样态"）。
+//   返回：{ mode: "ok" | "soft" | "blocked", reason, streakNext, gate }
+function decideDGate(batchLike, bucket, cooldownBaseMs, nowMs, softEnabled) {
+  const gate = backoffAllowed(bucket, cooldownBaseMs, nowMs, false);   // 不传 batchLike：冷却照常生效（顺序修正点）
+  if (!gate.allowed) {
+    return { mode: "blocked", reason: batchLike ? "batch-cooldown" : "cooldown", streakNext: gate.streak, gate: gate };
+  }
+  if (batchLike) {
+    if (softEnabled === false) return { mode: "blocked", reason: "batch", streakNext: gate.streak, gate: gate };   // 回退旧口径（硬静默）
+    return { mode: "soft", reason: "batch-soft", streakNext: gate.streak + 2, gate: gate };   // 降级投递 + 冷却加倍（多跳一档）
+  }
+  return { mode: "ok", reason: "ok", streakNext: gate.streak + 1, gate: gate };
 }
 
 // v0.5（P0c）：回归提醒入队（方案 A——替代 B/C 触发的直接 agent.inject；pre-step handler 消费）
@@ -1324,12 +2022,184 @@ function lessonApplyTimeout(now) {
 const WORKDIRS_STALE_DAYS = 30;              // 长期未命中判定阈值（天）
 const PROJECT_CHAR_HARD = 9000;              // v2.4.20：项目文件容量硬限（字符=JS String.length）；>9000 触发提取（滞回带 8000-9000 不触发，防边界抖动）
 const PROJECT_CHAR_SOFT = 6000;              // v2.4.20：提取目标上限（净空 3000，防 append 即重超震荡）与软提示线（6000-9000 且本轮已写才提示）
+// v2.6.7：UTF-8 字节数（沙箱无 Buffer，用 TextEncoder）——**提级到模块级**（原在 apply 闭包内，W1 阶段：
+//   软硬阈值同源需在模块级判定；纯函数无闭包依赖。注：模块级调用闭包内函数会 ReferenceError，
+//   而注入链在 try 内会把异常吞成一行 cerr → 记忆注入整链静默失效，故此处必须模块级）。
+function utf8Bytes(text) {
+  try {
+    return new TextEncoder().encode(text).length;
+  } catch (e) {
+    return text.length;
+  }
+}
+
 // v2.4.28：硬性注入预算提级到模块级（原 apply 闭包内 L4787，D0 计量纯函数需在模块级引用）。
 //   语义不变：CHAR_LIMIT 是"超过注入会被 slice 截断"的硬上限（global 3000 字≈9KB、index 2000 字≈6KB、摘要 1500 字≈4.5KB）；
-//   SIZE_WARN 是软字节维护信号（中文 4608B≈1500字，远低于硬预算）。软信号+硬预算双轨并存。
+//   SIZE_WARN 是**字节**软阈值，原注释「中文 4608B≈1500字」隐含 3 B/字符、只对纯中文成立 —— 对 ASCII 密集文件
+//   （index.md 实测 1.857 B/字符）该阈值**位于硬预算之后**，软告警整条通道不可达。v2.6.7 起软告警改为**字符口径**
+//   （硬预算 × WARN_CHAR_RATIO，见下 SIZESTATE 区），SIZE_WARN 退为**字节兜底**（OR 关系）。三态口径见 sizeStateOf。
 //   仅此一处真源；闭包内原引用点（sectionAwareSlice/checkSizeOverflow/buildMemoryDocStatus）自动读模块级。
+// v2.6.8（P5.1-1）：根文件**单源**——任何"根文件全量"的循环/默认值都引用本常量，禁止再写内联数组字面量
+//   （工程席实测：加一个根文件曾牵连 ≥19 处，其中 6 处属"改判定"；稀释点就是散落各处的内联 `["global.md","index.md"]`）。
+//   ⚠ L8894 附近的「纯删未下沉」检查**故意不用**它（该约束原为 fixed.md 写保护所需；fixed 层已于 v2.7.0 拆除）。
+const ROOT_FILES = ["global.md", "index.md"];
 const CHAR_LIMIT = { "global.md": 3000, "index.md": 2000, summary: 1500 };
-const SIZE_WARN = { "global.md": 4608, "index.md": 4608, summary: 4096 }; // v9.1: global 4096→4608B、摘要 2048→4096B（与注入截断对齐降噪音）；v10.1: index 3072→4608B（中文索引 3393B≈1130 字符，远低于注入预算 2000 字符，3072 为 v7 旧值）
+const SIZE_WARN = { "global.md": 4608, "index.md": 4608, summary: 4096 }; // v9.1: global 4096→4608B、摘要 2048→4096B（与注入截断对齐降噪音）；v10.1: index 3072→4608B；v2.6.7: 退为字节兜底（判定改用字符口径 sizeStateOf）
+// ═══ v2.6.7（W1）：软硬阈值同源 —— 修「软告警对 ASCII 密集文件不可达」═══
+// 实证（2026-09-17）：index.md 以 ASCII 路径/ID 为主，实测 **1.857 B/字符**（1963 字/3645 B）。而软阈值 SIZE_WARN
+//   是**字节**、硬预算 CHAR_LIMIT 是**字符** → 「旧软告警先于硬限可响」的充要条件 b > W/L（b=字节/字符）对 index
+//   要求 b > 2.304，实际 1.857 → **软告警通道整条不可达**：文件已 2102 字符（越 2000 硬限）仍零告警。
+// 处置：软告警与硬预算**同源** —— 以 CHAR_LIMIT 为基准算字符线（WARN_CHAR_RATIO），SIZE_WARN 退为字节兜底（OR）。
+// 三态（面板/cwarn/提醒共用）：overHard（注入已被 sectionAwareSlice 截断）/ nearHard（接近硬限）/ overSoft（字节兜底）。
+// ⚠ 零退化的诚实边界：对 b ≥ W/warnChars 的文件（如 global 1.707、纯中文）逐字不变；对 b 更小的文件本改动是
+//   **按设计提前告警**，额外告警区间 = [warnChars, floor(W/b)]（现库 index 提前 682 字符、summary 提前 927 字符；
+//   纯 CJK b=3.0 时 summary 仍有 [1350,1365] 差异带）→ 详见 docs/CHANGELOG.md v2.6.7「影响面」段。
+// >>> SIZESTATE BEGIN   （供门测试按 marker 抽取求值；本区**禁止**出现 export/import —— test/onboard.unit.test.mjs 同法求值 ONBOARD 区）
+const WARN_CHAR_RATIO = 0.9;          // 软告警线 = 硬预算 × 0.9（index 2000→1800）
+const WARN_CHAR_CLEAR_RATIO = 0.85;   // 滞回清除线（降到线下才复位，防 1800 附近来回 flap）
+function limitOf(key, table) {
+  // v2.6.8（P5.1-3）：改用 hasOwnProperty —— 未登记 key 仍回落 table.summary（**契约**：_gate-plugin-load.mjs
+  //   与 _test-size-warn-parity.mjs 都断言 warnCharsOf(undefined) === 1350），但不再可能取到原型键（toString 等）。
+  //   刻意**不加** cwarn：本函数是导出纯函数，加副作用会与门的捕获口径耦合。
+  const v = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : table.summary;
+  return typeof v === "number" && Number.isFinite(v) ? v : table.summary;
+}
+function warnCharsOf(key) { return Math.floor(limitOf(key, CHAR_LIMIT) * WARN_CHAR_RATIO); }
+function clearCharsOf(key) { return Math.floor(limitOf(key, CHAR_LIMIT) * WARN_CHAR_CLEAR_RATIO); }
+// 单一判定源：三处 cwarn + checkSizeOverflow + buildMemoryDocStatus + /dream 健康共用（防口径再次漂移）
+function sizeStateOf(key, text) {
+  const s = String(text == null ? "" : text);
+  const bytes = utf8Bytes(s);
+  const chars = s.length;
+  const byteWarn = limitOf(key, SIZE_WARN);
+  const charLimit = limitOf(key, CHAR_LIMIT);
+  const warnChars = warnCharsOf(key);
+  const clearChars = clearCharsOf(key);
+  const overHard = chars > charLimit;                        // 与 sectionAwareSlice（<= lim 不截断）同口径：== lim 不算超
+  const nearHard = !overHard && chars >= warnChars;
+  return { bytes, chars, byteWarn, charLimit, warnChars, clearChars, overHard, nearHard, overSoft: bytes > byteWarn };
+}
+// >>> SIZESTATE END
+export { sizeStateOf, warnCharsOf, clearCharsOf };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v2.6.8（P4 / 提案③）未沉淀清单 —— 只读、非阻塞、不自动动作
+//   动机（证据席实测）：条目级未沉淀率 35.8%~56.4%（5 个日档 250 条精确字面量里，出现在 projects/ 的 = 0）；
+//     插件现有判据只有「整会话级」sessionMentionedInMemory（L3243），**条目级完全不可观测**。
+//   纪律：只读；只出报告；不自动下沉；不注入（默认随 /dream 结算报告出 → 注入增量 0）。
+//   必扫 archive：轮转后旧档不可检索，只扫活跃日档会把"30 天前没沉淀"全判成假阳性（假阳性爆炸）。
+//   抗漂移：账本记 firstSeen，报告"新增条数 / 滞龄 >21 天条数"，避免每轮复述同一批。
+//   ⚠ 模块级函数：只许引用模块级符号（MEMORY_ROOT / portable / fs）——v2.6.7 的 utf8Bytes 教训。
+const DEPOSIT_WATCH_FILE = MEMORY_ROOT + "/.deposit-watch.json";
+
+function scanUndeposited(opts) {
+  const days = (opts && opts.days) || 14;
+  const cap = (opts && opts.cap) || 300;   // 真库实测：14 天窗口 >200 条 → 上限过低会把"≥200"谎报成"40"（口径诚实性）
+  try {
+    const cutoff = Date.now() - days * 86400000;
+    const files = [];
+    try {
+      for (const n of fs.readdirSync(portable(MEMORY_ROOT + "/sessions"))) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})\.md$/.exec(n);
+        if (!m) continue;
+        if (new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() < cutoff) continue;
+        files.push("sessions/" + n);
+      }
+    } catch (e1) {}
+    try {
+      for (const n of fs.readdirSync(portable(MEMORY_ROOT + "/sessions/archive"))) {
+        if (/^\d{4}-\d{2}-\d{2}\.md$/.test(n)) files.push("sessions/archive/" + n);
+      }
+    } catch (e2) {}
+    let deposited = "";
+    const pushDir = (rel) => {
+      try {
+        for (const n of fs.readdirSync(portable(MEMORY_ROOT + "/" + rel))) {
+          if (!n.endsWith(".md")) continue;
+          try { deposited += fs.readFileSync(portable(MEMORY_ROOT + "/" + rel + "/" + n), "utf8"); } catch (e0) {}
+        }
+      } catch (e0) {}
+    };
+    pushDir("knowledge"); pushDir("projects"); pushDir("tools");
+    for (const rf of ROOT_FILES) {   // v2.6.9（P0）：改用单源常量（原为内联三元组，是"加一个根文件牵连多处"的稀释点）
+      try { deposited += fs.readFileSync(portable(MEMORY_ROOT + "/" + rf), "utf8"); } catch (e0) {}
+    }
+    const RES = [
+      /`([^`\n]{6,120})`/g,
+      /[A-Za-z]:\\[^\s`"'（）()|,，。；;、]{4,120}/g,
+      /〔[^〕\n]{1,20}〕\d{1,4}号/g,
+      /https?:\/\/[^\s`"'（）()|]{6,120}/g,
+      /\b[\w.-]{2,40}\.(ps1|py|mjs|cjs|exe|json|xlsx|docx|md)\b/g,
+    ];
+    // ── 「值得沉淀」判据（v2.6.8 收紧）──
+    // 初版只按长度收，实测真库首屏大半是代码碎片（`$out=& cmd`、`if (floatProc !== null) return true`、
+    //   `注释下方出现`）——报告变噪音等于功能没用。判据：必须像"可复用的精确字面量"，且排除代码/通配形态。
+    const CMD_START = /^(npm|npx|pip|pip3|uv|git|node|python|pwsh|powershell|winget|choco|scoop|curl|ssh|scp|certutil|netsh|reg)\s/;
+    const PS_CMD = /^(Set|Get|New|Remove|Copy|Move|Start|Stop|Enable|Disable|Add|Clear|Test|Invoke|Out|Select|Where|Sort|Group|Measure|ConvertTo|ConvertFrom)-[A-Za-z]+/;
+    const isWorthyLiteral = (lit) => {
+      if (!lit || lit.length < 6 || lit.length > 120) return false;
+      const isUrl = /^https?:\/\//.test(lit);
+      if (!isUrl && /[*?#<>{}|]/.test(lit)) return false;                       // 通配符/占位/管道/花括号 = 形态不是字面量
+      const isPath = /^[A-Za-z]:[\\/]/.test(lit) || /^%[A-Za-z]+%/.test(lit) || /^\\\\/.test(lit);
+      const hasExt = /\.(ps1|py|mjs|cjs|exe|json|xlsx|docx|md|yaml|yml|txt|zip|pdf|wps|ofd|log|bak)\b/i.test(lit);
+      const hasDocNo = /〔[^〕]+〕/.test(lit);
+      const hasScope = /@[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+/.test(lit);
+      const hasNum = /\d{4,}/.test(lit);
+      if (!(isPath || isUrl || hasExt || hasDocNo || hasScope || hasNum)) return false;
+      // 带空格的必须"像命令/像路径/像文号"，否则多半是散文或代码
+      if (/\s/.test(lit) && !isPath && !isUrl && !CMD_START.test(lit) && !PS_CMD.test(lit) && !hasDocNo) return false;
+      return true;
+    };
+    const seen = new Set(), out = [];
+    for (const rel of files) {
+      let txt = "";
+      try { txt = fs.readFileSync(portable(MEMORY_ROOT + "/" + rel), "utf8"); } catch (e3) { continue; }
+      for (const line of txt.split("\n")) {
+        if (!line.trim()) continue;
+        for (const re of RES) {
+          re.lastIndex = 0;
+          let m;
+          while ((m = re.exec(line))) {
+            const lit = String(m[1] || m[0] || "").trim();
+            if (!isWorthyLiteral(lit)) continue;
+            if (seen.has(lit)) continue;
+            seen.add(lit);
+            if (deposited.includes(lit)) continue;
+            out.push({ lit: lit, src: rel });
+            if (out.length >= cap) return { ok: true, days: days, scanned: files.length, items: out, truncated: true };
+          }
+        }
+      }
+    }
+    return { ok: true, days: days, scanned: files.length, items: out, truncated: false };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? String(e.message) : String(e), days: days, items: [] };
+  }
+}
+
+// 水位账本：只记 firstSeen（新增判定 + 滞龄统计），独立点文件，不与 dream 结算共用 .integrate.json。
+function updateDepositWatch(items) {
+  const now = Date.now();
+  let prev = {};
+  try { prev = (JSON.parse(fs.readFileSync(portable(DEPOSIT_WATCH_FILE), "utf8")) || {}).items || {}; } catch (e0) {}
+  const next = Object.assign({}, prev);
+  for (const it of (items || [])) if (it && it.lit && !next[it.lit]) next[it.lit] = now;
+  // 软上限：账本只用于「新增/滞龄」，超量时按 firstSeen 保最新 2000 条（防无限增长）
+  let nextKeys = Object.keys(next);
+  if (nextKeys.length > 2000) {
+    const keptKeys = nextKeys.sort((a, b) => (next[b] || 0) - (next[a] || 0)).slice(0, 2000);
+    const trimmed = {};
+    for (const k of keptKeys) trimmed[k] = next[k];
+    nextKeys = keptKeys;
+    try { fs.writeFileSync(portable(DEPOSIT_WATCH_FILE), JSON.stringify({ at: now, items: trimmed }, null, 2), "utf8"); } catch (e2) {}
+    return { fresh: (items || []).filter((it) => it && it.lit && !prev[it.lit]).length, aged: 0, total: (items || []).length, ledger: nextKeys.length };
+  }
+  const fresh = (items || []).filter((it) => it && it.lit && !prev[it.lit]).length;
+  const aged = Object.keys(prev).filter((k) => now - (prev[k] || 0) > 21 * 86400000).length;
+  try { fs.writeFileSync(portable(DEPOSIT_WATCH_FILE), JSON.stringify({ at: now, items: next }, null, 2), "utf8"); } catch (e1) {}
+  return { fresh: fresh, aged: aged, total: (items || []).length, ledger: Object.keys(next).length };
+}
+export { scanUndeposited, updateDepositWatch };
 // v2.4.28（D0）：按 rel 预算表（写时校验/预览用）——global/index 与 CHAR_LIMIT 同源（上表），projects 用 PROJECT_CHAR_HARD/SOFT；sessions/|knowledge/|tools/ 无预算（null）。
 function budgetOf(rel) {
   const r = String(rel || "");
@@ -1512,6 +2382,127 @@ function listProjectChars() {   // v2.4.20：扫描 projects/*.md 返回 [{rel, 
   } catch (e) {}
   return out.sort((a, b) => b.chars - a.chars);
 }
+// ═══════════ v2.8.4（容量治理·**硬保证**）：超限文件机械下沉 ═══════════
+// 它破的是什么死循环（2026-09-18 实测，非推演）：
+//   验收每轮报「<文件> 仍超限…**下次整合优先提取**」，而**没有任何环节会让文件变小** ——
+//   ① 那句"下次优先"是**字符串拼接**（验收体检处），没有优先级字段、没有计数器、没有动作；
+//   ② 模型那条"整节下沉"引导挂在「memory_dream_patch **被拒写**」事件上，可实况是"**本轮未写**"
+//      ⇒ 不产生该事件 ⇒ 引导**永不触发**（没有差数、没有分节表，模型也不知道该沉多少、从哪节沉）；
+//   ③ 唯一的压缩器（合并维护）两次无进展即按设计停手（`stuck=infeasible`）；
+//   ④ 注入端有 `hard-cut` 硬切兜着 ⇒ 表面还能用 ⇒ 没人去真正缩小文件。
+//   ⇒ 状态永不改变（实测：projects 两文件连续 2 轮"本轮未写"、当日摘要 20321 字符 ≥ 硬预算 1500）。
+// 本函数是**不依赖模型判断的执行者**：把**整节**逐字搬到 knowledge/ 明细件，主文件留一行指针。
+// 安全不变量：① 搬走的每一节都必须**逐字**出现在 sink 里（**先校验再落盘**）② 主文件写前留备份
+//   ③ 任一步失败 ⇒ 主文件原样不动（返回 ok:false，绝不半途改文件）④ 只减不增（净减不成立即放弃）。
+function sinkOverLimitFile(rel, opts) {
+  const o = opts || {};
+  try {
+    const fsz = o.fs || fs;
+    const root = String(o.root || MEMORY_ROOT).replace(/\\/g, "/");
+    const main = portable(root + "/" + rel);
+    let text = ""; try { text = fsz.readFileSync(main, "utf8"); } catch (e) { return { ok: false, why: "read-failed" }; }
+    const target = Number.isFinite(Number(o.target)) ? Number(o.target) : PROJECT_CHAR_SOFT;
+    if (text.length <= target) return { ok: false, why: "not-over:" + text.length };
+    // ① 切节：头块 = 第一个 `## ` 之前（**永不搬** —— 它承载结论/画像/索引行）；其后每节到下一个 `## ` 行
+    const lines = text.split("\n");
+    const secs = []; let cur = null, offset = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (/^##\s/.test(lines[i])) { if (cur) { cur.end = offset; secs.push(cur); } cur = { title: lines[i].trim(), start: offset, end: 0 }; }
+      offset += lines[i].length + 1;
+    }
+    if (cur) { cur.end = offset; secs.push(cur); }
+    if (!secs.length) return { ok: false, why: "no-sections" };
+    const head = text.slice(0, secs[0].start);
+    secs.forEach((s) => { s.text = text.slice(s.start, s.end); s.chars = s.text.length; });
+    // ② 牺牲序 + **可搬范围**：
+    //   · `projects/` 文件：**只允许搬"冷节"**（`SINK_PREFER_RE` = 归档/漏网会话补档族）。
+    //     ★ 由 dry-run 拦下的一次破坏性动作：初版对项目文件"按位置从前往后搬"，实测会把
+    //     `## 周报与联系人口径`/`## 数据资产`/`## 当前状态与下一步` 这些**活内容**搬走 ——
+    //     "哪一节还活着"是**判断**，不该由机械下沉替人做。冷节不够 ⇒ 不搬（`insufficient-cold`），
+    //     交由整合下沉（有判断）或人工处理，并如实报出来。
+    //   · 其它文件（当日摘要等注入面）：全部节都可搬，冷节优先，其次越靠前越旧。
+    //   ★ 二次修正（实测再拦一次）：**全局统一为"只搬冷节"**。初版对非 projects 文件（当日摘要）放行"全部节"，
+    //   dry-run 实测会搬走 `## 项目块：…`/`## 检查点（目标与下一步）`/`## 本次目标` —— 那是**当日摘要自己的正文**，
+    //   不是冷数据。搬它等于把"今天的总结"搬空。冷节判定是**唯一无需判断**的边界 ⇒ 全局只搬它。
+    const ranked = secs.filter((s) => !/已下沉/.test(s.title) && SINK_PREFER_RE.test(s.title)).slice().sort((a, b) => {
+      const pa = SINK_PREFER_RE.test(a.title) ? 0 : 1;
+      const pb = SINK_PREFER_RE.test(b.title) ? 0 : 1;
+      return (pa - pb) || (a.start - b.start);
+    });
+    const ptrEst = 150;                                   // 指针行长度上界（决定"还要再搬一节吗"）
+    const moved = []; let movedChars = 0;
+    for (const s of ranked) {
+      if (text.length - movedChars + ptrEst <= target) break;
+      moved.push(s); movedChars += s.chars;
+    }
+    if (!moved.length) return { ok: false, why: "insufficient-cold" };
+    if (text.length - movedChars + ptrEst > target) return { ok: false, why: "insufficient-cold:" + (text.length - movedChars) };
+    // ★ 实测抓到的坑：`dateStr` 是 apply 内的闭包函数，**模块级用不了**（下沉首次运行就报 throw: dateStr is not defined）。
+    //   故本函数自带日期格式化（用模块级的 `pad`）。
+    const _d0 = new Date();
+    const stamp = _d0.getFullYear() + "-" + pad(_d0.getMonth() + 1) + "-" + pad(_d0.getDate());
+    const sinkRel = o.sinkRel || ("knowledge/MEMORY-" + path.basename(rel, ".md") + "-明细.md");
+    let sinkOld = ""; try { sinkOld = fsz.readFileSync(portable(root + "/" + sinkRel), "utf8"); } catch (e) { sinkOld = ""; }
+    const add = moved.map((s) => "<!-- 下沉自 " + rel + " " + stamp + " -->\n" + s.text.replace(/\s+$/, "")).join("\n\n");
+    const newSink = (sinkOld ? sinkOld.replace(/\s+$/, "") + "\n\n" : "") + add + "\n";
+    const ptr = "## 明细已下沉 → " + sinkRel + "（" + stamp + "，" + movedChars + " 字符 / " + moved.length + " 节；memory_search 可检索该文件）\n";
+    const kept = secs.filter((s) => moved.indexOf(s) < 0);
+    const newMain = head + kept.map((s) => s.text).join("") + "\n" + ptr;
+    // ③ 先校验后落盘
+    for (const s of moved) if (newSink.indexOf(s.text.replace(/\s+$/, "")) < 0) return { ok: false, why: "verify-failed:" + s.title };
+    if (newMain.length >= text.length) return { ok: false, why: "no-shrink" };
+    const meta = { ok: true, rel: rel, sinkRel: sinkRel, before: text.length, after: newMain.length, movedCount: moved.length, movedChars: movedChars, movedTitles: moved.map((s) => s.title), movedAll: kept.length === 0 };
+    if (o.dryRun) return Object.assign(meta, { dryRun: true });
+    const ts = Date.now();
+    try { fsz.writeFileSync(main + ".pre-sink-" + ts + ".bak", text); } catch (e) { return { ok: false, why: "backup-failed" }; }
+    try { if (sinkOld) fsz.writeFileSync(portable(root + "/" + sinkRel) + ".pre-sink-" + ts + ".bak", sinkOld); } catch (e) {}
+    writeFileAtomic(portable(root + "/" + sinkRel), newSink, { tag: "sink" });
+    writeFileAtomic(main, newMain, { tag: "sink" });
+    return meta;
+  } catch (e) { return { ok: false, why: "throw:" + (e && e.message ? e.message : String(e)) }; }
+}
+// v2.8.4（容量治理·A）：把「差数 + 分节表」**主动喂给下一轮整合**。
+//   为什么需要：模型的"整节下沉"引导本来挂在「memory_dream_patch **被拒写**」事件上（见 sinkOverLimitFile 头注释
+//   的 ①–④），而实况多是「**本轮未写**」⇒ 该事件永不发生 ⇒ 没有差数、没有分节表 ⇒ 模型只能继续报"下次优先"。
+//   本函数把**同样的机器事实**渲染成一个提示块，由 `spawnIntegrate` 拼进 `capacityText` ⇒ 不必先写再被拒。
+function renderOverLimitHint(hint) {
+  if (!hint || typeof hint !== "object") return "";
+  const keys = Object.keys(hint).filter((k) => hint[k] && hint[k].cleared !== true && Number(hint[k].chars) > 0);   // 墓碑（已下沉干净的路径）不进 prompt
+  if (!keys.length) return "";
+  const L = ["\n【插件预置·超限文件的下沉依据（**无需先提交一个会被拒的 patch**）】"];
+  for (const k of keys.slice(0, 6)) {
+    const h = hint[k];
+    L.push("- " + k + "：当前 " + h.chars + " 字符 / 硬限 " + h.limit + " / **需减 ≥ " + h.overBy + " 字符**（目标 ≤" + h.target + "，保留净空防 append 即重超）");
+    const secs = Array.isArray(h.sections) ? h.sections : [];
+    // ★★ v3.0.1：渲染侧上限 12 → **30**（并**如实报出被省略的节数**）。
+    //   原先 12 与生成侧的 12 **两处各写一遍同一口径**（本批反复批判的形态），且现场已有 21 节的真实文件
+    //   ⇒ 两处都会漏。现：生成侧不截断（信息入库不丢）、渲染侧 30（有界且够用），
+    //   若真超过 30 则**明说"另有 N 节未列出"**，绝不静默截断（与全仓"不许静默丢"一致）。
+    const SEC_CAP = 30;
+    if (secs.length) {
+      const shown = secs.slice(0, SEC_CAP);
+      const more = secs.length - shown.length;
+      L.push("  分节表（优先把 ★ 整节搬到 knowledge/）：" + shown.map((s) => (s.preferExtract ? "★" : "") + String(s.title || "?") + " " + (Number(s.chars) || 0) + "字").join(" ｜ ")
+        + (more > 0 ? " ｜ …**另有 " + more + " 节未列出**（超出渲染上限 " + SEC_CAP + "；如需全部请直接读该文件）" : ""));
+    }
+    L.push("  下沉目标：knowledge/MEMORY-" + String(k.replace(/^projects\//, "").replace(/\.md$/, "")) + "-<主题>.md；主文件留一行指针（## 明细已下沉 → <该路径>）；**指针与目标文件必须同一次 memory_dream_patch 提交**");
+  }
+  L.push("（本块口径由插件机器计算：照它下沉即可，**不要自行估算字符数**）\n");
+  return L.join("\n");
+}
+export { renderOverLimitHint };
+// v2.8.4（A 配套）：**模块级**分节表（`## ` 切节 → 字符数）。为什么不用现成的 `charSectionBreakdown`：
+//   踩过的坑 —— 它是 apply 内的闭包函数，模块级调用会 `is not defined`（本批已因 `dateStr` 栽过一次）。
+function sectionTableOf(text, maxRows) {
+  const out = [];
+  for (const line of String(text || "").split("\n")) {
+    if (/^##\s/.test(line)) out.push({ title: line.trim(), chars: 0 });
+    else if (out.length) out[out.length - 1].chars += line.length + 1;
+  }
+  return out.slice(0, Number(maxRows) > 0 ? Number(maxRows) : 15);
+}
+export { sectionTableOf };
+export { sinkOverLimitFile };
 // v2.4.26（项目摘要注入隔离）：命中项目 X → 行级剥离「X 相关节」（匹配 key/aliases 词，大小写不敏感）；
 //   0 命中返回 {text:"",hit:0}（调用方降级通知）；超预算按整行头优先截断（保行完整性）
 function projectSummarySlice(text, key, aliases, budgetChars) {
@@ -1540,6 +2531,9 @@ const PROJECT_BLOCK_RE = /^##\s*项目块[：:]\s*(.+?)\s*$/;
 const GENERAL_BLOCK_RE = /^##\s*通用块\s*$/;
 const DUMP_MARK_RE = /^\s*<!--\s*compaction:/;
 const ARCHIVE_BLOCK_RE = /^##\s*漏网会话补档/;   // v2.5.2（F5a）：归档节可寻址（staleArchive EOF 追加，同日多轮=多个归档段）
+// v2.8.4（机械下沉）：**优先搬走**的节族 —— 与 `memory_size_preview` 的 `preferExtract` 判定式**同源**
+//   （那里是 `/^##\s*(归档|漏网会话补档)/`）⇒ 两处口径一致，避免"预览说要沉这节、下沉却搬了别的节"。
+const SINK_PREFER_RE = /^##\s*(归档|漏网会话补档)/;
 
 // 把当日文件文本切成有序段：{ kind: "project"|"general"|"dump"|"other", key?, lines[] }
 function parseDailySections(text) {
@@ -1998,6 +2992,66 @@ function matchProjectByCwd(cwd) {
   return { hits: hits, staleHits: staleHits, index: idx, marker: meta };
 }
 
+// v2.6.2（工作空间自动建档，用户 2026-09-14 拍板）：顶层会话 cwd 未命中任何项目 → 自动补建项目记忆。
+//   ① projects/<目录名>.md 缺失 → 写最小骨架（标题+五标准节，dream 整合/漏网归档/「## 归档」锚点直接兼容）
+//   ② _index.json：同名条目已存在 → 只补 workdirs/root（stale 复位；改名条目 file≠目录名时登记进原条目、不新建文件防双条目打架）；
+//      不存在 → 新条目 {key/display/file, workdirs:[cwd], root, aliases:[]}
+//   ③ 种 ~dsh/project.json 标记（seedProjectMarker 幂等）→ 下轮起 matchProjectByCwd 正常命中注入
+//   护栏：isDeepEnoughRoot（≥4 段）+ ONE_DRIVE_CONFLICT_RE + `_` 前缀目录名（索引扫描排除段）跳过；
+//   已命中（hits/staleHits 非空）或标记已存在（markerKey/markerStale/markerBad）→ 不动作（防与 reconcile 改名线索打架，失效交巡检报告）。
+//   返回 { acted, created, registered, seeded, key, file, reason }；全程 try/catch 不抛（失败不阻塞注入主链路）。
+function ensureProjectForCwd(cwd) {
+  const res = { acted: false, created: false, registered: false, seeded: false, key: "", file: "", reason: "" };
+  try {
+    const root = portable(String(cwd || "")).replace(/\/+$/, "");
+    if (!root) { res.reason = "no-cwd"; return res; }
+    if (!isDeepEnoughRoot(root)) { res.reason = "shallow-root"; return res; }
+    if (ONE_DRIVE_CONFLICT_RE.test(root)) { res.reason = "conflict-dir"; return res; }
+    const name = root.split("/").filter(Boolean).pop() || "";
+    if (!name || /^_/.test(name) || ONE_DRIVE_CONFLICT_RE.test(name)) { res.reason = "bad-name"; return res; }
+    const mp = matchProjectByCwd(root);
+    if (mp.hits.length > 0 || (mp.staleHits && mp.staleHits.length > 0)) { res.reason = "already-hit"; return res; }
+    if (mp.marker && (mp.marker.markerKey || mp.marker.markerStale || mp.marker.markerBad)) { res.reason = "marker-present"; return res; }
+    const file = name + ".md";
+    const idx = readProjectIndex();
+    const pr = (idx.projects || []).find((p) => p.key === name);
+    if (pr && pr.file !== file) {
+      // 同名条目但文件已改名：登记 cwd 进原条目 + 按原 file 种标记，不新建文件（防双条目打架）
+      registerCwdIntoEntry(pr, root);
+      writeProjectIndex(idx);
+      const sm = seedProjectMarker(root, pr.key, pr.file);
+      res.registered = true; res.seeded = !!(sm && sm.ok);
+      res.key = pr.key; res.file = pr.file; res.reason = "renamed-entry"; res.acted = true;
+      return res;
+    }
+    const full = portable(MEMORY_ROOT + "/projects/" + file);
+    if (!fs.existsSync(full)) {
+      const sk = "# " + name + "\n\n> " + dayStrLocal(new Date()) + " 自动建档（dsh-memory：工作空间首次会话创建；dream 整合/漏网归档按节写入）\n\n## Rules\n\n## Architecture decisions\n\n## Patterns\n\n## Gotchas\n\n## Discovered durable knowledge\n";
+      const wr = writeFileAtomic(full, sk, { tag: "projboot", verify: true });
+      if (!wr || !wr.ok || wr.readbackOk === false) { res.reason = "write-fail"; return res; }
+      res.created = true;
+    }
+    if (pr) registerCwdIntoEntry(pr, root);
+    else idx.projects.push({ key: name, display: name, file: file, workdirs: [root], updatedAt: Date.now(), root: root, aliases: [] });
+    writeProjectIndex(idx);
+    res.registered = true;
+    const sm2 = seedProjectMarker(root, name, file);
+    res.seeded = !!(sm2 && sm2.ok);
+    res.key = name; res.file = file;
+    res.acted = res.created || res.registered || res.seeded;
+    return res;
+  } catch (e) { res.reason = "error:" + (e && e.message ? e.message : String(e)); return res; }
+}
+function registerCwdIntoEntry(pr, root) {   // v2.6.2：cwd 补登记（normCwd 口径去重；root 缺才补；stale 复位）
+  const wds = Array.isArray(pr.workdirs) ? pr.workdirs : [];
+  const nr = normCwd(root);
+  if (!wds.some((w) => normCwd(w) === nr)) wds.push(root);
+  pr.workdirs = wds;
+  if (!pr.root) pr.root = root;
+  if (pr.stale) delete pr.stale;
+  pr.updatedAt = Date.now();
+}
+
 function normalizeErrorSigFromRaw(raw) {
   const unwrapped = String(raw || "").slice(0, 300)
     .replace(/^Error:\s*code run failed \(exception\):\s*/i, "")
@@ -2164,6 +3218,8 @@ function monitorEvent(type, detail) {
 
 // v2.1.3: 超限告警按文件 60 分钟冷却——多会话并发注入时同一超限重复 cwarn 刷屏（实测 4 秒 22 行）
 const SIZE_WARN_LAST_AT = {};
+// v2.6.7（W2）：近限「按变化报」的内存冷却表（每 rel 10 分钟；水位账本持久化在 .integrate.json）
+const NEAR_HARD_TOLD = new Map();
 function sizeWarnThrottled(key, msg) {
   const now = Date.now();
   if (now - (SIZE_WARN_LAST_AT[key] || 0) < 3600000) return;
@@ -2228,6 +3284,9 @@ function updateMonitorSummary() {
       mLine += " · token 消耗 输入约 " + wanW(mt.inT) + " 万" + (hitRate !== null ? "（缓存命中 " + hitRate + "%）" : "") + " / 输出约 " + wanW(mt.outT) + " 万";
       sumLines.push(mLine);
     }
+    // v2.8.4（P18/自动归档包⑤）：自动归档一行 —— 「跑没跑 + 为什么 + 上轮内容见证」放到运行状况里。
+    //   为什么必须有读者：账本里写了证据但没人读 = 等于没写（红队口径：**不可观测的自动化不许上线**）。
+    try { if (typeof __archiveSignalLine === "function") sumLines.push(__archiveSignalLine()); } catch (e) {}
     const spirN = Array.isArray(d.spiralEvents) ? d.spiralEvents.length : 0;
     // v2.2.1: 阈值变化情况展示——当前生效值+最近一次调整（替代静态文案）
     const et = effectiveSpiralThresh();
@@ -2273,9 +3332,9 @@ function updateMonitorSummary() {
     }
     MONITOR_LAST_SUMMARY = s;
     MONITOR_LAST_PUSH_AT = nowMs;
-    // v1.12.2: register scope 无 set —— 只有 get/watch/update/replace；update 是异步 merge 写路径
-    if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-      // v2.3.1：日志只输出变动行（sLog）；设置界面 monitorSummary 仍全量 s；无任何量变动 → 静默不打印
+    // [2026-09-23 dsh 0.1.7 适配] scope 通道退役：统计改走 LIVE_STATS，随 /dsh-memory/stats.json 下发（设置页 fetch 显示）
+    {
+      // v2.3.1：日志只输出变动行（sLog）；无任何量变动 → 静默不打印
       let didLog = false;  // v1.12.9：本次是否打了内容日志（成功回执与之同条件）
       const logSig = sLog !== null ? sLog.split("\n").filter((l) => l.indexOf("累计") !== 0).join(" ⏎ ") : "";
       if (sLog !== null && logSig !== MONITOR_LAST_LOG_SIG) {
@@ -2283,11 +3342,8 @@ function updateMonitorSummary() {
         didLog = true;
         clog("[dsh-memory] 推送监控汇总:\n" + sLog);
       }
-      Promise.resolve().then(() => HOST_SETTINGS_SCOPE.update({ monitorSummary: s }))
-        .then(() => { if (didLog) clog("[dsh-memory] 监控汇总推送成功"); })  // v1.12.9：静默推送完全无声
-        .catch((err) => cwarn("[dsh-memory] 监控汇总推送失败:", err && err.message ? err.message : String(err)));
-    } else {
-      clog("[dsh-memory] 监控汇总未推送: scope=" + (HOST_SETTINGS_SCOPE ? String(typeof HOST_SETTINGS_SCOPE.update) : "null"));
+      LIVE_STATS.monitorSummary = s;
+      if (didLog) clog("[dsh-memory] 监控汇总已更新（随 stats.json 下发）");  // v1.12.9：静默推送完全无声
     }
   } catch (e) { cwarn("[dsh-memory] updateMonitorSummary 异常:", e && e.message ? e.message : String(e)); }
 }
@@ -2334,6 +3390,39 @@ function monitorHintW() {
   monitorEvent("hintW", { time: Date.now() });
 }
 
+// ═══ v3.2.0（2026-10-02 Wave 0）：闸门决策留痕 recordGate ═══
+//   每次"命中后过闸"都留一条：reason=ok（放行）/batch（批量进展豁免）/cooldown（冷却）/off（spiralRemind 关闭）。
+//   ★ 为什么必须落盘：2026-10-01 事故里 D 类 7 次命中全部无投递，而插件**不记录闸门结果** ⇒
+//     只能靠"排除冷却 ⇒ 只剩 batchLike"反推（红队 03 §1.3）。没有这个字段，同类问题下次仍不可归因。
+//   ★ 体积纪律：W 的闸门每个工具步都会评估，逐条落盘会把 300 条上限顶穿 ⇒ **段合并**：
+//     同一 (sid,cls,reason) 10 分钟内重复决策就地累加 n（不追加条目）。实测拦截 ~7 次/58h，合并后日均 <20 条。
+const GATE_SEG_MS = 10 * 60000;
+const GATE_SEG = new Map();              // "sid|cls|reason" -> gateEvents 条目引用（内存态，重启即空）
+function recordGate(cls, reason, sid, extra) {
+  try {
+    if (PLUGIN_CFG.monitorEnabled === false) return;
+    const d = readMonitorData();
+    if (!Array.isArray(d.gateEvents)) d.gateEvents = [];
+    const now = Date.now();
+    const key = String(sid || "?") + "|" + cls + "|" + reason;
+    const prev = GATE_SEG.get(key);
+    if (prev && (now - prev.t) < GATE_SEG_MS && d.gateEvents.indexOf(prev) >= 0) {
+      prev.n = (prev.n || 1) + 1;        // 段合并：同段内只累加计数
+      prev.t = now;
+      if (extra) for (const k of Object.keys(extra)) prev[k] = extra[k];
+      d.updatedAt = now;
+      scheduleMonitorSave();
+      return;
+    }
+    const e = Object.assign({ t: now, n: 1, cls: cls, reason: reason }, extra || {});
+    d.gateEvents.push(e);
+    if (d.gateEvents.length > 300) d.gateEvents = d.gateEvents.slice(-300);   // 滚动 300（旧引用失效由 indexOf 兜住）
+    GATE_SEG.set(key, e);
+    d.updatedAt = now;
+    scheduleMonitorSave();
+  } catch (e) { /* 埋点失败绝不影响主功能 */ }
+}
+
 // v2.6.0（D 级打转熔断）：熔断动作计数 + breakerEvents 样本落盘（独立于 D/E/W，防污染 spiralEvents 校准与 hints 口径）
 function monitorHintBrk(level, tool, reason, action) {
   try {
@@ -2372,6 +3461,8 @@ function monitorToolCall(toolName, meta, args, sid) {
         d.hintOpen = null;
         const sr = SPIRAL_REMIND_AT.get(sid);
         if (sr) { sr.streak = 0; SPIRAL_REMIND_AT.set(sid, sr); }   // v2.0.6: 提醒奏效立即恢复灵敏度
+        const se = SPIRAL_REMIND_E_AT.get(sid);   // v3.2.0: E 桶独立，同样「奏效即复位」
+        if (se) { se.streak = 0; SPIRAL_REMIND_E_AT.set(sid, se); }
       } else {
         d.hintOpen.count += 1;
         const cap = d.hintOpen.kind === "A" ? FOLLOW_CAP_A : FOLLOW_CAP_BC;
@@ -2413,6 +3504,43 @@ function effectiveSpiralThresh() {
     brkMinSteps: Math.round(num(t.brkMinSteps, 1, 5, BRK_MIN_STEPS))
   };
 }
+// v3.2.0（2026-10-02 Wave 1）：**阈值世代快照 threshEpoch()** —— 写进每条阈值变更日志，
+//   供日后"只看同世代样本"做校准（红队 03 阶段2 靶5：旧日志只有 from→to，无法判断样本是否跨世代；
+//   且 E 相关字段 sameMinSecs/sameHomo 必须一起进快照，否则动 E 会立刻污染校准面）。
+function threshEpoch() {
+  const e = effectiveSpiralThresh();
+  return { rep: e.rep, neg: e.neg, sim: e.sim, w: e.w, cooldownMin: e.cooldownMin,
+    sameNeg: e.sameNeg, sameSteps: e.sameSteps, sameMinSecs: e.sameMinSecs, sameHomo: e.sameHomo,
+    watchSteps: e.watchSteps, watchSecs: e.watchSecs, watchCooldownMin: e.watchCooldownMin,
+    brkSameN: e.brkSameN, brkMaxDeny: e.brkMaxDeny, brkMinSteps: e.brkMinSteps };
+}
+
+// ═══ v3.2.0（2026-10-02 Wave 1）：阈值**一次性事故回调** ═══
+//   事故：D 类阈值被 /dream 自校准单向上棘轮推到硬上限 rep=0.80（`spiralThreshLog` 17 条里 6 条同一理由），
+//     此后 D 自 2026-09-29 13:33 起再无投递（红队 03 阶段1 实证）。
+//   依据（Lead 独立复算，97 条 D 样本按 k=round(repRate·winLen) 还原后）：rep 0.80 保留 63/97，
+//     而 **0.75 = 0.70 = 0.65 = 94/97**（同属 k≥6 格点）⇒ 只需一步 0.80→0.75 就拿回全部灵敏度，
+//     且这一步正好**跨格点**（k≥7→k≥6），满足"单轮 ≤0.05 且必须跨格点"的防抖约束。
+//   一次性：由 `md.threshMigr.rep075` 记账（-1 = 判定过且无需迁移）；用户日后手动改回 0.80 不会被再次覆盖。
+function applyThresholdMigrations() {
+  try {
+    const md = readMonitorData();
+    if (!md.threshMigr || typeof md.threshMigr !== "object") md.threshMigr = {};
+    if (md.threshMigr.rep075) return;
+    const cur = effectiveSpiralThresh();
+    if (!(cur.rep > 0.75)) { md.threshMigr.rep075 = -1; return; }   // 已是 ≤0.75（或用户自带配置）→ 不动
+    md.spiralThresh = Object.assign({}, (md.spiralThresh || {}), { rep: 0.75 });
+    if (!Array.isArray(md.spiralThreshLog)) md.spiralThreshLog = [];
+    md.spiralThreshLog.push({ t: Date.now(), from: { rep: cur.rep }, to: { rep: 0.75 }, dir: "sens",
+      reason: "事故回调（v3.2.0 一次性迁移，人工）：rep 被自校准棘轮到上限 0.80 后 D 类自 09-29 13:33 静默；复算 97 条样本 0.75=94/97 而 0.80=63/97，且 0.75/0.70/0.65 保留数相同",
+      ep: threshEpoch() });
+    if (md.spiralThreshLog.length > 20) md.spiralThreshLog = md.spiralThreshLog.slice(-20);
+    md.threshMigr.rep075 = Date.now();
+    scheduleMonitorSave();
+    clog("[dsh-memory] 阈值一次性迁移：rep " + cur.rep + "→0.75（事故回调；仅执行一次，记账 threshMigr.rep075）");
+  } catch (e) { /* 迁移失败绝不阻塞启动 */ }
+}
+
 // v2.4.30（E 类）：结果归一化指纹——折叠空白 + 时间戳/数字/uuid 占位 + 前后 64 拼接 hash。
 // 根治 resKey 前 80 字原文截断的「固定头动态尾虚高 / 时间戳前置虚低 / 模板化两头皆错」三类缺陷（评审 P0-2）。
 function resultFingerprint(rTxt) {
@@ -2477,6 +3605,10 @@ let DREAM_LISTENER = null;
 // 不节流一个 dream 会往会话流灌 20~60 行；每 60 秒最多落一行（首条/终态/health 不受限）。
 let DREAM_BROADCAST_LAST_AT = 0;
 const DREAM_BROADCAST_MIN_MS = 60000;
+// [dream-visible 20260930] 本轮手动 dream 是否已用「唤醒」投递过发起行——同步段即时回执先占位（见 runDreamPipeline），
+//   之后 spawnIntegrate 发出的 running patch 就不再重复唤醒（避免开两个回合），只按原样落表。
+//   自动/定期整合传的 agentForParent 是 null ⇒ DREAM_LISTENER 为空，本标记恒 false，不受影响。
+let DREAM_WOKE = false;
 // v2.4.14(lesson-settle): 本轮 dream 投喂的回归条目序号→(sig,sessionId) 清单。
 // 投喂时写入（pick 顺序，序号 L1..Ln），settleDream 按子代理 Output 的 lesson-skip:L1,L3 结算 fed/skippedByDream；跑完即清。
 let DREAM_FEED_ROUND = null;
@@ -2509,7 +3641,7 @@ function spiralBucket(sid) {
     // v2.4.30（E/W 类）：桶扩 lastUserAt/stepsSinceUser——W 看门狗无用户介入计数（pre-step step1 复位）
     b = { cur: null, win: [], ws: "?", lastUserAt: 0, stepsSinceUser: 0,
       // v2.6.0（D 级熔断态）：suspectKeys=同指纹 suspect 键集；denyN=本周期累计 deny 次数；fullStop=拒调达上限准备停轮；seq=同指纹连续计数
-      brk: { suspectKeys: new Set(), denyN: 0, fullStop: false, seq: 0, seqKey: "" } };
+      brk: { suspectKeys: new Set(), denyN: 0, fullStop: false, seq: 0, seqKey: "", lastRFp: "" } };
     SPIRAL_BUCKETS.set(key, b);
   }
   return b;
@@ -2523,10 +3655,10 @@ function diceBigram(a, b) {
   for (const g of A) if (B.has(g)) inter++;
   return (2 * inter) / (A.size + B.size);
 }
-function spiralObserve(toolName, args, result, isError, sid) {
+function spiralObserve(toolName, args, result, isError, sid, callId) {
   // v2.4.30（E 类）：返回布尔 → { d, e }——D/E 并列计算再统一返回（架构评审 P0：旧实现 D 命中提前 return 会吞掉 E 判定）
   try {
-    if (PLUGIN_CFG.monitorEnabled === false || SPIRAL_SKIP.has(toolName)) return { d: false, e: false };
+    if (PLUGIN_CFG.monitorEnabled === false || SPIRAL_SKIP.has(toolName)) return { d: false, e: false, rep: 0, neg: 0, win: 0, eN: 0 };
     const B = spiralBucket(sid);   // v2.0.1: 会话桶 { cur, win, ws } 替代全局单例
     const ET = effectiveSpiralThresh();   // v2.0.3: 生效阈值（内置默认 + spiralThresh 覆盖层）
     let aTxt = "";
@@ -2545,7 +3677,21 @@ function spiralObserve(toolName, args, result, isError, sid) {
     let stepSim = 0;
     for (const w of B.win) { const s2 = diceBigram(aTxt, w.argsTxt); if (s2 > stepSim) stepSim = s2; if (s2 >= ET.sim) rep = 1; }
     // v2.4.30（E 类，架构 P0 Q3）：窗元素双字段——resKey 原文前 80 字保留（保 batchLike/D 语义 L5983）+ resKeyFp 归一化指纹（E 专用）；补 ts 供簇墙钟
-    B.win.push({ argsTxt: aTxt, resKey: rTxt.slice(0, 80), resKeyFp: resultFingerprint(rTxt), neg: neg ? 1 : 0, rep, tool: toolName, sim: Math.round(stepSim * 100) / 100, ts: Date.now() });
+    // ═══ v3.2.0（2026-10-02 Wave 1）候选0：折叠「一次逻辑调用被观测两次」═══
+    //   实证（红队 03 §1.3.1，两窗逐字复现）：一次 run_code 会先产生**内层** ptc 调用观测、再产生**外壳** run_code 观测
+    //   ⇒ 同一次失败被双计 neg；两侧结果文本略有差异又让 uniq 虚增 ⇒ batchLike 把"打转"读成"批量进展"并静默。
+    //   折叠规则（宿主约定 subCallId = `${rootCallId}:ptc:${n}`）：含 ":ptc:" 的是内层，正常入窗并记 rootId；
+    //   外壳（其 callId 恰为窗内某内层条目的 rootId）**整条跳过**——不入窗、不计 calls/neg，避免同一逻辑步计两次。
+    //   关闭方式：PLUGIN_CFG.spiralFoldPtc=false（回退旧口径做对照）。
+    const cid = String(callId || "");
+    const pIdx = cid.indexOf(":ptc:");
+    const isInner = pIdx > 0;
+    const rootId = isInner ? cid.slice(0, pIdx) : cid;
+    if (PLUGIN_CFG.spiralFoldPtc !== false && cid && !isInner) {
+      const folded = B.win.some((w) => w && w.rootId === cid && w.sub === true);
+      if (folded) return { d: false, e: false, rep: 0, neg: 0, win: B.win.length, eN: 0, folded: true };
+    }
+    B.win.push({ argsTxt: aTxt, resKey: rTxt.slice(0, 80), resKeyFp: resultFingerprint(rTxt), neg: neg ? 1 : 0, rep, tool: toolName, sim: Math.round(stepSim * 100) / 100, ts: Date.now(), rootId: rootId || "", sub: isInner });
     if (B.win.length > ET.w) B.win.shift();
     if (!B.cur) B.cur = { t0: Date.now(), calls: 0, negN: 0, errN: 0, spiralN: 0, spiralE: 0, tools: {}, sims: [] };   // v2.2.8: sims 累积步间相似度；v2.4.30 加 spiralE
     B.cur.calls += 1;
@@ -2554,10 +3700,14 @@ function spiralObserve(toolName, args, result, isError, sid) {
     if (neg) B.cur.negN += 1;
     if (isError) B.cur.errN += 1;
     let dHit = false, eHit = false;
+    // v3.2.0（Wave 0）：把命中判据原样带回调用点——recordGate 需要真值，禁止调用点重算（重算=另一种口径漂移）。
+    let retRep = 0, retNeg = 0, retEN = 0;
     if (B.win.length >= 5) {
       const n = B.win.length;
       const repRate = B.win.reduce((s2, w2) => s2 + w2.rep, 0) / n;
       const negRate = B.win.reduce((s2, w2) => s2 + w2.neg, 0) / n;
+      retRep = Math.round(repRate * 100) / 100;
+      retNeg = Math.round(negRate * 100) / 100;
       // ── D 判定（语义与 v2.4.29 逐字节等价；只把提前 return 改 flag）──
       if (repRate >= ET.rep && negRate >= ET.neg && B.cur) {
         const firstHit = B.cur.spiralN === 0;   // 本周期首次命中
@@ -2581,6 +3731,7 @@ function spiralObserve(toolName, args, result, isError, sid) {
       // 与 D 判定并列计算（架构 P0：D 命中不吞 E、d/e 独立可测）；同轮 d/e 同真由调用点单 gate 裁决（D>E 优先级）
       if (repRate >= ET.rep && B.cur) {
         const cluster = extractArgsCluster(B.win, aTxt, ET.sim);
+        retEN = cluster.length;   // v3.2.0：E 提醒文案要用**簇长**（旧实现误用窗长，见调用点修复）
         if (cluster.length >= ET.sameSteps) {
           const clNegN = cluster.reduce((s2, c) => s2 + c.w.neg, 0);
           const clNegRate = clNegN / cluster.length;
@@ -2602,9 +3753,9 @@ function spiralObserve(toolName, args, result, isError, sid) {
         }
       }
     }
-    return { d: dHit, e: eHit };
+    return { d: dHit, e: eHit, rep: retRep, neg: retNeg, win: B.win.length, eN: retEN };
   } catch (e) { /* 探针失败不影响会话 */ }
-  return { d: false, e: false };
+  return { d: false, e: false, rep: 0, neg: 0, win: 0, eN: 0 };
 }
 // v1.12.16: 任务周期画像结算（pre-step 新用户输入时调用）——后续动态阈值的基线数据
 function settleTurnProfile(sid) {
@@ -2643,8 +3794,12 @@ function armBreakSuspect(toolName, args, result, isError, spSid) {
     if (BREAK_READ_SKIP.has(toolName)) return;
     // 元工具豁免（沿用 SPIRAL_SKIP）
     if (SPIRAL_SKIP.has(toolName)) return;
-    // 无用户穿插检查
-    if ((B.stepsSinceUser || 0) < brkMinSteps) return;
+    // 无用户穿插检查（[2026-09-23 修根因]）
+    //   原实现把本闸放在 seq 计数**之前** → 单回合内前 brkMinSteps 步完全不观测，seq 恒停在 1，
+    //   永远解不开 brkSameN=3 ⇒ suspectKeys 恒空、D2/D3 长期不触发（监控"熔断动作 0"的真因）。
+    //   现改为**只 gate 最后的 add**：seq 照常累计（纯内存计数，无副作用），
+    //   只在「连续重复已达标 且 确无用户穿插」时才武装 suspect —— 语义与设计注释一致，不降低误伤门槛。
+    const noUserInterleave = (B.stepsSinceUser || 0) >= brkMinSteps;
     // 计算指纹
     let aTxt = "";
     try { aTxt = String(typeof args === "string" ? args : JSON.stringify(args) || ""); } catch (e) {}
@@ -2660,8 +3815,8 @@ function armBreakSuspect(toolName, args, result, isError, spSid) {
       B.brk.seqKey = key;
       B.brk.lastRFp = rFp;
     }
-    // 达阈值 → 进 suspect
-    if (B.brk.seq >= brkSameN) {
+    // 达阈值 且 无用户穿插 → 进 suspect（门槛只在武装这一步生效，见上）
+    if (B.brk.seq >= brkSameN && noUserInterleave) {
       B.brk.suspectKeys.add(key);
     }
   } catch (e) {}
@@ -2691,9 +3846,18 @@ function armBreakSuspect(toolName, args, result, isError, spSid) {
         try { sdirs = fs.readdirSync(path.join(SESSIONS_ROOT, ws.name), { withFileTypes: true }); } catch (e) { continue; }
         for (const s of sdirs) {
           if (!s.isDirectory() || !s.name.startsWith("session-")) continue;
-          const z = path.join(SESSIONS_ROOT, ws.name, s.name, "session.jsonl.zstd");
+          const sdir = path.join(SESSIONS_ROOT, ws.name, s.name);
+          // v2.8.4（P21）：取**全部**同目录日志（双名目录旧实现整类看不见后者，实测 7 个目录命中）
+          const zs = resolveSessionLogPaths(sdir);
+          if (!zs.length) { probeUnknownLogNames(sdir); continue; }   // v2.6.5: 未识别名顺带采集（供自检提示）
           let st;
-          try { st = fs.statSync(z); } catch (e) { continue; }
+          try {
+            // P21：`mtime` 取**最大**（= 最后交互，启用界限判定必须用它），`size` 取**和**（= 会话真实体量）。
+            //   旧实现只看 v3 一个文件 ⇒ 双名会话的 mtime 可能取到更早的那个、size 少算一半以上。
+            let mtimeMs = 0, size = 0;
+            for (const zp of zs) { const s1 = fs.statSync(zp); if (s1.mtimeMs > mtimeMs) mtimeMs = s1.mtimeMs; size += s1.size; }
+            st = { mtimeMs: mtimeMs, size: size };
+          } catch (e) { continue; }
           // v1.6.1 修正：启用界限用「会话最后交互时间」（mtime）而非创建时间——
           // 最后交互在插件最近一次启用之前的会话（含插件关闭期间结束的）不触发整合；
           // 只有最后交互在启用之后的会话才纳入漏网检测。
@@ -2708,134 +3872,821 @@ function armBreakSuspect(toolName, args, result, isError, spSid) {
     }
 
 // v1.8.0：提取会话日志的 compaction 摘要（根治 token 爆炸）——
-// 解压 session.jsonl.zstd（node:zlib zstd），找 compaction/summary 事件，返回摘要文本（截断防超长）。
+// 解压会话日志（session.jsonl.zstd 或新版 session.v3.jsonl.zstd，node:zlib zstd），找 compaction/summary 事件，返回摘要文本（截断防超长）。
 // 子代理只读这个摘要（几千 token），不再读原始大日志（几十 MB → 数百万 token）。
+// 批0（P0-4）账本上限**单源**——保存路径（saveStaleNotified）与"写盘前合并路径"（writeIntegrateState）
+//   曾各自硬编码同一个上限 300；两处一起把最旧会话挤掉（盘上 1065 会话、账本实测 280/300 即将顶格），
+//   顶格后最旧 id 静默丢失 ⇒ 重复归档或漏档。裁剪必要（防状态文件无限增长），但必须**同源 + 留痕**。
+const LEDGER_CAP = 5000;
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-function decompressSessionLog(filePath) {
+// v2.8.4（P12）：**提取口径版本号**。改 KEEP 集合／装配规则／截断策略时必须 +1。
+//   动机：单元缓存原只按「帧数单调」判陈旧（L3354 `d.frames > curFrames`），**改口径后旧单元会被
+//   当成有效产物复用** ⇒ 新口径永不生效、且 `mergeUnitCache` 会把旧内容并进新单元。
+//   加了它之后 `readUnitCache` 直接拒旧 ⇒ 口径变更自动全量重算。
+const EXTRACT_COUNTER_VER = 2;   // v2.8.4 = 2（v1 = 1：无 counterVer 时代）
+// ═══════ v2.8.4（P14/P15）：提取的**时间预算** + **已消费帧数** ═══════
+//   为什么必须有（P14 的因果）：旧码把水位写成 `countZstdFrames`（**文件总帧数**）。只要提取被任何原因截断
+//     （墙钟超时 / 异常 / 未来加的任何上限），水位就等于"已全部消费" ⇒ `archivePendingEntry` 恒 false
+//     ⇒ 剩余帧**永远不再被提取**，而且**完全不可观测**（账本看起来是正常的）。
+//   现状（P15）：单会话预算 = `max(8000, 400×sizeMiB)` ms —— 实测全库原始解码 ≈0.168 s/MiB（120.8 s / 718 MiB）
+//     即约 2.4× 余量；整轮预算 ≈90 s，**跨会话共享**（`L6809` 注释记过旧路径顶住会话启动 6 分 14 秒的事故）。
+const ROUND_EXTRACT_BUDGET_MS = 90000;
+function sessionExtractBudgetMs(sizeBytes) {
+  const sizeMiB = (Number(sizeBytes) || 0) / 1048576;
+  return Math.max(8000, 400 * sizeMiB);
+}
+// ═══════ v2.8.4（P4 第三保险）：装配期**运行时断言** ═══════
+//   为什么必须有（BUG-2 的实测教训）：装配链曾写成 `arr.map(p => p.s).join("\n")`，而元素是 `{si,frame,kind,body}`
+//   ⇒ `p.s` 全是 `undefined` ⇒ `Array.prototype.join` 把 `undefined` **静默渲染成空串** ⇒ 产物**只剩分隔符**
+//   （实测 `60e0713f` 9.06 MiB 会话的单元 `chars = 17` = 17 个换行）。这类错误**不抛、不 warn、看起来成功**，
+//   只有"产物里除分隔符外什么都没有"这一个表征 ⇒ 必须在**装配那一刻**把它钉死。
+//   本函数是 P4 的第三道保险（① `markers` 与件分装 ② 守卫按**内容**判空 ③ **本断言**）：
+//   任何元素不是**非空字符串**、或传进来的不是数组，一律**抛错**（宁可让调用方炸，也不产出半句话都没有的单元）。
+function joinPartsStrict(parts, tag) {
+  const t = tag || "(assembly)";
+  if (!Array.isArray(parts)) throw new Error("[dsh-memory] joinPartsStrict: " + t + " 收到非数组（" + typeof parts + "）");
+  if (parts.length === 0) throw new Error("[dsh-memory] joinPartsStrict: " + t + " 收到空数组");
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (typeof p !== "string") throw new Error("[dsh-memory] joinPartsStrict: " + t + " 第 " + i + " 件不是字符串（" + (p === null ? "null" : typeof p) + "）");
+    if (!p.trim()) throw new Error("[dsh-memory] joinPartsStrict: " + t + " 第 " + i + " 件为空白串（装配链出现空件 ⇒ 疑似 map 取错字段）");
+  }
+  return parts.join("\n");
+}
+// v2.8.4（P13）：**候选旁路**。原候选过滤 = `archivePendingEntry(s) && !sessionMentionedInMemory(s.id)`，
+//   两道闸串行：①水位（`cur > wm.frames`）②**已提及**（归档会把 `### <sid12>` 写进 sessions/*.md）。
+//   ⚠ **注释更正（§9.11.4-8，2026-09-19 取证）**：原文此处写"**凡内容落过盘的会话永远进不了候选**"，**与事实相反**。
+//     现场实测：`sessionMentionedInMemory` 原口径（完整 id / 去前缀完整 id）**匹配不到 `### <sid12>` 块头**
+//     ⇒ 289 个已归档会话里**只有 4 个命中（1.4%）** ⇒ 第二道闸**基本不生效**，真正把关的一直是第①道。
+//     同轮取证还确认：首次归档**0 重复**、`·补N` 多块之间**内容 0 重叠**（是正常增量补档，不是重复归档）。
+//   ⇒ 本文件已做两件事：①**补上 12 位短 id 判据**（命中率 → 145/289）；②把它的用途**限定为"首次归档"去重**
+//     （补档路径不参与 —— 否则 `·补N` 会被它挡死）。旁路（counterVer）仍保留原用途：修提取口径后重算存量单元。
+function unitCounterVerMismatch(sid, opts) {
   try {
-    const buf = fs.readFileSync(filePath);
-    let out = Buffer.alloc(0);
-    let off = 0;
-    while (off < buf.length) {
-      const frame = zlib.zstdDecompressSync(buf.subarray(off));
-      out = Buffer.concat([out, frame]);
-      let next = -1;
-      for (let i = off + 4; i < buf.length - 3; i++) {
-        if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) { next = i; break; }
+    const fsz = (opts && opts.fs) || fs;
+    const root = (opts && opts.root) || MEMORY_ROOT;
+    const p = String(root).replace(/\\/g, "/") + "/.archive-units/" + sid + ".json";
+    const d = JSON.parse(fsz.readFileSync(p, "utf8"));
+    return Number(d && d.counterVer) !== EXTRACT_COUNTER_VER;   // 缓存缺失（抛错）⇒ 下面的 catch 也返回 true
+  } catch (e) { return true; }                                  // 缺失 ⇒ 视为不匹配（要求重算）
+}
+function shouldReArchive(s, opts) {
+  const o = opts || {};
+  // ★ 旁路**默认关闭**。行为验证（2026-09-18）发现：存量单元全无 counterVer ⇒ 若默认开启，
+  //   首跑会把全部 280 个会话判为需重档，每个都会拉起归档子代理 ⇒ **token 大爆炸**
+  //   （插件设 ARCHIVE_MAX_CONCURRENT=5 正是防这个）。故改为**显式开启**（/dream 或 --rearchive）。
+  if (o.rearchiveOnMismatch && unitCounterVerMismatch(s.id, o)) return true;
+  // v2.8.4（P15）**未完成续跑**：本轮提取被墙钟掐断 ⇒ 账本留 `incomplete` 标记 ⇒ 无条件重入。
+  //   为什么必须放在**这里**（而不是靠 P13 的 counterVer 旁路）：`incomplete` 是 P15「超时不丢，下轮从该帧
+  //   续跑」这一保证的**唯一实现路径** —— 被掐断的会话已经落过盘 ⇒ `sessionMentionedInMemory` 恒 true
+  //   ⇒ 第二道闸恒拦；若不在此放行，"续跑"永远只是注释。
+  //   为什么它**不**带来 token 爆炸风险（与 counterVer 旁路的关键区别）：`incomplete` 是**自清除**的
+  //   （本轮完整归档即写回 false）且**只会因本轮真被掐断而置位** ⇒ 存量 280 个会话一个都不会被它命中，
+  //   且单轮重入数天然受 `MAX_ARCHIVE_SESSIONS=32` 与整轮 90 s 预算夹紧。
+  const wmv = ARCHIVE_WATERMARK.get(s.id);
+  if (wmv && wmv.incomplete === true) return true;
+  // ★★ 修正十三（**红队 rev8h B 实测**）：**"按水位跳过"必须真重试** —— 否则修正十一只是把
+  //   "消号后永久漏档"换成了"不消号但**永久静默挂起**"：红队实测 `archivePendingEntry` 因水位虚高
+  //   （`cur == wm.frames`）恒假 ⇒ 永不重选，而 `incomplete` 未置、counterVer 旁路默认关 ⇒ 三条路全 false。
+  //   凭据由落盘段写（`wmSkip` + `wmSkipRounds`）；**有限次**：到上限即不再重选（改由落盘段的 `cwarn`
+  //   升级为**人工告警**）⇒ 既不无限烧轮、也不静默。
+  if (wmv && wmv.wmSkip === true && (Number(wmv.wmSkipRounds) || 0) < WM_SKIP_MAX_ROUNDS) return true;
+  // ★★ §9.11.4-8（**现场取证驱动**）：最后这道闸的**用途限定**与**注释更正**。
+  //   【注释更正】原文写"凡内容落过盘的会话永远进不了候选"—— **与事实相反**（现场取证：原口径命中率仅
+  //     1.4%，即 285/289 的已归档会话**照样**会被它放行；首次归档 0 重复、`·补N` 内容 0 重叠也印证了
+  //     "真正把关的是第一道闸 `archivePendingEntry`（水位比较）"）。
+  //   【用途限定】`sessionMentionedInMemory` **不得当补档闸**：`·补N` 是正常特性（续聊增量重档，内容不重叠），
+  //     若对补档也生效 ⇒ **续聊永不补档**。⇒ 它只在"**首次归档**"时参与去重：
+  //       首次 = 水位 `round <= 1`（或没有水位条目）。补档（`round >= 2`）时**跳过该判断**，只看水位。
+  const round0 = wmv ? (Number(wmv.round) || 1) : 1;
+  const isFirstArchive = round0 <= 1;
+  if (!isFirstArchive) return archivePendingEntry(s);          // 补档路径：只认水位（不认"提及"）
+  return archivePendingEntry(s) && !sessionMentionedInMemory(s.id);
+}
+// 旁路开关的**唯一读点**（三个候选调用点共用，避免三处各写一份开关判定）：
+//   ① 环境变量 `DSH_MEMORY_REARCHIVE=1`（重启前设置即可，不需要改配置模式）
+//   ② 配置键 `rearchiveOnMismatch: true`（若 normalizeCfg 保留该键）
+function reArchiveOpts() {
+  return {
+    rearchiveOnMismatch: (typeof process !== "undefined" && process.env && process.env.DSH_MEMORY_REARCHIVE === "1") ||
+      !!(PLUGIN_CFG && PLUGIN_CFG.rearchiveOnMismatch),
+  };
+}
+const MAX_REARCHIVE_PER_ROUND = 40;   // 单轮重档上限（与 MAX_ARCHIVE_SESSIONS 同量级；分多轮排空）
+// 候选选取（推荐调用点用这个而不是裸 filter）：默认行为与旧版**逐字一致**；开启旁路时
+//   ①先收"正常重入"的 ②再把口径不符的按**受损程度**（单元字符最少者优先）**截断到上限**。
+// ═══ §9.12②（用户「都搞」）：**跳过判定的两把机器尺** ═══
+//   动机：`skip=true` 的含义是"这个会话的内容**不进记忆库**"，而此前的唯一约束是"给个理由"——理由是自由文本，
+//   机器判不了真假（实测 2026-09-18 那轮 5 个会话共约 5.4 万字符被声明跳过）。用户最怕的正是"内容没计入"，
+//   所以真正的保证不该是"请写理由"，而应当是**"跳过 ⇒ 正文仍可恢复"**（§9.12① 那条单元检索通道就是这条路）。
+//   ① `readArchiveUnitForSkip`：**可恢复 = 单元存在且 `chars>0`**；★ 但**它不再决定放行/拒**（见下）——它只回答
+//      "这次跳过之后，正文还有没有副本可捞"，答案连同原因（`unitWhy`）一起进见证；
+//   ② `unitIndexedInSearchCache`：**软记录**（不是硬闸）—— 只如实记下"写这批时它是否已在检索缓存里"，
+//      因为检索路径本身会按需增量重建单元索引（§9.12①）⇒"此刻没索引"≠"搜不到"。
+const ARCHIVE_UNITS_DIR = MEMORY_ROOT + "/.archive-units";
+const SEARCH_CACHE_UNITS_DIR = DSH_HOME + "/session-text/_units";
+function readArchiveUnitForSkip(sid) {
+  const s = String(sid || "").trim();
+  if (!s) return { ok: false, why: "sid-empty" };
+  // ★ 根因席 C（2026-09-19）：**写方用 12 位、读方却按 8 位**——同一处口径分裂。现在两边同走 `unitSid`（唯一所有者），
+  //   精确匹配在前；前缀兜底仅用于**命名口径不同的存量单元**，且命中多个时**先按 `d.sid` 精确挑一个**，
+  //   不再直接判"前缀命中多个 ⇒ 无法确定依据"（那是一条**硬拒死路**：legacy 与 v3 单元并存时必然触发）。
+  const key = unitSid(s);
+  const dir = portable(ARCHIVE_UNITS_DIR);
+  let file = null, viaPrefix = false;
+  try {
+    const exact = key + ".json";
+    if (fs.existsSync(dir + "/" + exact)) file = exact;
+    else {
+      const pref = key.slice(0, 8);
+      const hits = fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f.startsWith(pref) && f !== exact);
+      if (hits.length === 1) { file = hits[0]; viaPrefix = true; }
+      else if (hits.length > 1) {
+        const same = hits.filter((f) => {
+          try { const d = JSON.parse(fs.readFileSync(dir + "/" + f, "utf8")); return unitSid(d && d.sid) === key; } catch (e) { return false; }
+        });
+        if (same.length === 1) { file = same[0]; viaPrefix = true; }
+        else return { ok: false, why: "unit-multi-hit: 前缀 " + pref + " 命中 " + hits.length + " 个候选，且 d.sid 无法唯一定位请求的 " + key };
       }
-      if (next < 0) break;
-      off = next;
     }
-    return out.toString("utf8");
+  } catch (e) { return { ok: false, why: "unit-dir-unreadable: " + ARCHIVE_UNITS_DIR }; }
+  if (!file) return { ok: false, why: "no-unit-file: .archive-units/" + key + ".json 不存在" };
+  try {
+    const d = JSON.parse(fs.readFileSync(dir + "/" + file, "utf8"));
+    const ch = Number(d && d.chars) || String((d && d.text) || "").length;
+    if (!(ch > 0)) return { ok: false, why: "unit-empty: " + file + " 为空（chars=0）" };
+    // 评审整改（红队 R-3 + 根因席 C）：**"有单元"必须真是这个会话的单元**，且比较口径与文件名一致（**精确**，不再只比 8 位）。
+    const declared = unitSid(d && d.sid);
+    if (declared && declared !== key) {
+      return { ok: false, why: "unit-sid-mismatch: " + file + " 的 sid 字段（" + declared + "）≠ 请求（" + key + "）" };
+    }
+    return { ok: true, file: file, chars: ch, counterVer: Number(d && d.counterVer) || 0, truncated: d && d.truncated === true, sampled: d && d.sampled === true, viaPrefix: viaPrefix };
+  } catch (e) { return { ok: false, why: "unit-unreadable: " + file }; }
+}
+function unitIndexedInSearchCache(sid) {
+  const pref = unitSid(sid).slice(0, 8);   // 检索缓存是**另一套**命名（CLI 侧按 8 位分目录，见 CLI 的 `normSid`）⇒ 这里显式取 8 位
+  if (!pref) return false;
+  try {
+    const root = portable(SEARCH_CACHE_UNITS_DIR);
+    for (const day of fs.readdirSync(root)) {
+      const p = root + "/" + day + "/" + pref;
+      if (fs.existsSync(p + "/manifest.json")) {
+        const m = JSON.parse(fs.readFileSync(p + "/manifest.json", "utf8"));
+        if (m && Array.isArray(m.segs) && m.segs.length) return true;
+      }
+    }
+  } catch (e) { return false; }
+  return false;
+}
+export { readArchiveUnitForSkip, unitIndexedInSearchCache };
+
+function unitCharsOf(sid, opts) {  try {
+    const fsz = (opts && opts.fs) || fs;
+    const root = (opts && opts.root) || MEMORY_ROOT;
+    const d = JSON.parse(fsz.readFileSync(String(root).replace(/\\/g, "/") + "/.archive-units/" + sid + ".json", "utf8"));
+    return Number(d && d.chars) || 0;
+  } catch (e) { return -1; }        // 缺失 ⇒ 最优先（-1 排最前）
+}
+// v2.8.4（损伤代理替换）：单元**实际被丢内容量** —— `dropped`（机制层丢弃，含 `(merge-overflow)`）各 kind 的
+//   `chars` 之和 + `truncs`（截断，`raw−kept`）之和。为什么不用 `chars`：所有单元都被 `UNIT_MAX_CHARS` 封顶 ⇒
+//   `chars` 升序在受损单元之间**失去分辨力**（见 `pickReArchiveCandidates` 内注释）。
+//   返回 `missing:true, damage:-1` 表示缓存缺失/不可读（无元数据 ⇒ 排最前，最需要重算）。
+function unitDamageOf(sid, opts) {
+  try {
+    const fsz = (opts && opts.fs) || fs;
+    const root = (opts && opts.root) || MEMORY_ROOT;
+    const d = JSON.parse(fsz.readFileSync(String(root).replace(/\\/g, "/") + "/.archive-units/" + sid + ".json", "utf8"));
+    let droppedChars = 0;
+    if (d && d.dropped && typeof d.dropped === "object") {
+      for (const k of Object.keys(d.dropped)) droppedChars += Number((d.dropped[k] || {}).chars) || 0;
+    }
+    let truncChars = 0;
+    if (d && Array.isArray(d.truncs)) {
+      for (const t of d.truncs) {
+        const raw = Number(t && t.raw), kept = Number(t && t.kept);
+        // 缺任一字段 ⇒ **跳过该条**（不凭残缺数据编造丢失量；生产端三处 `truncs.push` 都同时写 raw/kept）
+        if (!Number.isFinite(raw) || !Number.isFinite(kept)) continue;
+        truncChars += Math.max(0, raw - kept);
+      }
+    }
+    return { chars: Number(d && d.chars) || 0, droppedChars: droppedChars, truncChars: truncChars, damage: droppedChars + truncChars, missing: false };
+  } catch (e) { return { chars: 0, droppedChars: 0, truncChars: 0, damage: -1, missing: true }; }
+}
+function pickReArchiveCandidates(list, opts) {
+  const o = opts || {};
+  // 「正常重入」= 两道闸（水位 + 未提及）**外加** P15 的 `incomplete` 续跑（它有界、自清除，与 counterVer 旁路不同类）。
+  const normal = list.filter((s) => {
+    const wmv = ARCHIVE_WATERMARK.get(s.id);
+    if (wmv && wmv.incomplete === true) return true;
+    return archivePendingEntry(s) && !sessionMentionedInMemory(s.id);
+  });
+  if (!o.rearchiveOnMismatch) return normal;
+  const cap = Number.isFinite(o.cap) ? o.cap : MAX_REARCHIVE_PER_ROUND;
+  const stale = list
+    .filter((s) => normal.indexOf(s) < 0 && unitCounterVerMismatch(s.id, o))
+    // v2.8.4（损伤代理替换，用户 2026-09-18「全部做完」项）：旧排序键 = `unitCharsOf`（单元字符数**升序**，
+    //   假设"单元越小越受损"）。该假设在 P16/§8.6 之后**已经不成立**：所有单元的 `chars` 都被
+    //   `UNIT_MAX_CHARS` 封顶 ⇒ 大量受损单元 chars 全等于 20000，**排序退化成无意义**（实测：cap=40 时
+    //   真正被吃掉的会话可能排在 40 名之外，等于旁路开了也救不回来）。
+    //   新键 = **实际被丢内容量**（`dropped` 各 kind 的 chars 之和 + `truncs` 的 raw−kept 之和）降序 ——
+    //   直接量"丢了多少"，与 P18 的见证口径同源（`dropped`/`truncs` 正是 P16/P17 落进单元元数据的那两个字段）。
+    //   平手时回到旧键（chars 升序）保持确定性；**缓存缺失者（damage=-1）排最前**（无元数据 ⇒ 最需要重算）。
+    //   注：本排序**只在旁路分支内生效**，而旁路默认关闭（`reArchiveOpts()`）⇒ 对现网行为零影响。
+    .sort((a, b) => {
+      const da = unitDamageOf(a.id, o), db = unitDamageOf(b.id, o);
+      if (da.missing !== db.missing) return da.missing ? -1 : 1;
+      if (da.damage !== db.damage) return db.damage - da.damage;
+      return da.chars - db.chars;
+    });
+  return normal.concat(stale.slice(0, cap));
+}
+// ═══ 批0（P0-2）单源解码器：帧扫描 + 逐帧解压**只此一份** ═══
+//   根因（2026-09-17 实测 7/7 复现）：把**整文件**交给 zlib.zstdDecompressSync 只会解出**第一帧**——
+//   5 KB 与 28.6 MB 文件**同样**只返回 224–379 B（首帧头），且**不抛错** ⇒ 任何"整文件解码"写法
+//   都是**静默近空**（看起来成功、实则丢 99.99%）。唯一正确读法：先扫 magic 得帧起点 → 逐帧 subarray 解压。
+//   本区为模块级单源：`extractMessageFlowAsync` 与 `countZstdFrames` 均复用，禁止在别处再写一份扫描。
+function scanZstdFrames(buf) {
+  const out = [];
+  for (let i = 0; i + 3 < buf.length; i++) {
+    if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) out.push(i);
+  }
+  return out;
+}
+// 逐帧解压：失败**只丢该帧**（返回 null）——绝不因单帧损坏丢掉整个文件
+function decompressFrameAt(buf, off) {
+  try { return zlib.zstdDecompressSync(buf.subarray(off)); } catch (e) { return null; }
+}
+// 逐帧解码全文件（宽容模式）：返回 {text, frames, okFrames, err}
+//   批0（P1-1）：原实现 catch 在 while **外** ⇒ 任一帧抛错 = 整文件 null（该会话内容全丢）；
+//   且 `out = Buffer.concat([out, frame])` 在循环内 = O(n²) 拷贝（30 MB/千帧累计十余 GB）。
+//   现改为：坏帧跳过 + 数组收集（末尾一次 join）。
+function decodeSessionLog(filePath) {
+  let buf = null;
+  try { buf = fs.readFileSync(filePath); } catch (e) { return { text: "", frames: 0, okFrames: 0, err: "read" }; }
+  const offs = scanZstdFrames(buf);
+  const chunks = [];
+  let okFrames = 0;
+  for (const off of offs) {
+    const b = decompressFrameAt(buf, off);
+    if (b) { chunks.push(b); okFrames++; }
+  }
+  return { text: Buffer.concat(chunks).toString("utf8"), frames: offs.length, okFrames: okFrames, err: "" };
+}
+// ★ 2026-09-25（wm-skip 空壳证人）：水位跳过分支的**有界**对话探测。
+//   背景（现场实证 session-28a52c6a-…）：账本水位说"已消费"、本轮按水位整文件跳过（压根没调提取器）时，
+//   插件保守记为"有帧却没读"并拒绝消号 → 重试到上限后留下永久告警。但有一类会话**根本没有对话事件**
+//   （日志只有 agent/inbox/spliced 通知帧 + 会话元数据，实测 13 帧 / 0 字正文），它们永远无法通过
+//   "重读"变成有内容，只会白占重试配额并持续误报。
+//   判据（**正面证据式**，2026-09-25 第二版）：对 [0, uptoFrame) 等距采样最多 WM_PROBE_MAX_FRAMES 帧、
+//   累计解压 ≤ WM_PROBE_MAX_BYTES；从采样文本里提取**事件类型**（`"type":"<a>/<b>"` 形态，避免命中
+//   内容块的 `"type":"text"`）——
+//     · 任一类型属对话/摘要族 → true（有内容，仍需重读）；
+//     · 任一类型**不在空壳白名单**里 → null（未知形态 ⇒ **不确定**，调用方保持旧行为）；
+//     · 有类型且全属白名单 → false（正面证据：纯通知/元数据，无对话）；
+//     · 一个类型都没提取到 → null（解析不出 ⇒ 不确定）。
+//   为什么不写"没搜到对话关键词就算空壳"：合成夹具/截断日志同样搜不到关键词，那样会把
+//   「有帧却没读」的防线整条削掉（第一版实测：`_test-t8-empty-admission` 由 35/0 退化为 22/13）。
+const WM_PROBE_MAX_FRAMES = 12;
+const WM_PROBE_MAX_BYTES = 2 * 1024 * 1024;
+// 本轮"空壳证人"计数（模块级：批次级日志在另一个块作用域里读它，用 let 会 TDZ/未定义）
+let WM_PROBE_EMPTY_ROUND = 0;
+// 对话/摘要族：出现即"有内容"
+const WM_PROBE_DIALOGUE_TYPES = new Set([
+  "user/message", "assistant/message", "assistant/attempt", "tool/call", "tool/result", "compaction/summary",
+]);
+// 空壳白名单：纯通知 / 会话元数据 / 策略与沙箱声明（现场实证 session-28a52c6a 的全部事件类型）
+const WM_PROBE_SHELL_TYPES = new Set([
+  "agent/inbox/spliced", "session", "approval/policy", "permission/preset", "sandbox/mode",
+  "agent/status", "agent/disposed", "session/end-seed", "subagent/model-selection-policy",
+]);
+function probeDialogueEvents(filePath, uptoFrame) {
+  let buf = null;
+  try { buf = fs.readFileSync(filePath); } catch (e) { return null; }
+  const offs = scanZstdFrames(buf);
+  if (offs.length === 0) return null;
+  const cap = Math.min(offs.length, Number(uptoFrame) > 0 ? Number(uptoFrame) : offs.length);
+  if (cap <= 0) return null;
+  const n = Math.min(WM_PROBE_MAX_FRAMES, cap);
+  const re = /"type"\s*:\s*"([a-z]+\/[a-z0-9-]+)"/g;
+  let bytes = 0;
+  let sawType = false;
+  let sawUnknown = false;
+  for (let k = 0; k < n; k++) {
+    const b = decompressFrameAt(buf, offs[Math.floor((k * cap) / n)]);
+    if (!b) continue;                              // 坏帧/幻影帧：跳过，不改变结论
+    bytes += b.length;
+    if (bytes > WM_PROBE_MAX_BYTES) return null;   // 成本超预算 → 不确定
+    const t = b.toString("utf8");
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      const ty = m[1];
+      if (WM_PROBE_DIALOGUE_TYPES.has(ty)) return true;
+      if (WM_PROBE_SHELL_TYPES.has(ty)) { sawType = true; continue; }
+      sawUnknown = true;
+    }
+  }
+  if (sawUnknown) return null;                     // 未知形态 ⇒ 不确定，绝不放行
+  return sawType ? false : null;                   // 纯白名单类型 ⇒ 空壳正面证据；否则不确定
+}
+function decompressSessionLog(filePath) {
+  // 兼容既有调用口径（L3490 的 used 判定、L8379 的子代理 token 统计）：全失败仍返回 null
+  try {
+    const r = decodeSessionLog(filePath);
+    if (r.frames === 0 || r.okFrames === 0) return null;
+    return r.text;
   } catch (e) { return null; }
 }
+// 批0：具名导出（门用；先例 L1533 `export { sizeStateOf, … }`、L1652 `export { scanUndeposited, … }`）
+//   —— 让 _test-raw-decode.mjs 能**直接行为断言**单源解码器，而不是只做源码正则。
+export { scanZstdFrames, decompressFrameAt, decodeSessionLog };
+// v2.8.4（P19）：归档链核心函数的具名导出 —— **让门与探针直接调用真实现**。
+//   动机：`_probe-cliff.mjs` 原先**复刻**了选帧+抽取逻辑（违反本仓铁律「测实际实现，不要把逻辑
+//   复制进测试」）⇒ 改 index.js 不会自动改探针 ⇒ 门**可假绿也可恒红**。导出后探针只负责造场景与断言。
+//   实测判定（2026-09-18）：`extractMessageFlowAsync` 等函数的 4/6 空格缩进是**历史编辑遗留**，
+//   并非闭包作用域 —— `export { … }` 直接可用、import 后 `typeof === "function"`（十者全通过）。
+//   ⇒ **不需要 thunk / 不需要先 apply(fakeCtx)**；门可直接 `import` 后调用。
+export {
+  extractMessageFlowAsync, compressUnit, bucketUnits,
+  readUnitCache, writeUnitCache, mergeUnitCache,
+  countZstdFrames, extractExistingArchiveBlock,
+  archivePendingEntry, sessionMentionedInMemory, refreshMemorySessionsIndex,   // ★ §9.11.4-8：导出以便门在"写夹具后强制刷新索引"（只读函数，导出无害）
+  unitCounterVerMismatch, shouldReArchive, pickReArchiveCandidates, unitCharsOf,
+  // v2.8.4（损伤代理替换）：单元实际被丢量 —— 门在**合成单元缓存**上直测（不必造整轮归档）。
+  unitDamageOf,
+  // v2.8.4（P9/P10/P12）：预算链条常量 + 不变量判定器 —— 让 GA12/GA13 **行为断言真值**（而非源码正则）。
+  EXTRACT_COUNTER_VER, EXTRACT_BUDGET_CHARS, UNIT_MAX_CHARS, BUCKET_BUDGET_CHARS, BUCKET_MAX_UNITS,
+  checkBudgetInvariant,
+  // v2.8.4（P4 第三保险）：装配期断言 —— 门可对「合规件」与「undefined/空件」**双向行为断言**（旧字节必红）。
+  joinPartsStrict,
+  // v2.8.4（P14/P15）：时间预算 + 账本单例 —— 门上要能**真调用** `shouldReArchive` 而不必跑整条归档流水线。
+  ROUND_EXTRACT_BUDGET_MS, sessionExtractBudgetMs, reArchiveOpts,
+  ARCHIVE_WATERMARK, ARCHIVED_SESSIONS,
+  // v2.8.4（P21/P22）：多日志解析 + 水位分摊 —— 纯函数 ⇒ GA24 直接行为断言（不必造 7 个真目录）。
+  SESSION_LOG_CHRONO, resolveSessionLogPaths, sessionFramesTotal, distributeOffsets, combineExtracts,
+};
+// v2.8.4（P18）：归档**内容见证聚合器** —— 纯函数（门直测；账本写入与两处「指定读者」共用同一口径，防口径漂移）。
+//   输入 = `[[sid, {mode, points, chars, reason}], …]`（`LAST_ARCHIVE_WITNESS` 的 entries）+ A5 标志。
+//   分类：written（真写入）/ declared-skip（子代理自己声明跳过）/ dropped（**机制层**丢弃：已在库、本轮已记、写盘异常）。
+//   `lost` 只数 **dropped 且 chars>0** 的 —— 那才是"取到了内容却没进库"的真丢失；declared-skip 是子代理的判断，不算丢失。
+function summarizeArchiveWitness(entries, a5ok) {
+  const out = { written: 0, declaredSkip: 0, dropped: 0, lost: 0, charsWritten: 0, charsLost: 0, lostDetail: [], a5: a5ok === true, skipWithContent: 0, skipDetail: [], skipReasons: [], noUnitSkip: 0, skipUnitTruncated: 0, unitLost: 0, noUnitWhy: [] };
+  const lost = [];
+  const skipC = [];
+  const skipR = [];                                            // v2.8.4（T3）：跳过**理由**（旧实现只留字数 ⇒ 事后不可审计）
+  const list = Array.isArray(entries) ? entries : [];
+  for (const e of list) {
+    if (!Array.isArray(e) || e.length < 2) continue;            // 形状可疑条目直接跳过（账本容错优先于计数精确）
+    const sid = e[0], v = e[1];
+    if (typeof sid !== "string" || !sid) continue;
+    if (!v || typeof v !== "object") continue;
+    const ch = Number(v.chars) || 0;
+    if (v.mode === "written") { out.written++; out.charsWritten += ch; }
+    else if (v.mode === "declared-skip") {
+      out.declaredSkip++;
+      // ★ 方案 P18 原文要求的那半条：**本轮单元非空却声明跳过** = 可疑丢弃（(D) 方向下，旧正文不再随轮提供，
+      //   子代理看到的"仅新增帧"若判为无价值，则该 sid 的新增内容就地消失）。单列出来给读者看，不等同于 lost。
+      const uc = Number(v.unitChars) || 0;
+      if (uc > 0) {
+        out.skipWithContent++; skipC.push(sid + "(" + uc + "字)");
+        // v2.8.4（T3）：连**理由**一起带上（见证里本来就有 reason，≤60 字）—— 否则「有内容却跳过」只看得见"跳掉多少字"，
+        //   看不见"为什么判它无价值"，事后无法复核子代理这次判断（实测 09-18 那轮 5 个会话共跳掉约 5.4 万字符，理由全无留存）。
+        // v2.8.4（T3·消毒）：理由必须**单行且封顶** —— 它会经 `formatArchiveSignal` 拼进心跳行/启动自检行，
+  //   而那一行是要进模型上下文的。子代理写的理由可能带换行（破行/注入面）⇒ 换行折成空格后再截断。
+        skipR.push(sid + "：" + ((String(v.reason || "").replace(/[\r\n]+/g, " ").trim() || "未给理由").slice(0, 40)));
+      }
+      // §9.12② 评审整改（逃生口 + 打折的副本）单独计数 —— **绝不静默**：这两类都是"跳过之后拿不回原文"的形态
+      if (v.noUnitSkip === true) {
+        out.noUnitSkip++;
+        // ★ 根因席（rev3 复核）：`noUnitSkip` 若只是**一个数字**，上涨时无法归因（至少混着四类：抽取未产出 /
+        //   写失败 / LRU 淘汰 / 读方拒因）⇒ 把 `unitWhy` 一起收进见证（**已在手上**，零成本），并按 `unitLost`
+        //   把"系统故障"与"确实没内容"当场分开。
+        const wy = String(v.unitWhy || "").replace(/[\r\n]+/g, " ").trim();
+        out.noUnitWhy.push(sid + "：" + (wy || "未记 why") + (v.unitLost === true ? "〔★系统故障〕" : ""));
+      }
+      if (v.unitLost === true) out.unitLost++;
+      if (v.unitTruncated === true) out.skipUnitTruncated++;
+    }
+    else if (v.mode === "dropped") {
+      out.dropped++;
+      if (ch > 0) { out.lost++; out.charsLost += ch; lost.push(sid + "(" + ((String(v.reason || "").replace(/[\r\n]+/g, " ").trim() || "?").slice(0, 40)) + "," + ch + "字)"); }
+    }
+  }
+  out.lostDetail = lost.slice(0, 8);                            // 明细封顶 8 条（账本/心跳行都不该被长清单撑爆）
+  out.skipDetail = skipC.slice(0, 8);
+  out.skipReasons = skipR.slice(0, 5);                          // v2.8.4（T3）：理由前 5 条（读者行只显示前 2 条，长清单不进上下文）
+  out.noUnitWhy = (out.noUnitWhy || []).slice(0, 5);            // ★ 同上：无单元的原因前 5 条（读者行只显示前 2 条）
+  return out;
+}
+export { summarizeArchiveWitness };
+// v2.8.4（P18）：账本 → **一行人类可读信号**（纯函数 ⇒ 门用合成账本直测每个分支，不碰真文件）。
+//   读这条信号的两个位置（「指定读者」）：① 运行状况心跳行 ② 每次启动的自检。二者共用本格式源。
+function formatArchiveSignal(st, nowMs) {
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  const s0 = (st && typeof st === "object") ? st : {};
+  const seg = [];
+  const al = s0.archiveAutoLast;
+  if (al && al.at) {
+    const d0 = new Date(al.at);
+    seg.push("自动归档 最近判定 " + pad(d0.getMonth() + 1) + "-" + pad(d0.getDate()) + " " + pad(d0.getHours()) + ":" + pad(d0.getMinutes())
+      + " " + (al.ran ? "已发起（" + String(al.why || "") + "）" : "未发起（" + String(al.why || "") + "）"));
+    if (!al.ran && al.until > now) {                       // 只有"还没到期"的退避才值得显示（过期退避是噪声）
+      const u = new Date(al.until);
+      seg.push(" · 白轮退避至 " + pad(u.getMonth() + 1) + "-" + pad(u.getDate()) + " " + pad(u.getHours()) + ":" + pad(u.getMinutes()));
+    }
+  } else {
+    seg.push("自动归档 尚无判定记录（silent 档下：首个顶层会话或每小时 tick 时写入）");
+  }
+  const w = s0.archiveWitnessLast;
+  if (w && w.at) {
+    seg.push(" · 上轮留证 写入 " + (Number(w.written) || 0) + " · 声明跳过 " + (Number(w.declaredSkip) || 0) + " · 丢弃 " + (Number(w.dropped) || 0));
+    if ((Number(w.lost) || 0) > 0) seg.push("（⚠️ 丢弃正文 " + (Number(w.charsLost) || 0) + " 字：" + ((w.lostDetail || []).slice(0, 3).join(" ") || "明细见账本") + "）");
+    if ((Number(w.skipWithContent) || 0) > 0) seg.push("（⚠️ " + (Number(w.skipWithContent) || 0) + " 个会话**本轮有内容却声明跳过**：" + ((w.skipDetail || []).slice(0, 3).join(" ") || "明细见账本") + "）");
+    // §9.12② ：**恢复通道要写在读者眼前** —— 被跳过的正文没有进记忆库，只落在归档单元里；
+    //   而"要用 source:\"units\" 才搜得到"这件事此前没有任何地方告诉读者（用户按默认 source=logs 搜不到就会以为真丢了）。
+    if ((Number(w.skipWithContent) || 0) > 0) seg.push("（正文只在归档单元：检索请用 `source:\"units\"`）");
+    // §9.12② 评审整改：两种"打折的跳过"必须能被读者看见 —— 无单元（连副本都没有）与单元被上限截断（副本不全）
+    if ((Number(w.noUnitSkip) || 0) > 0) seg.push("（其中 " + Number(w.noUnitSkip) + " 个**无任何副本**（无单元：抽取未产出，已留痕放行））");
+    if ((Number(w.unitLost) || 0) > 0) seg.push("（⚠️ 其中 " + Number(w.unitLost) + " 个是**系统故障**：本轮曾抽取但盘上无单元文件（写失败/被淘汰）⇒ 与「确实没内容」不同，详见下一批的重试项）");
+    // ★★ §9.11.4-3 修正九（**工程席 rev8f A2 实测：`empty`/`skipped` 写进账本却全仓无活读点**，
+    //   而原先的注释声称它是 `unitLost` 的排除项 —— 那是"注释描述了一个不存在的实现"）：
+    //   现在把这两个标记**真正接上健康信号**（本条即唯一活读点）⇒ ①"为什么判它已归档"在**用户可见的健康行**上自答；
+    //   ②它同时是 `unitLost` 的**排除项说明**：`empty`/`skipped` 的会话**本来就没有单元**，不该被误读成"丢了单元"。
+    if ((Number(s0.archiveWmEmpty) || 0) > 0 || (Number(s0.archiveWmSkipped) || 0) > 0) {
+      seg.push("（账本自答：**确无内容**消号 " + (Number(s0.archiveWmEmpty) || 0) + " 个"
+        + ((Number(s0.archiveWmSkipped) || 0) > 0 ? " · 其中**本轮未读**（水位已判消费完）" + Number(s0.archiveWmSkipped) + " 个" : "")
+        + " —— 这些会话**本来就没有单元**，不算「丢了单元」）");
+    }
+    // ★★ 修正十二（根因席 rev8f B）：**"已归档但盘上查不到单元、且不是空会话"** = 内容可能真丢了。
+    //   与上面那条互为对照：`empty`/`skipped` 是"本来就没有单元"（不算丢），本条是"**该有单元却没有**"。
+    //   带 `unitLostChecked` 一起报，读者才知道这信号覆盖了多少（**不把"没查"误读成"没丢"**）。
+    // ★★ 修正十三（红队 rev8h B/C-3）：**"按水位跳过"必须可见** —— 未到上限=自动重试中；到上限=需人工。
+    if ((Number(s0.archiveWmSkip) || 0) > 0) {
+      // ★ 工程席 rev8k A3：把"合计被跳过帧数"报出来（`wmSkippedFrames`/`archiveWmSkipFrames` 原先只写不读）；
+      //   A1：上限文案也改引用常量（原先这里硬编码"3 轮"）。
+      seg.push("（⚠ 按水位跳过（有帧却没读）" + Number(s0.archiveWmSkip) + " 个"
+        + ((Number(s0.archiveWmSkipFrames) || 0) > 0 ? "、合计 " + Number(s0.archiveWmSkipFrames) + " 帧" : "")
+        + "：自动重试中（上限 " + WM_SKIP_MAX_ROUNDS + " 轮，写好/耗尽的会在这里报）"
+        + ((Number(s0.archiveWmSkipExhausted) || 0) > 0 ? "；**已耗尽 " + Number(s0.archiveWmSkipExhausted) + " 个 ⇒ 停止重试，内容可能未入档，请人工核查**" : "") + "）");
+    }
+    // ★★ §9.11.4-9（**现场取证驱动**）：`unitLostArchived` 原先**只在 >0 时报** ⇒ "0"被读者天然读成
+    //   "没有丢失"；而现场实测 `unitLostChecked=39 / 已归档 289` ⇒ **覆盖率仅 13.5%**，那个 0 的真实含义是
+    //   "**在抽查到的那 39 个里没发现**"，**不是**"全库没有"。这正是我在修正十二 注释里承诺过的
+    //   "不把『没查』误读成『没丢』"，却没在信号里兑现。⇒ 现在**0 也报**，并给出"已查 / 待查"与覆盖状态。
+    {
+      const checked = Number(s0.unitLostChecked) || 0;
+      const total = Number(s0.archiveWmTotal) || 0;
+      const lost = Number(s0.unitLostArchived) || 0;
+      const todo = total > 0 ? Math.max(0, total - checked) : 0;
+      if (lost > 0) {
+        seg.push("（⚠️ **已归档却查不到单元** " + lost + " 个（非空会话；本轮抽查 " + checked + " 个"
+          + (todo > 0 ? "，**另有 " + todo + " 个待查**" : "") + "）—— 内容可能未入档，建议用 `source:\"units\"` 或 `session_search` 核对来源）");
+      } else if (checked > 0) {
+        seg.push("（单元抽查：本轮查 " + checked + " 个**未发现**「已归档却查不到单元」"
+          + (todo > 0 ? "；**另有 " + todo + " 个待查**（跨轮轮转覆盖 —— 勿把本项 0 读成「全库无丢失」）" : "（已覆盖全量）") + "）");
+      }
+    }
+    if ((Number(w.noUnitSkip) || 0) > 0) {
+      const why = Array.isArray(w.noUnitWhy) ? w.noUnitWhy.slice(0, 2) : [];
+      seg.push("（无单元原因：" + (why.length ? why.join(" ｜ ") : "旧账本未记 why（v2.8.4 前的轮次只有计数）") + "）");
+    }
+    if ((Number(w.skipUnitTruncated) || 0) > 0) seg.push("（其中 " + Number(w.skipUnitTruncated) + " 个单元被上限**截断**，副本可能不完整）");
+    // v2.8.4（T3）：**理由**也报出来 —— 只看"跳掉多少字"无法判断该不该复核；旧账本没有该字段就**如实说"未记"**，不伪造。
+    if ((Number(w.skipWithContent) || 0) > 0) {
+      const rs = Array.isArray(w.skipReasons) ? w.skipReasons.slice(0, 2) : [];
+      seg.push("（跳过理由：" + (rs.length ? rs.join(" ｜ ") : "旧账本未记理由（v2.8.4 前的轮次只记字数）") + "）");
+    }
+    // ★★ §9.11.4-11（B4）**单元写失败**的**活读点**。
+    //   为什么必须在这里读（而不是只 `monitorEvent`）：本仓已因"加了字段没人读"栽过**四次**
+    //   （`LEDGER_UNREADABLE_TOLD`、`archiveWmEmpty`/`archiveWmSkipped`、`wmSkippedFrames`、以及工程席 rev8k 点名的第 4 例）。
+    //   而且这一项**正是**"已归档却查不到单元"的**上溯成因之一**：健康行现在报"丢了 N 个单元"，
+    //   却答不出"是**写失败**还是**被淘汰**" —— 本行补上那个答案。
+    //   ★★ 位置修正（**我在本项实测抓到自己的错**）：第一版把这个 `if` 写在上面 `if (w && w.at)` **块内** ⇒
+    //     没有 `archiveWitnessLast` 的首轮/新进程里**根本读不到**（实测：健康行只 42 字、计数器不显示）。
+    if (w.doneOk === false) seg.push("（上轮未消号：" + (w.a5 ? "A5 缺声明" : "未落盘/批失败") + "）");
+  }
+  // ★★ §9.11.4-11（B4）**单元写失败**的**活读点**（进程级计数 ⇒ 必须在 `if (w && w.at)` 块**之外**）。
+  //   为什么必须在这里读（而不是只 `monitorEvent`）：本仓已因"加了字段没人读"栽过**四次**
+  //   （`LEDGER_UNREADABLE_TOLD`、`archiveWmEmpty`/`archiveWmSkipped`、`wmSkippedFrames`、工程席 rev8k 点名的第 4 例）。
+  //   而且它**正是**"已归档却查不到单元"的**上溯成因之一**：健康行报"丢了 N 个单元"，却答不出
+  //   "是**写失败**还是**被淘汰**" —— 本行补上那个答案。
+  //   ★★ 位置修正（**我在本项实测抓到自己的错**）：前两版把它写在 `if (w && w.at)` **块内** ⇒
+  //     没有 `archiveWitnessLast` 的新进程/首轮里**根本读不到**（实测：健康行只 42 字、计数不显示）。
+  if (UNIT_WRITE_FAIL_SEEN > 0) {
+    seg.push("（⚠️ **单元写盘失败 " + UNIT_WRITE_FAIL_SEEN + " 次**（本次进程内）—— 这些会话本轮产物**未落盘**，"
+      + "下游只会看到 `no-unit-file`（**读侧区分不出「写失败」与「被淘汰」**）。连续出现多为缓存目录不可写或磁盘已满；"
+      + "详见 `.monitor.json` 的 `write-fail`/`write-readback-mismatch`）");
+  }
+  const tk = s0.archiveTokenLast;                                          // v2.8.4（自动归档包⑤）：每轮花费可见
+  if (tk && tk.at) {
+    const wan = (n9) => Math.round((Number(n9) || 0) / 10000);
+    const hit = (Number(tk.inT) > 0) ? Math.round(((Number(tk.cacheT) || 0) / Number(tk.inT)) * 100) : null;
+    // §9.12④：**"读不到"不许显示成"0 消耗"** —— 那会让读者以为这轮免费（既有缺陷的表现形式之一）。
+    if (tk.usageEmpty === true) {
+      seg.push(" · 上轮消耗 **读取失败**（子代理日志未落盘，已重试 " + (Number(tk.usageRetry) || 0) + " 次）—— 不是 0 消耗");
+    } else {
+      seg.push(" · 上轮消耗 输入 " + wan(tk.inT) + " 万" + (hit !== null ? "（缓存 " + hit + "%）" : "") + " / 输出 " + wan(tk.outT) + " 万"
+        + (Number(tk.usageRetry) > 1 ? "（读取重试 " + Number(tk.usageRetry) + " 次）" : ""));
+    }
+  }
+  // v2.8.4（容量治理·硬保证）：**超限卡住**可见 —— 否则"卡了几轮、做过什么"只存在于账本深处
+  const ol = s0.overLimitStuck;
+  if (ol && typeof ol === "object") {
+    const rels = Object.keys(ol).filter((k) => (Number((ol[k] || {}).rounds) || 0) > 0);
+    if (rels.length > 0) {
+      const sunk = rels.filter((k) => String((ol[k] || {}).lastAction || "").indexOf("sink:") === 0);
+      seg.push(" · 超限卡住 " + rels.length + " 个文件" + (sunk.length > 0 ? "（已机械下沉 " + sunk.length + "）" : "") + "：" +
+        rels.slice(0, 3).map((k) => k.replace(/^projects\//, "").replace(/\.md$/, "") + "×" + (Number((ol[k] || {}).rounds) || 0) + "轮").join("、"));
+    }
+  }
+  // v2.8.4（T3·消毒）：**整行不变量** —— 本函数的产物是要塞进"一行"的两个读者（心跳行 / 启动自检行），
+  //   而其中的字段来自账本（子代理可写）。把任何 CR/LF 折成空格，保证读者拿到的**永远是一行**
+  //   （否则一条带 `\n` 的理由就能在上下文里伪造出一行"看着像系统消息"的文本）。
+  return seg.join("").replace(/[\r\n]+/g, " ");
+}
+export { formatArchiveSignal };
+// v2.8.4（自动归档包）：`runStaleSilentTick` 定义在 `apply()` 内（要用 PLUGIN_CFG / 账本 / STALE_RUNNING 等闭包态）
+//   ⇒ 门无法直接 import。按本仓 P19 先例用**模块级 thunk**：apply 内赋值，门先 `apply(fakeCtx)` 再取用。
+//   回归门席要求"可注入时钟" ⇒ 暴露的是**带 `now` 形参**的原函数，门可注入任意时刻，**绝不真等 1 小时**。
+export let __staleSilentTick = null;
+// v2.8.4（P18/自动归档包⑤）：**指定读者**的单一格式源 —— apply 内赋值（要读账本闭包态）。
+//   `updateMonitorSummary`（运行状况心跳行）与启动自检都只调它 ⇒ 两处永不各解释一遍账本字段。
+export let __archiveSignalLine = null;
+// v2.8.4（§9.6）：维护提醒函数本体（apply 内赋值）—— 门据此**行为断言**「remind/approval 档会注入漏网提醒」
+//   （该缺陷原先只能靠读源码发现，而 `} else {` 藏在行注释里 ⇒ 读也容易看漏）。
+export let __maintenanceInjectReminder = null;
+// v2.8.4（§9.11.4-6）：账本**写入口** `saveStaleNotified`（apply 内赋值）——门据此**行为断言**
+//   「坏账本 ⇒ 写入口自己拒写」。为什么必须暴露而**不能**靠"跑一轮 tick 再看痕迹"：
+//   实测（本项）：8 个调用点里 7 个以 `ARCHIVE_WM_DIRTY` 为闸，而损坏夹具下没有任何东西会置该标志
+//   ⇒ `saveStaleNotified` **根本不被调用** ⇒ 靠 tick 观察到的只能是**下游** `writeIntegrateState` 的抢救痕迹
+//   ⇒ 断言会**测不到写入口本身**（我第一版就这么写的，实测 `save-refuse=false`、门红得不明所以）。
+//   直调本体才能把"写入口的判据"与"下游兜底的判据"分开断言。
+export let __saveStaleNotified = null;
+// v3.1.0（索引自动刷新）：apply 内赋值的**刷新入口**（门据此行为断言：主挂点已接线 / 自动路径零 execFileSync /
+//   单飞 / 冷却 / 锁被占按跳过）。用法同上面先例：先 apply(fakeCtx) 再取用，签名 refreshSearchIndex({ reason, listener })。
+export let __indexRefreshTick = null;
 // v1.12.18.4: 旧版 extractMessageFlow（8000 截断）已删除——改为 extractMessageFlowAsync（compaction 优先 + 分段 map-reduce）
     // v1.12.18+: 分层提取——先官方 compaction/summary 摘要链（完整上下文浓缩含工具脉络），
     // 无压缩史的会话走帧级采样+行级快筛+工具轨迹+动态预算；大会话分段交 map-reduce 仿真压缩。
     // 逐帧间 setImmediate 让出，主线程不冻结；zstd 多帧可独立解压（实测单帧语义）。
-    async function extractMessageFlowAsync(filePath, skipFrames) {
+    async function extractMessageFlowAsync(filePath, skipFrames, opts) {
       try {
+        const o = opts || {};
         const st = fs.statSync(filePath);
         const sizeMB = st.size / 1048576;
+        // v2.8.4（P15）：两级墙钟预算 —— 取「整轮共享截止」与「本会话预算」的**较早者**。
+        const sessionDeadline = Date.now() +
+          (Number.isFinite(Number(o.sessionBudgetMs)) ? Number(o.sessionBudgetMs) : sessionExtractBudgetMs(st.size));
+        const deadlineTs = Math.min(Number.isFinite(Number(o.deadlineTs)) ? Number(o.deadlineTs) : Infinity, sessionDeadline);
         const buf = fs.readFileSync(filePath);
-        const frames = [];
-        for (let i = 0; i < buf.length - 3; i++) {
-          if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) frames.push(i);
-        }
+        const frames = scanZstdFrames(buf);   // 批0（P0-2）：单源帧扫描（原内联逐字节扫描已收敛到 scanZstdFrames）
         if (frames.length === 0) return null;
         // v2.4.3：增量重档——丢掉水位前的已归档帧，只喂尾部新增；总帧数不高于水位（日志被外部重写）→ 回退全量，绝不静默丢尾
         if (skipFrames > 0) { if (frames.length > skipFrames) frames.splice(0, skipFrames); else skipFrames = 0; }
-        const FULL = sizeMB < 8 || frames.length <= 12;
-        let selected;
-        if (FULL) selected = frames.slice();
-        else {
-          selected = frames.slice(0, 2);
-          const midA = 2, midB = frames.length - 2, span = Math.max(1, midB - midA);
-          const K = Math.min(Math.max(6, Math.round(sizeMB * 1.5)), span);
-          for (let k = 0; k < K; k++) selected.push(frames[midA + Math.floor(span * k / K)]);
-          if (frames.length >= 4) selected.push(frames[frames.length - 2], frames[frames.length - 1]);
-          selected = Array.from(new Set(selected)).sort((a, b) => a - b);
-        }
-        // v1.12.18.3: 大会话预算放宽至 200K——不再截断丢弃，提取后按 40K 分段走 map-reduce 仿真压缩
-        const maxChars = sizeMB < 5 ? 8000 : 200000;
-        // v1.12.18.2: 同一趟遍历双收获——官方 compaction 摘要（模型看过完整上下文含工具调用，
-        // 大会话必有）优先于任何采样消息流；compParts 非空则最终以它为准。
-        const compParts = [];
-        let compTotal = 0;
-        let lastCompSi = -1;
-        const parts = [];
-        let total = 0;
-        let stop = false;
-        const nSel = selected.length;
-        for (let si = 0; si < nSel && !stop; si++) {
-          if (si > 0) await new Promise((r2) => setImmediate(r2));
-          let text = "";
-          try { text = zlib.zstdDecompressSync(buf.subarray(selected[si])).toString("utf8"); } catch (e) { continue; }
-          if (!FULL) parts.push(si === 0 ? "[采样视图 " + nSel + "/" + frames.length + " 帧·首尾保真中段均匀]" : "[段 " + (si + 1) + "/" + nSel + "]");
-          const segLines = text.split("\n");
-          for (const line of segLines) {
-            let kind = 0;
-            if (line.indexOf('"type":"user/message"') >= 0 || line.indexOf('"type": "user/message"') >= 0) kind = 1;
-            else if (line.indexOf('"type":"assistant/message"') >= 0 || line.indexOf('"type": "assistant/message"') >= 0) kind = 2;
-            else if (line.indexOf('"type":"tool/call"') >= 0 || line.indexOf('"type": "tool/call"') >= 0) kind = 3;
-            else if (line.indexOf('"type":"compaction/summary"') >= 0 || line.indexOf('"type": "compaction/summary"') >= 0) kind = 4;
-            if (kind === 0) continue;
+        // ══════ v2.8.4（P6）**删除帧采样** ══════
+        // 原 `FULL = sizeMiB < 8 || frames <= 12`，之上走「首2 + 中K + 末2」；而 K 按**文件大小**
+        // 缩放（`round(sizeMiB*1.5)` 帧/MiB），实际帧密度 ≈2700 帧/MiB ⇒ 采样率随体积崩塌：
+        // 9 MiB 会话只取 18/24860 = **0.072%**（实测 `60e0713f` 24860 帧 → 单位元 **17 个换行**）。
+        // 现改**全帧遍历**；FULL 仅作 ≤12 帧的 sanity 短路（不再有采样语义）。
+        const FULL = frames.length <= 12;
+        const maxChars = EXTRACT_BUDGET_CHARS;   // P9：删 `sizeMiB < 5 ? 8000 : 200000` 中间档，并轨为唯一上限（定义见下方预算链）。
+                                   //   真正绑定的是下游 `UNIT_MAX_CHARS`（20000，本批不改）⇒ 净收益上限 8000→20000（2.5×）。
+
+        // ══════ v2.8.4（P1–P3/P5）按类配额的装配（替换原 FIFO `total > maxChars → break`）══════
+        // ① 删件内固定上限 800/1000/80 —— 用户案例的**唯一**根因：6521 字符的消息被切在第 6 个
+        //    URL 的 `rowguid=` 之后（实测 `b078d968` 单元里前 5 个 URL 完整、后 4 个全无）。
+        // ② `<system-reminder>` 开头**整条跳** → 改为剥离注入块后**剩余非空即保留**
+        //    （注入块正是"记忆内容回灌"的载体；但 P5 是独立缺陷，不在用户案例因果链上）。
+        // ③ 纳入 `tool/result`（**仅错误**，判据 `content[].isError === true`；正文在 `content[].content`）
+        //    与 `system/message`。
+        // ④ 预算按**类配额 + 优先级**分配；同类内**新近优先**。
+        // 内存有界：每类收集量上限 = 该类配额 × 3，超出即计 dropped（不撑爆内存，也不撞"先全收"）。
+        const KIND_ORDER = ["compaction/summary", "user/message", "assistant/message", "tool/call", "tool/result", "system/message"];
+        const KIND_SHARE = { "compaction/summary": 0.35, "user/message": 0.45, "assistant/message": 0.15, "tool/call": 0.04, "tool/result": 0.01, "system/message": 0.0 };
+        const PIECE_MAX = { "compaction/summary": 4000, "user/message": 2000, "assistant/message": 2000, "tool/call": 400, "tool/result": 400, "system/message": 2000 };
+        const HEAD_KEEP = 200, MIN_KEEP = 600, SLACK = 800;   // 二态制：n = 0 或 n ≥ 800（禁止 0<n<800，修 slice(-0) 缺陷）
+        const LABEL = { "user/message": "[用户] ", "assistant/message": "[助手] ", "system/message": "[系统] ", "tool/call": "[工具] ", "tool/result": "[工具结果] ", "compaction/summary": "【压缩点摘要】\n" };
+        const collectCap = (kd) => Math.max(4000, Math.floor(maxChars * (KIND_SHARE[kd] || 0.02)) * 3);
+
+        const pieces = [];                       // {frame,line,kind,text} —— 有界收集
+        const collected = Object.create(null);
+        const dropped = Object.create(null);     // kind → {n, chars}（不变量 Ⅱ：丢弃必须带 chars 留痕）
+        const bump = (kd, chars) => { const d = dropped[kd] || (dropped[kd] = { n: 0, chars: 0 }); d.n++; d.chars += (chars || 0); };
+        let lastCompFrame = -1;
+        let stoppedAt = -1;                    // P14/P15：被墙钟掐断的**局部帧下标**（-1 = 跑完）
+        for (let k = 0; k < frames.length; k++) {
+          if (k > 0 && (k & 63) === 0) {
+            // v2.8.4（P15）：超时不抛异常、不留半成品——只**截在帧边界**并把截断位置如实上报。
+            //   `Date.now()` 每 64 帧一次 ⇒ 2.5 万帧会话只多 388 次调用，可忽略。
+            if (Date.now() > deadlineTs) { stoppedAt = k; break; }
+            await new Promise((r2) => setImmediate(r2));   // P7：每 64 帧让出
+          }
+          const fb = decompressFrameAt(buf, frames[k]);
+          if (!fb) { bump("(badframe)", 0); continue; }                                // P11：坏帧也要留痕
+          const lines = fb.toString("utf8").split("\n");
+          for (let li = 0; li < lines.length; li++) {
+            const line = lines[li];
+            if (!line.trim()) continue;
+            let kd = null;
+            if (line.indexOf('"type":"user/message"') >= 0 || line.indexOf('"type": "user/message"') >= 0) kd = "user/message";
+            else if (line.indexOf('"type":"assistant/message"') >= 0 || line.indexOf('"type": "assistant/message"') >= 0) kd = "assistant/message";
+            else if (line.indexOf('"type":"system/message"') >= 0 || line.indexOf('"type": "system/message"') >= 0) kd = "system/message";
+            else if (line.indexOf('"type":"tool/call"') >= 0 || line.indexOf('"type": "tool/call"') >= 0) kd = "tool/call";
+            else if (line.indexOf('"type":"tool/result"') >= 0 || line.indexOf('"type": "tool/result"') >= 0) kd = "tool/result";
+            else if (line.indexOf('"type":"compaction/summary"') >= 0 || line.indexOf('"type": "compaction/summary"') >= 0) kd = "compaction/summary";
+            if (!kd) continue;                        // 非 KEEP 类（chunk 流等）体量最大，不逐个计数
             let j; try { j = JSON.parse(line); } catch (e) { continue; }
-            if (kind === 1) {
-              const content = j.data && j.data.content;
-              if (!Array.isArray(content)) continue;
-              const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
-              if (!txt || txt.indexOf("<system-reminder>") === 0) continue;
-              const piece = "[用户] " + txt.slice(0, 800);
-              parts.push({ si: si, s: piece }); total += piece.length;
-            } else if (kind === 2) {
-              const content = j.data && j.data.message && j.data.message.content;
-              if (!Array.isArray(content)) continue;
-              const txt = content.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
-              if (!txt) continue;
-              const piece = "[助手] " + txt.slice(0, 1000);
-              parts.push({ si: si, s: piece }); total += piece.length;
-            } else {
-              const nm = (j.data && j.data.name) || "?";
-              const args = String((j.data && j.data.arguments) || "").replace(/\s+/g, " ").slice(0, 80);
-              const piece = "[工具] " + nm + "(" + args + ")";
-              parts.push({ si: si, s: piece }); total += piece.length;
+            const txts = extractTextsFor(j, kd);
+            if (!txts.length) { bump(kd, 0); continue; }
+            for (const t of txts) {
+              if (!t) continue;
+              const cur = collected[kd] || 0;
+              if (cur >= collectCap(kd)) { bump(kd, t.length); continue; }   // 有界收集：超出即计数丢弃
+              collected[kd] = cur + t.length;
+              pieces.push({ frame: skipFrames + k, line: li, kind: kd, text: t });   // P8：**全局帧号**
+              if (kd === "compaction/summary") lastCompFrame = skipFrames + k;      //   （`k` 是 splice 后的局部下标）
             }
-            if (kind === 4) {
-              // 官方压缩摘要：模型看全量上下文（含工具调用）后的浓缩——最高价值来源
-              const segs = (j.data && j.data.summary) || [];
-              const txt = segs.filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n").trim();
-              if (txt) { compParts.push("【压缩点摘要】\n" + txt); compTotal += txt.length; lastCompSi = si; }
-            }
-            if (total > maxChars) { stop = true; break; }
           }
         }
-        // v1.12.18.2: 三态组装——
-        // ① 有压缩史：压缩摘要链（完整演进史）+ 末次压缩点之后的新增交互（摘要覆盖不到的最新内容）
-        // ② 无压缩史：消息流（小会话无损 / 大会话首尾保真中段采样）
-        const joinParts = (arr) => arr.map((p) => p.s).join("\n");
-        if (compParts.length > 0 && lastCompSi >= 0) {
-          const post = joinParts(parts.filter((p) => p.si > lastCompSi));
-          let flowOut = compParts.join("\n\n=====\n\n");
-          if (post) flowOut += '\n\n【末次压缩后的新增交互】\n' + post;
-          return { flow: flowOut.slice(-maxChars), sampled: false, source: "compaction", compCount: compParts.length };
+
+        // ── v2.8.4（P14）：**已消费帧数** —— 提取真正走到的全局帧位置（水位与单元缓存一律用它，不用文件总帧数）
+        //   跑满时 = `skipFrames + frames.length` = 文件总帧数（与旧口径数值相同，故无行为回归）；
+        //   被掐断时 = `skipFrames + stoppedAt` **小于**总帧数 ⇒ 水位不推进到尾部 ⇒ 余下帧下轮可续（P15）。
+        const consumedFrames = skipFrames + (stoppedAt >= 0 ? stoppedAt : frames.length);
+        const incomplete = stoppedAt >= 0;
+
+        // ── 分配：按 KIND_ORDER 依次扣类配额；同类内**新近优先**（frame 降序）
+        const budget = Object.create(null);
+        for (const kd of KIND_ORDER) budget[kd] = Math.floor(maxChars * (KIND_SHARE[kd] || 0));
+        const usedK = Object.create(null);
+        const chosen = [];
+        const truncs = [];                      // 截断标注**只进元数据**，绝不进 text（D-11）
+        let totalAll = 0;
+        for (const kd of KIND_ORDER) {
+          const group = pieces.filter((p) => p.kind === kd).sort((a, b) => b.frame - a.frame);
+          for (const p of group) {
+            const globalLeft = maxChars - totalAll;
+            let n = Math.min(PIECE_MAX[kd], Math.max(budget[kd] - (usedK[kd] || 0), 0) + SLACK, globalLeft);
+            // ★ v2.8.4（二态制修正 —— 由新行为门 `_test-extract-kinds.mjs` 实测抓出，非推演）：
+            //   原判据 `if (n < HEAD_KEEP + MIN_KEEP) n = 0;` 是把**额度**拿去比 800，于是**短件**也被判死：
+            //   `PIECE_MAX["tool/call"] = PIECE_MAX["tool/result"] = 400 < 800` ⇒ 这两类的 `n` **恒为 0**
+            //   ⇒ **工具调用与错误工具结果永远进不了单元**（实测：25 字的两件 100% 被丢，GA10c/GA10d 其实从未满足）。
+            //   二态制的**本意**是"要截断时不做无意义碎片"（修 `slice(-0)` 缺陷），不是"拒绝短件" ——
+            //   故只在**真要截断**（`n < p.text.length`）时适用：能整件放下就必须整件放下。
+            if (n < p.text.length && n < HEAD_KEEP + MIN_KEEP) n = 0;
+            if (n <= 0) { bump(kd, p.text.length); continue; }
+            const take = Math.min(p.text.length, n);
+            if (take < p.text.length) truncs.push({ frame: p.frame, line: p.line, kind: kd, raw: p.text.length, kept: take });
+            chosen.push({ frame: p.frame, line: p.line, kind: kd, body: p.text.length > take
+              ? (LABEL[kd] || "") + p.text.slice(0, HEAD_KEEP) + "\n…[中间 " + (p.text.length - take) + " 字符已截断]…\n" + p.text.slice(-(take - HEAD_KEEP))
+              : (LABEL[kd] || "") + p.text });
+            usedK[kd] = (usedK[kd] || 0) + take; totalAll += take;
+          }
         }
-        if (parts.length === 0) return null;
-        // v1.12.18.3: 无压缩史 → 按 40K 分段输出（≤5 段；超出保首尾均匀取中），供 map-reduce 仿真压缩
-        const allText = joinParts(parts);
+        chosen.sort((a, b) => a.frame - b.frame || a.line - b.line);   // 输出回原始顺序
+        const truncated = truncs.length > 0 || Object.keys(dropped).length > 0;
+
+        // ── 组装：markers **进 text**（子代理需要知道这不是全量）；截断明细走元数据
+        const markers = [];
+        if (!FULL || truncated) {
+          markers.push("[说明] 本轮按**类配额 + 新近优先**择优提取：原文共 " + frames.length + " 帧 / " +
+            (skipFrames > 0 ? "（本轮为增量，" : "（") + "选中 " + chosen.length + " 件" +
+            (truncated ? "，存在截断/丢弃（明细见单元元数据 dropped/truncs）" : "") + "]");
+        }
+        // v2.8.4（P15）：掐断必须**进 text**（`markers` 会进单元正文）——子代理要能知道这一段是不完整的，
+        //   否则它会照着半个会话写"已归档"（P18 的账本见证也依赖这个可观测性）。
+        if (incomplete) {
+          markers.push("[说明] 本轮提取被**墙钟预算**掐断：已消费 " + consumedFrames + " / " + (skipFrames + frames.length) +
+            " 帧（截断位置帧边界）；**余下帧将在下一轮从该帧续跑**，本单元内容不完整。");
+        }
+
+        if (lastCompFrame >= 0 && chosen.some((c) => c.kind === "compaction/summary")) {
+          // v2.8.4（P4 第三保险）：三处装配**全部走 `joinPartsStrict`** —— 任何 `undefined`/空串件一律抛错，
+          //   而不是被 `Array.join` 静默渲染成空串（BUG-2 的形态：单元只剩 17 个换行）。
+          const compParts = chosen.filter((c) => c.kind === "compaction/summary").map((c) => c.body);
+          const comp = compParts.join("\n\n=====\n\n");
+          const postParts = chosen.filter((c) => c.kind !== "compaction/summary" && c.frame > lastCompFrame).map((c) => c.body);
+          const post = postParts.length ? joinPartsStrict(postParts, "compaction/post") : "";
+          let flowOut = joinPartsStrict(markers.concat([comp]), "compaction/flow");   // markers 为空时也至少 [comp]
+          if (post) flowOut += "\n\n【末次压缩后的新增交互】\n" + post;
+          const cut = flowOut.length > maxChars;
+          const kept = cut ? flowOut.slice(-maxChars) : flowOut;
+          return { flow: kept, sampled: false, source: "compaction", compCount: chosen.filter((c) => c.kind === "compaction/summary").length,
+                   truncated: cut || truncated, dropped: dropped, truncs: truncs, markers: markers,
+                   consumedFrames: consumedFrames, incomplete: incomplete };
+        }
+        // ★★ §9.11.4-3（用户 2026-09-19 拍板「按你推荐的来」）：**"确实无内容"不能与"抽取失败"共用 `null`**。
+        //   旧写法这里 `return null`，而归档循环对 `null` 的处理是"保守：该文件不推进"（P0-1 意图：怕静默丢内容）
+        //   ⇒ 两条后果实测（2026-09-19，真机两个候选）：
+        //     ① 循环里那条「**真·无内容 ⇒ 帧已全部检查 ⇒ 视为已消费**」的分支（`!hasBody && !r.incomplete`）
+        //        **永远不可达** —— 空内容在源头就变成 null 了。作者（我）当初把下游写好了，源头却把它短路。
+        //     ② 于是"只含控制事件"的会话（实测 `574b8af7` 的 legacy 2 帧、`28a52c6a` 的 v3 6 帧，
+        //        内容全是 `session`/`permission/preset`/`sandbox/mode`/`session/end-seed` —— **一个字正文都没有**）
+        //        每轮都被判"有新增"（水位量纲还停在旧码的 v3-only：`cur=3749 > wm=3747` 恒真）⇒
+        //        **僵尸候选**：每轮重选、每轮无流，还会触发一次白轮 + 24h 退避（把新会话的自动归档一起压住）。
+        //   ★★★ 2026-09-20 **撤销前一次"更正"**（B6 取证定案，详见 `docs/现场取证-三-最终版-推翻chunk结论-20260919.md` 第三·补节）：
+        //     我曾在 2026-09-19 深夜在此加过一段"更正"，声称把 `28a52c6a` 当"零正文"是错的、它其实有 52592 字。
+        //     **那次更正本身是错的，现撤销。** 两个口径在同一会话上的实测：
+        //       口径 A（**本代码的口径**：六类装配事件 ∧ `content[].type === "text"`）= **0 字**
+        //       口径 B（全部事件文本，含 `text-chunks`/`reasoning-chunks`/`texts[]`）= **0 字**
+        //     该会话 19 帧全是控制事件（`session`/`permission/preset`/`sandbox/mode`/`approval/policy`/
+        //     `subagent/model-selection-policy`/`agent/inbox/spliced`/`session/end-seed`）——**没有任何对话事件**。
+        //     ⇒ **上面 ② 的原措辞是对的**，本节设计的现实依据成立。
+        //     ⇒ 我的错在"口径"：那份手工拼接把**控制事件里的配置字段**当成了正文。
+        //       **"某事件里有可打印文本" ≠ "该文本是会话正文"。**
+        //     独立佐证：全部 302 个已归档会话里，满足"KEEP=0 ∧ type=text=0 ∧ 有帧 ∧ 无坏帧"的共 **22 个**
+        //       （`docs/B6-真空会话样本.csv`，`28a52c6a` 在列）⇒ "真·只含控制事件"是**真实存在的一类**。
+        //   ⇒ 空内容返回**结构化空结果**（`empty:true` + `consumedFrames`）：让下游那条分支**真的执行**，
+        //     把这些帧消费掉（**没有内容可丢**）；而 `null` 继续**专表失败**（异常 / frames=0）⇒ 失败路径行为不变。
+        if (chosen.length === 0) {
+          // ★ 坏帧（`decompressFrameAt` 返回 null：截断写 / 压缩载荷内出现 4 字节 magic 的"幻影帧" / 存储损坏）
+          //   **必须与"没有内容"一起上报**，不能因为走了"结构化空"就再也看不见它。
+          //   ★ 已权衡并**否掉**的替代方案：`badFrames > 0 ⇒ return null`（不推进、下轮重试）。否掉的理由：
+          //     ① 同一帧字节的解压结果是**确定性**的（重试恒失败）⇒ 那只是把"有限且已留痕的损失"
+          //        换成"该会话永久僵尸候选"（每轮重选 + 白轮 24h 退避，正是本批要修的形态）；
+          //     ② `scanZstdFrames` 按 magic 计帧 ⇒ 压缩载荷里偶然出现那 4 字节也会产生"幻影帧"
+          //        （**没有任何真实损坏**）⇒ 拿它当"读不出来"会误判正常日志、把正常会话卡死。
+          //   故这里把"帧已尽数尝试"与"坏帧计数"**同时**交出去：水位照常推进（帧确实都试过了），
+          //   坏帧数进单元元数据/留痕 ⇒ 事后能回答"这批帧读出来了吗"，不是静默丢。
+          const badFrames = (dropped["(badframe)"] && dropped["(badframe)"].n) || 0;
+          return { flow: "", empty: true, sampled: false, source: "empty", compCount: 0, badFrames: badFrames,
+            truncated: truncated, dropped: dropped, truncs: truncs, markers: markers,
+            consumedFrames: consumedFrames, incomplete: incomplete };
+        }
+        const allText = joinPartsStrict(markers.concat(chosen.map((c) => c.body)), "messageflow/allText");   // P4 第三保险
+        // ★★ §9.11.4-12（**B5 后队列项：`badFrames` 对"有正文"会话的可见性**）。
+        //   实测缺口（`_bf-probe.mjs`，不是读码推测）：**有正文 + 3 坏帧**的日志，
+        //   返回对象的键里**没有 `badFrames`**（`undefined`），而 `dropped["(badframe)"]` 里其实**有数据**（n=2）
+        //   ⇒ 该数据**从不被上报**：本文件的正常路径 return 没有这个字段，下游也无人读 `dropped`。
+        //   对照：**无正文 + 坏帧**走 `empty:true` 那条 return（含 `badFrames`）⇒ 只有那条可见。
+        //   ⇒ 后果：会话"有正文但部分帧读不出"时，**读者完全看不到**"这批帧读出来了吗"——
+        //     而这正是 `extractMessageFlowAsync` 注释里承诺过的事（L4228「事后能回答『这批帧读出来了吗』」），
+        //     **却只在空会话上兑现**。⇒ 现在把同一口径**接到全部三条 return**（含下面的分段路径）。
+        //   ★ 口径与空路径**完全一致**：`dropped["(badframe)"].n`（`scanZstdFrames` 按 magic 计帧，
+        //     压缩载荷内偶现 4 字节 magic 会产生"幻影帧"⇒ 该数**可能高估**，如实上报、不修饰）。
+        const badFrameCount = (dropped["(badframe)"] && dropped["(badframe)"].n) || 0;
         const SEG = 40000, MAX_SEG = 5;
         const segments = [];
         for (let i = 0; i < allText.length && segments.length < MAX_SEG; i += SEG) segments.push(allText.slice(i, i + SEG));
         if (allText.length > SEG * MAX_SEG) {
-          const tail = allText.slice(allText.length - SEG);
-          const midA = SEG, span = allText.length - SEG * 2;
           const dense = [allText.slice(0, SEG)];
-          for (let k = 1; k < MAX_SEG - 1; k++) { const p = midA + Math.floor(span * k / (MAX_SEG - 1)); dense.push(allText.slice(p, p + SEG)); }
-          dense.push(tail);
-          return { segments: dense, sampled: true, source: "messageflow" };
+          const spanMid = allText.length - SEG * 2;
+          for (let k = 1; k < MAX_SEG - 1; k++) { const p = SEG + Math.floor(spanMid * k / (MAX_SEG - 1)); dense.push(allText.slice(p, p + SEG)); }
+          dense.push(allText.slice(allText.length - SEG));
+          return { segments: dense, sampled: !FULL, source: "messageflow", truncated: truncated, dropped: dropped, truncs: truncs, markers: markers,
+                   badFrames: badFrameCount,
+                   consumedFrames: consumedFrames, incomplete: incomplete };
         }
-        return { segments: segments, sampled: !FULL, source: "messageflow" };
+        return { segments: segments, sampled: !FULL, source: "messageflow", truncated: truncated, dropped: dropped, truncs: truncs, markers: markers,
+                 badFrames: badFrameCount,
+                 consumedFrames: consumedFrames, incomplete: incomplete };
       } catch (e) { return null; }
+    }
+    // v2.8.4（P2）：逐类型正文抽取（**与 session-search.mjs 的 KEEP_KINDS 同源**，由 GR22 门断相等）
+    //   实测裁决：`user/message` → `data.content[]`；`assistant|system/message` → `data.message.content[]`
+    //   （**两条路径不同**）；两者都必须 `filter(c => c.type === "text")` —— `reasoning` 块**也带 text 字段**。
+    //   `tool/result`：正文在 `content[].content`（**不是 `.text`**）；**仅错误**（`isError===true` 为超集判据）。
+    function extractTextsFor(j, kd) {
+      const d = (j && j.data) || {};
+      if (kd === "user/message") {
+        const arr = d.content;
+        if (!Array.isArray(arr)) return [];
+        const t = arr.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
+        if (!t) return [];
+        // P5：原为「`<system-reminder>` 开头 ⇒ **整条丢弃**」。注入块是记忆回灌载体，剥离后剩余非空应保留。
+        const stripped = t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, " ").trim();
+        return stripped ? [stripped] : [];
+      }
+      if (kd === "assistant/message" || kd === "system/message") {
+        const arr = d.message && d.message.content;
+        if (!Array.isArray(arr)) return [];
+        const t = arr.filter((b) => b && b.type === "text").map((b) => b.text || "").join(" ").trim();
+        return t ? [t] : [];
+      }
+      if (kd === "tool/call") {
+        const nm = d.name || "?";
+        return ["[" + nm + "] " + String(d.arguments || "")];
+      }
+      if (kd === "tool/result") {
+        const arr = (d.message && d.message.content) || [];
+        const isErr = Array.isArray(arr) && arr.some((c) => c && c.isError === true);
+        if (!(d.error != null || isErr)) return [];            // 非错误 ⇒ 不收（对标 mimocode 不收 tool_output）
+        const out = [];
+        for (const c of arr) {
+          let got = false;
+          if (c && Array.isArray(c.content)) for (const q of c.content) if (q && typeof q.text === "string") { out.push(q.text); got = true; }
+          if (!got && c && typeof c.text === "string" && c.text) out.push(c.text);   // [2026-09-23 V4] 提升后的 tool-role 消息 text 直挂块上
+        }
+        if (!out.length) out.push(JSON.stringify(d).slice(0, 4000));
+        return out;
+      }
+      if (kd === "compaction/summary") {
+        const s = d.summary;
+        if (typeof s === "string") return [s];
+        if (Array.isArray(s)) { const t = s.filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n").trim(); return t ? [t] : []; }
+        return [];
+      }
+      return [];
     }
 
     // ═══════════ v2.4.7（方案C·L2 确定性预压缩）：插件内规则压缩——替代 v1.12.18.3 的逐段 spawn 子代理仿真压缩
@@ -2845,45 +4696,123 @@ function decompressSessionLog(filePath) {
     //   source=compaction（有官方摘要链）→ 摘要链本身是模型看全量后的浓缩，最多额外补末次压缩后交互；
     //   source=messageflow（帧采样）→ 多段拼接后按"工具轨迹优先 + 用户消息 + 尾保真"规则取 ≤UNIT_MAX_CHARS。
     // 输出：单元 text（≤UNIT_MAX_CHARS），供 L3 分桶（桶预算 BUCKET_BUDGET_CHARS）确定性切批。
-    const UNIT_MAX_CHARS = 20000;       // 单会话单元上限（≈5-6K token，加指令后单批上下文安全）
-    const BUCKET_BUDGET_CHARS = 60000;  // 单批字符预算（≈3-4 个单元，约 15-20K token）
-    const BUCKET_MAX_UNITS = 5;         // 单批单元数上限（防小单元堆积过长 prompt）
-    const ARCHIVE_MAX_CONCURRENT = 2;   // 批并发上限（防 token 放大）
+    // ═══ v2.8.4（P9/P10）：预算链条**一处定义** + 写死不变量 ═══
+    //   P9：原 `maxChars = sizeMiB < 5 ? 8000 : 200000` **就地写在提取函数内部**（且带体积分支）⇒
+    //     并轨为模块级唯一的 `EXTRACT_BUDGET_CHARS`（提取函数内 `maxChars` 只是它的别名）。
+    //   P10：`UNIT_MAX_CHARS × 2 ≤ BUCKET_BUDGET_CHARS` 由**注释**升级为**加载期硬断言**（注释不是约束）。
+    //     为什么恰好 ×2：分桶至少要能**并装两个满额单元**，否则桶内恒定只剩 1 个单元 ⇒ 会话间聚合失效、
+    //     批数翻倍、token 放大。本批**不改常量值**（红队已裁决：上调 UNIT_MAX_CHARS 会饿死其他会话）。
+    const EXTRACT_BUDGET_CHARS = 200000;   // 提取端唯一上限（原 maxChars；<5MiB 的 8000 分支已删）
+    const UNIT_MAX_CHARS       = 20000;    // 单会话单元上限（≈5-6K token，加指令后单批上下文安全）
+    const BUCKET_BUDGET_CHARS  = 60000;    // 单批字符预算（≈3-4 个单元，约 15-20K token）
+    const BUCKET_MAX_UNITS     = 5;        // 单批单元数上限（防小单元堆积过长 prompt）
+    // 断言体抽成**具名函数**：门可对「合规值」与「违规值」**双向行为断言**，无需改源码（否则只能做源码正则）。
+    function checkBudgetInvariant(unitMax, bucketBudget) {
+      if (!(Number.isFinite(unitMax) && Number.isFinite(bucketBudget) && unitMax > 0 && bucketBudget > 0)) {
+        return { ok: false, msg: "非有限正数：unitMax=" + unitMax + " bucketBudget=" + bucketBudget };
+      }
+      if (!(unitMax * 2 <= bucketBudget)) {
+        return { ok: false, msg: "UNIT_MAX_CHARS(" + unitMax + ") × 2 > BUCKET_BUDGET_CHARS(" + bucketBudget + ")" };
+      }
+      return { ok: true, msg: "ok" };
+    }
+    const BUDGET_INVARIANT_OK = checkBudgetInvariant(UNIT_MAX_CHARS, BUCKET_BUDGET_CHARS);
+    if (!BUDGET_INVARIANT_OK.ok) throw new Error("[dsh-memory] 预算不变量被破坏（P10）：" + BUDGET_INVARIANT_OK.msg);
+    // v2.6.6（2026-09-16 用户拍板）：2 → 5，且语义修正为「**在跑子代理**上限」。
+    //   旧实现只在发起循环里限制协程数，而 startOneBatch 秒级返回（不等在跑）→ 协程瞬间把全部批发起
+    //   （实证 09-16 17:06:19：7 批在**同一秒**全部创建），"并发上限"形同虚设、token 一次性放大。
+    //   新实现：首批只发起 N 批 → 其余进等待队列 → settle 内每完成一批才补发起下一批（真闸门）。
+    const ARCHIVE_MAX_CONCURRENT = 5;   // 在跑归档子代理并发上限（用户拍板 5；防 token 放大）
     const UNIT_CACHE_DIR = MEMORY_ROOT + "/.archive-units";   // 单元缓存（增量重档复用）
     const UNIT_CACHE_KEEP = 500;         // 单元 LRU 保留数
+    // ★ §9.11.4-8：**唯一副本**（会话正文只存在于单元里、未落库）的**硬上限** —— 只有单元总数也超过它时，
+    //   才会去动唯一副本。给"唯一副本无限膨胀"设一个天花板（防磁盘无界增长），同时保证正常规模下
+    //   （现场 186/51）**一个唯一副本都不会被删**。取 2×KEEP：留足余量，又不至于让目录失控。
+    const UNIT_CACHE_ONLY_COPY_HARD = UNIT_CACHE_KEEP * 2;
+    // ═══════════ v3.1.0：检索索引自动刷新（session-search）常量 ═══════════
+    //   本机实测（2026-09-20，真缓存）：全库增量稳态 2.98s / 吸收积压首轮 8.92s / 冷建最坏 115.2s
+    //   ⇒ 300s 对最坏仍有 2.6× 余量（初版设计拟 20 分钟，是照抄插件自述的旧口径「约 6 分钟」）。
+    const IDX_REFRESH_MIN_GAP_MS = 6 * 3600000;    // 成功后续冷却 6h（失败不续冷却）
+    const IDX_REFRESH_BACKOFF_MS = 24 * 3600000;   // 连续失败 ≥3 次 ⇒ 转 24h 退避
+    //   环境变量是**测试缝**（门用 800ms 验证 kill 路径），生产不设它。
+    //   ★ 必须**调用时读**：宿主对重复 apply 会早退（同进程二次 apply 只更新配置、不重建闭包）
+    //     ⇒ 若按 apply 期常量，门的短超时会被首次 apply 的值钉死（本仓自审实测踩到）。
+    const IDX_REFRESH_TIMEOUT_DEFAULT_MS = 300000;
+    const idxRefreshTimeoutMs = () => { const v = Number(process.env.DSH_MEMORY_IDX_TIMEOUT_MS); return v > 0 ? v : IDX_REFRESH_TIMEOUT_DEFAULT_MS; };
+    const IDX_REFRESH_LEDGER = MEMORY_ROOT + "/.index-refresh.json";   // 自有独立点文件（不碰 .integrate.json）
+    const IDX_TOOL_BUILD_QUIET_MS = 10 * 60000;    // 刚发生过手工/工具 build ⇒ 本轮不贴脸刷新
+    // ═══════════ v2.8.4（P16）：`compressUnit` **降级为「透传 + 标注」** ═══════════
+    // 旧实现在**此处做了第二套分配**：`text > UNIT_MAX_CHARS` 时按**行前缀**（`/^\[工具\]/`、`/^\[用户\]/`）
+    //   取「60 行工具 + 40 行用户 + 末 40 行」，**优先级与 P3 相反**（工具先占、用户次之）。两个后果：
+    //   ① **多行件的续行被整片丢掉**——件内 `\n` 会被 `split("\n")` 拆开，只有**首行**带 `[用户] `/`[工具] ` 前缀，
+    //      其余物理行三个 filter 全部落空（实测形态：6521 字符的消息只剩首行）。这是 L-A 类丢失在**下游**的翻版，
+    //      且发生在**件已选完之后** ⇒ P1–P3 的增益会被它二次吃掉。
+    //   ② **[助手]/[工具结果]/[系统]/【压缩点摘要】** 在中段**整类消失**（只有 `tail` 的末 40 行能带出来）。
+    // 现改为：**分配只由 P3 负责**（单一预算 ⇒ 单一丢失点）；此处只做 `slice(0, UNIT_MAX_CHARS)` 兜底，
+    //   并把这次兜底**记进元数据**（GA8：不静默丢；GA17：截断必有元数据条目**且 `text` 内不含旧标注串**）。
+    // 附注（方案 §1.4-3 的取舍）：§1.4-3「多行件压成单行（`\n`→字面 `\\n`）」的**唯一理由是让行前缀过滤 ≡ kind 过滤**；
+    //   行前缀过滤此处已被**整体删除** ⇒ 该转义失去动机，且会给归档子代理的阅读面引入字面 `\n` ⇒ **不实施**。
+    //   其真正要求（"续行不被丢"）由**删除过滤**本身满足，并由 GA8 的续行断言把住。
     function compressUnit(extract, fallbackText) {
       try {
-        if (!extract) return { text: String(fallbackText || "").slice(0, UNIT_MAX_CHARS), source: "none", chars: 0 };
-        if (extract.source === "compaction" && extract.flow) {
-          return { text: extract.flow.slice(0, UNIT_MAX_CHARS), source: "compaction", chars: Math.min(extract.flow.length, UNIT_MAX_CHARS) };
-        }
+        const src = (!extract) ? "none" : (extract.source || "messageflow");
         let text = "";
-        if (Array.isArray(extract.segments) && extract.segments.length > 0) text = extract.segments.join("\n\n");
-        else if (extract.flow) text = extract.flow;
+        if (!extract) text = String(fallbackText || "");
+        else if (Array.isArray(extract.segments) && extract.segments.length > 0) text = extract.segments.join("\n\n");
+        else if (typeof extract.flow === "string") text = extract.flow;
         else text = String(fallbackText || "");
-        if (text.length > UNIT_MAX_CHARS) {
-          const lines = text.split("\n");
-          const toolLines = lines.filter((l) => /^\[工具\]/.test(l.trim()));
-          const userLines = lines.filter((l) => /^\[用户\]/.test(l.trim()));
-          let head = "";
-          let budgetLeft = UNIT_MAX_CHARS;
-          for (const l of toolLines.slice(0, 60)) {
-            if (l.length + head.length > budgetLeft) break;
-            head += (head ? "\n" : "") + l;
-          }
-          budgetLeft = UNIT_MAX_CHARS - head.length;
-          let userPart = "";
-          for (const l of userLines.slice(0, 40)) {
-            if (l.length + userPart.length > budgetLeft) break;
-            userPart += (userPart ? "\n" : "") + l;
-          }
-          const tail = lines.slice(-40).filter((l) => /^\[用户\]|^\[助手\]|^\[工具\]/.test(l.trim())).join("\n").slice(0, 4000);
-          text = [head, userPart, "…[规则压缩省略]", tail].filter(Boolean).join("\n\n").slice(0, UNIT_MAX_CHARS);
-        }
-        return { text: text.slice(0, UNIT_MAX_CHARS), source: "messageflow", chars: Math.min(text.length, UNIT_MAX_CHARS) };
+        const rawLen = text.length;
+        const cut = rawLen > UNIT_MAX_CHARS;      // 兜底截断：只有 P3 分配之后仍超上限才会发生
+        const truncs = Array.isArray(extract && extract.truncs) ? extract.truncs.slice() : [];
+        if (cut) truncs.push({ stage: "unit", kind: "(unit)", raw: rawLen, kept: UNIT_MAX_CHARS });
+        const out = {
+          text: cut ? text.slice(0, UNIT_MAX_CHARS) : text,
+          source: src,
+          chars: Math.min(rawLen, UNIT_MAX_CHARS),
+          truncated: !!((extract && extract.truncated) || cut),
+          truncs: truncs,
+        };
+        if (extract && extract.dropped) out.dropped = extract.dropped;            // 元数据透传（不重复分配）
+        if (extract && Array.isArray(extract.markers)) out.markers = extract.markers;
+        if (extract && extract.sampled !== undefined) out.sampled = !!extract.sampled;
+        if (extract && Array.isArray(extract.segments)) out.segments = extract.segments;
+        return out;
       } catch (e) {
-        return { text: String(fallbackText || "").slice(0, UNIT_MAX_CHARS), source: "error", chars: 0 };
+        return { text: String(fallbackText || "").slice(0, UNIT_MAX_CHARS), source: "error", chars: 0, truncated: false, truncs: [] };
       }
+    }
+    // ═══ v2.8.4（P21）：把**多个文件的提取产物**并成一个单元原料 ═══
+    //   为什么需要：双名目录（实测 7 个）里 legacy 与 v3 各是一段真实会话，必须**同时**进单元。
+    //   为什么在这里**不做分配**：每个文件已各自受 `EXTRACT_BUDGET` 约束；合并后若超过 `UNIT_MAX_CHARS`，
+    //   一律交给 `compressUnit` 的 P16 兜底并记 `truncs` —— 单一预算、单一丢失点（否则又是两套丢失点）。
+    function combineExtracts(rs, consumedTotal, incomplete) {
+      if (!Array.isArray(rs) || rs.length === 0) return null;
+      const segments = [];
+      let flow = "";
+      let truncated = false, incAny = !!incomplete;
+      const dropped = Object.create(null);
+      const truncs = [];
+      const markers = [];
+      for (const r of rs) {
+        if (Array.isArray(r.segments)) for (const sg of r.segments) segments.push(sg);
+        if (typeof r.flow === "string" && r.flow) flow += (flow ? "\n\n" : "") + r.flow;
+        if (r.truncated) truncated = true;
+        if (r.incomplete) incAny = true;
+        if (r.dropped) for (const k of Object.keys(r.dropped)) {
+          const d = dropped[k] || (dropped[k] = { n: 0, chars: 0 });
+          d.n += r.dropped[k].n || 0; d.chars += r.dropped[k].chars || 0;
+        }
+        if (Array.isArray(r.truncs)) for (const t of r.truncs) truncs.push(t);
+        if (Array.isArray(r.markers)) for (const m of r.markers) if (markers.indexOf(m) < 0) markers.push(m);
+      }
+      const out = {};
+      if (segments.length) out.segments = segments;
+      if (flow) out.flow = flow;
+      out.source = (flow && !segments.length) ? "compaction" : "messageflow";
+      out.sampled = rs.some((r) => r.sampled === true);
+      out.truncated = truncated; out.dropped = dropped; out.truncs = truncs; out.markers = markers;
+      out.consumedFrames = consumedTotal; out.incomplete = incAny;
+      return out;
     }
     // ===== 分桶：按字符预算 + 单元数上限，把单元列表切成子代理批 =====
     function bucketUnits(units) {
@@ -2906,33 +4835,171 @@ function decompressSessionLog(filePath) {
     // ===== v2.4.7（方案C·L2b 单元缓存）：增量重档复用——避免续聊会话重新提取/压缩全量 =====
     // 文件名 <sid12>.json：{sid, frames, round, at, text, source, chars}；LRU 保留 UNIT_CACHE_KEEP 个
     function unitCachePath(sid) { return UNIT_CACHE_DIR.replace(/\\/g, "/") + "/" + sid + ".json"; }
-    function readUnitCache(sid) {
+    function readUnitCache(sid, curFrames) {
+      // 批0（P0-5）加身份校验：原实现只校验 `typeof d.text === "string"` —— 缓存陈旧/被换时会被当作有效单元，
+      //   而 L5778-5780 更把它当成**本轮成功**结果 ⇒ 子代理拿到旧内容却报成功、新帧从此不见。
+      //   校验：① sid 与文件名一致；② frames 为有限非负数；③ 若调用方给出当前帧数且缓存帧数**大于**它
+      //   （= 文件被截断/重写）→ 判为陈旧；④ **口径版本 `counterVer` 必须等于 `EXTRACT_COUNTER_VER`（P12）**。
       const p = unitCachePath(sid);
-      try { const d = JSON.parse(fs.readFileSync(portable(p), "utf8")); if (d && typeof d.text === "string") return d; } catch (e) {}
+      try {
+        const d = JSON.parse(fs.readFileSync(portable(p), "utf8"));
+        if (!d || typeof d.text !== "string") return null;
+        if (d.sid !== undefined && String(d.sid) !== String(sid)) return null;
+        if (!Number.isFinite(Number(d.frames)) || Number(d.frames) < 0) return null;
+        if (Number.isFinite(Number(curFrames)) && Number(d.frames) > Number(curFrames)) return null;
+        // v2.8.4（P12）：**口径版本**校验（④）。提取集合/装配规则/截断策略任一变更都会 +EXTRACT_COUNTER_VER，
+        //   旧口径单元必须**直接拒收**——既不得 merge 进新单元，也不得在 L5919 被当成 `staleFallback` 成功。
+        //   否则"改了口径却永远复用旧产物"：P1–P18 的修复对**全部存量单元**失效且不可观测。
+        if (Number(d.counterVer) !== EXTRACT_COUNTER_VER) return null;
+        return d;
+      } catch (e) {}
       return null;
     }
     function writeUnitCache(unit) {
       try {
         if (!unit || !unit.sid) return;
         fs.mkdirSync(portable(UNIT_CACHE_DIR), { recursive: true });
-        writeFileAtomic(portable(unitCachePath(unit.sid)), JSON.stringify(unit), { tag: "units" });   // v0.5（step1 账本闸）：统一原子写
-        // LRU 保留：超 UNIT_CACHE_KEEP 时删最旧（按 at 排序）——仅单元目录规模大时触发
+        // ★★ §9.11.4-11（B4：**写失败留痕**）—— 原实现把 `writeFileAtomic` 的返回值**丢弃**，
+        //   且函数尾部是 `catch (e) { /* 忽略 */ }` ⇒ **写失败完全不可见**。
+        //   为什么必须留痕（工程席 rev8k A2 的原始诉求，本项补上）：
+        //     下游 `readArchiveUnitForSkip` 对"盘上无单元"只报 `no-unit-file`，**无法区分**三种成因 ——
+        //       ①**写失败**（本次新写的没落盘）②**被 LRU 淘汰**（写成功过、后来被删）③**从未写**
+        //     ⇒ 三种在健康行里长成一个样子，而它们的处置**完全不同**（①要重试 ②要调保留数 ③才是正常）。
+        //   留痕落在**旁路账本**（`monitorEvent` → `.monitor.json`）+ 内存计数，
+        //     **绝不写进受保护对象**（本批已因"把可观测量写进 fail-closed 要保护的账本"栽过一次，见 T9a-2）。
+        const wRes = writeFileAtomic(portable(unitCachePath(unit.sid)), JSON.stringify(unit), { tag: "units" });   // v0.5（step1 账本闸）：统一原子写
+        // `writeFileAtomic` 返回 `{ ok, readbackOk? }`；`readbackOk === false` 表示"盘上内容与预期不符"。
+        if (wRes && wRes.readbackOk === false) {
+          UNIT_WRITE_FAIL_SEEN++;
+          cwarn("[dsh-memory] ⚠ 单元写盘**回读校验不一致**（盘上内容 ≠ 预期）：" + unitSid(unit.sid)
+            + "（" + (Number(unit.chars) || 0) + " 字）⇒ 该会话本轮产物可能不可用；"
+            + "下次 `readArchiveUnitForSkip` 会报 `no-unit-file`/内容不符 —— **读侧无法区分「写失败」与「被淘汰」**，故必须在此留痕。");
+          try { monitorEvent("units", "write-readback-mismatch sid=" + unitSid(unit.sid) + " chars=" + (Number(unit.chars) || 0) + " fails=" + UNIT_WRITE_FAIL_SEEN); } catch (e) {}
+        }
+        // ★★ §9.11.4-8（**根因席 B 组 · 现场取证驱动**）：LRU 淘汰**不许静默**、**不许先删"唯一副本"**。
+        //   现场实测（2026-09-19）：186 个单元里 **51 个是"唯一副本"**（对应会话未落库 `sessions/*.md`），
+        //   合计 **345673 字**，且它们**恰好是最旧的一批**（08-31 起）—— 而原实现按 `at` 升序删最旧
+        //   ⇒ **淘汰顺序与"谁最不可替代"完全相反**：一旦到 500（当时约 10/天 ⇒ 约 31 天后），
+        //   最先被删的正是这 51 个唯一副本 ⇒ 那 34.6 万字 **logs 搜不到、units 也搜不到**（彻底消失）。
+        //   修法三条：①**优先淘汰"已落库"的**（还有别处副本，删了仍搜得到）；
+        //             ②唯一副本**只在极端情况**才动（超出硬上限 `UNIT_CACHE_ONLY_COPY_HARD` 时，且留痕）；
+        //             ③删除**一律留痕**（`monitorEvent` + `cwarn`），并写明"删了几个、其中几个是唯一副本"。
         try {
           const files = fs.readdirSync(portable(UNIT_CACHE_DIR)).filter((f) => f.endsWith(".json"));
           if (files.length > UNIT_CACHE_KEEP) {
-            const sorted = files.map((f) => { try { const d = JSON.parse(fs.readFileSync(portable(UNIT_CACHE_DIR + "/" + f), "utf8")); return { f: f, at: d.at || 0 }; } catch (e) { return { f: f, at: 0 }; } }).sort((a, b) => a.at - b.at);
-            for (const x of sorted.slice(0, files.length - UNIT_CACHE_KEEP)) { try { fs.unlinkSync(portable(UNIT_CACHE_DIR + "/" + x.f)); } catch (e) {} }
+            const metas = files.map((f) => {
+              let d = null; try { d = JSON.parse(fs.readFileSync(portable(UNIT_CACHE_DIR + "/" + f), "utf8")); } catch (e) {
+                // ★ 读不出来的单元**不得当成"可删"**（它可能正是唯一副本，只是文件损坏）⇒ 归入"保留"侧并留痕
+                return { f: f, at: 0, sid: "", onlyCopy: true, unreadable: true };
+              }
+              const sid = String((d && d.sid) || "");
+              // ★★ 口径修正（**我在设计时就该查实**）：单元里的 `sid` 是**完整 id 且无 `session-` 前缀**
+              //   （现场：`199d8584-d66…`），而 `sessions/*.md` 的块头写的是 **12 位短 id**（`### 199d8584`）。
+              //   而 `sessionMentionedInMemory(sid)` 用的是"完整 id / 去前缀完整 id" ⇒ **匹配不到 `### <sid12>`**
+              //   ⇒ 直接拿它判"是否已落库"会把**所有已落库单元也当成唯一副本**（保护过度、永不淘汰）。
+              //   ⇒ 必须用 **`unitSid(sid)`（= 去前缀取 12 位）**去查。两条判据取"或"（任一命中即算有副本）。
+              const landed = sessionMentionedInMemory(sid) || sessionMentionedInMemory(unitSid(sid));
+              return { f: f, at: (d && d.at) || 0, sid: sid, onlyCopy: !landed, unreadable: false };
+            });
+            // ★★ §9.11.4-8（**为可测而抽纯函数**，同本批 `applyOverLimitHintEntry`/`distributeOffsets` 的范式）：
+            //   淘汰**顺序决策**抽成模块级纯函数 `evictUnitCachePlan` 并导出 —— 否则门只能"自写复算"，
+            //   那等于**门在测自己**（我第一版就是这么写的：`T10a/T10b` 在新旧字节上都 PASS = vacuous）。
+            //   现在门直调它 ⇒ 断言红绿**由产品字节决定**。
+            const plan = evictUnitCachePlan(metas, UNIT_CACHE_KEEP, UNIT_CACHE_ONLY_COPY_HARD);
+            const all = plan.evict;
+            const fromOnly = all.filter((x) => x.onlyCopy === true);
+            for (const x of all) { try { fs.unlinkSync(portable(UNIT_CACHE_DIR + "/" + x.f)); } catch (e) {} }
+            if (all.length > 0) {
+              const sids = all.slice(0, 6).map((x) => (x.sid ? x.sid.replace(/^session-/, "").slice(0, 8) : x.f.replace(/\.json$/, "")));
+              clog("[dsh-memory] 单元缓存淘汰 " + all.length + " 个（保留 " + UNIT_CACHE_KEEP + "；其中**唯一副本** " + fromOnly.length + " 个"
+                + (fromOnly.length > 0 ? "——已超硬上限 " + UNIT_CACHE_ONLY_COPY_HARD + "，请人工核查这些会话的正文是否已落库" : "（优先淘汰的是已落库会话，正文仍可在记忆库检索）")
+                + "）: " + sids.join(", "));
+              try { monitorEvent("units", "lru-evict n=" + all.length + " keep=" + UNIT_CACHE_KEEP + " onlyCopyEvicted=" + fromOnly.length + " items=" + sids.join("|")); } catch (e) {}
+              if (fromOnly.length > 0) cwarn("[dsh-memory] ⚠ 单元缓存淘汰了 " + fromOnly.length + " 个**唯一副本**（该会话正文只存在于单元里、未落库）⇒ 这些内容此后 logs/units 都搜不到。请核对：" + sids.join(", "));
+            }
           }
-        } catch (e) {}
-      } catch (e) {}
+        } catch (e) {}   // LRU 段自身失败不连带写失败留痕（见下）
+      } catch (e) {
+        // ★★ §9.11.4-11（B4）：**写路径的异常必须留痕**。原为 `catch (e) { /* 忽略 */ }` ⇒
+        //   `mkdirSync` 失败（权限/路径）、`writeFileAtomic` 抛错（磁盘满 / EACCES / rename 失败）
+        //   全部**静默**，而下游只看得到"盘上没单元"。落在旁路账本 + 内存计数，不写受保护对象。
+        UNIT_WRITE_FAIL_SEEN++;
+        cwarn("[dsh-memory] ⚠ **单元写盘失败**（" + unitSid(unit && unit.sid) + "）：" + (e && e.message ? e.message : String(e))
+          + " —— 该会话本轮产物**未落盘**；下游只会看到 `no-unit-file`（**读侧区分不出「写失败」与「被淘汰」**）。"
+          + "连续出现通常意味着缓存目录不可写或磁盘已满。");
+        try { monitorEvent("units", "write-fail sid=" + unitSid(unit && unit.sid) + " err=" + String((e && e.message) || e).slice(0, 80) + " fails=" + UNIT_WRITE_FAIL_SEEN); } catch (e2) {}
+      }
     }
-    // 合并：旧单元（已归档部分）+ 新增帧单元（增量）——续聊会话的单元重组
+    // 合并：补档轮次的单元重组织
+    // ═══ v2.8.4（P17 → 评审组裁决后**重写方向**）═══
+    // 【原缺陷】原实现 `full = 【已归档部分】+旧 + 【新增部分】+新` 再 `full.slice(0, UNIT_MAX_CHARS)`
+    //   ⇒ 旧在前、头截断 ⇒ **整段吃掉「新增部分」**；而本轮 `consumedFrames` 已推进到文件尾 ⇒ 该轮新增
+    //   **永不重试**。根因席判定与原案**同型**（切点在模型视野之前 + 内容对模型不可见 + 水位照常推进），
+    //   且因产物**写回缓存成为下一轮 `old`** 而**更硬**：一旦 `len(old)` 触顶，此后每轮新增 100% 被吃。
+    //   实测（`_probe-merge-overflow.mjs`，真机 7 个双名会话）：**3/7 命中溢出**，旧方向下丢 **8905 字符**新增。
+    // 【裁决】三席一致否决旧方向。旧段去留的分歧由**仓内既有契约**裁定：
+    //   归档块头对 `isRe` **已经**自称 `【补档第N轮·**仅含新增帧**】`（`L6290`），提示词第 1b 条亦写
+    //   「本次消息流**只含上次归档之后的新增内容**」（`L6307`）⇒ **拼入旧段是本函数违反自身下游契约**，
+    //   不是特性。故本函数取 **(D) 不自增**：`unit.text` = **仅新增**，与块头声明一致、零溢出、无标签嵌套。
+    // 【被否决的两案及其复活条件】（留档，避免以后重复争论）
+    //   · (B)「保新 + 旧段按余额补」/ (E)「旧段按字面量筛行」：只有在**同时改提示词**（允许"补齐旧轮遗漏的
+    //     字面量"）时才有收益 —— 现行 1b 明令"只写新增部分的新事实"，旧段进了 prompt 也只能当噪声；
+    //     且填满旧段**不是免费的**：`bucketUnits` 用 `text.length` 计 `BUCKET_BUDGET_CHARS=60000`
+    //     ⇒ 单元越满、每批装得越少、子代理批数与 token 越多。
+    //   · (A)「保旧丢新 + 只记账」：记账 ≠ 可见（`dropped` 迄今无任何消费者 ⇒ 由 P18 补读者），
+    //     且水位照常推进 ⇒ 不可重试 ⇒ 构成静默丢失。
+    // 【配套依赖】选 (D) 之后，旧正文不再随本轮提供，其结论只由提示词另给的
+    //   `extractExistingArchiveBlock(sid)`（旧要点）承载 ⇒ **必须**与 P18（账本内容见证 + 指定读者）
+    //   同批上线，否则"上轮要点因写盘失败却照样消号"时旧段即成最后一份材料（工程席 falsifier）。
+    // 历史标签剥离（只为**兼容存量缓存**）：2026-09-18 之前写入的单元可能带着
+    //   `【已归档部分（上次提取）】`/`【新增部分（本次提取）】` 头（旧方向留下的），新方向不再产生它们。
+    const MERGE_OLD_LABEL = "【已归档部分（上次提取）】";
+    const MERGE_NEW_LABEL = "【新增部分（本次提取）】";
+    function stripMergeLabels(t) {
+      return String(t || "").split(MERGE_OLD_LABEL).join("").split(MERGE_NEW_LABEL).join("").replace(/^\s+/, "");
+    }
     function mergeUnitCache(oldUnit, newUnit, curFrames, round) {
       if (!oldUnit && !newUnit) return null;
-      const nl='\n';
-      const text = [oldUnit && oldUnit.text ? "【已归档部分（上次提取）】"+nl+oldUnit.text : "", newUnit && newUnit.text ? "【新增部分（本次提取）】"+nl+newUnit.text : ""].filter(Boolean).join(nl+nl).slice(0, UNIT_MAX_CHARS);
       const sid = (newUnit && newUnit.sid) || (oldUnit && oldUnit.sid) || "?";
-      return { sid: sid, frames: curFrames, round: round, at: Date.now(), text: text, source: "merged", chars: text.length };
+      const newText = (newUnit && typeof newUnit.text === "string") ? newUnit.text : "";
+      const oldText = stripMergeLabels(oldUnit && oldUnit.text);
+      // 历史账（逐 kind 累计）——但 `(merge-overflow)` 是**本轮量**，下面单独写，绝不被历史值覆盖：
+      //   原实现"先写本轮、再用 `oldUnit.dropped` 整体覆盖" ⇒ 账里存的是**上一轮**的字符数，
+      //   而 `truncs` 是本轮正确值 ⇒ GA19 的独立复算必然对不平（工程席复核）。
+      const dropped = {};
+      for (const src of [oldUnit, newUnit]) {
+        if (!src || !src.dropped) continue;
+        for (const k of Object.keys(src.dropped)) {
+          if (k === "(merge-overflow)") continue;
+          const a = dropped[k] || (dropped[k] = { n: 0, chars: 0 });
+          a.n += src.dropped[k].n || 0; a.chars += src.dropped[k].chars || 0;
+        }
+      }
+      // 新增为空 ⇒ **绝不写空单元覆盖旧缓存**（否则 `readUnitCache` 下一轮读到空文本、该会话链路断掉）
+      if (!newText.trim()) {
+        if (!oldText.trim()) return null;
+        return Object.assign({}, oldUnit, {
+          sid: sid, frames: curFrames, round: round, at: Date.now(), source: "merged", staleFallback: true,
+          text: oldText, chars: oldText.length, counterVer: EXTRACT_COUNTER_VER, dropped: dropped,
+        });
+      }
+      const text = newText.slice(0, UNIT_MAX_CHARS);          // ★ 新增全额优先（唯一不可让的部分）
+      const cut = newText.length - text.length;
+      const truncs = Array.isArray(newUnit.truncs) ? newUnit.truncs.slice() : [];   // 只留本轮（原来逐轮 concat ⇒ 单调膨胀）
+      if (cut > 0) {
+        truncs.push({ stage: "merge", kind: "(merge-new-truncated)", raw: newText.length, kept: text.length });
+        dropped["(merge-overflow)"] = { n: 1, chars: cut };
+      }
+      return {
+        sid: sid, frames: curFrames, round: round, at: Date.now(), text: text,
+        source: "merged-newonly",                            // 门可据此分辨"合并出问题"（工程席主张①）
+        chars: text.length, counterVer: EXTRACT_COUNTER_VER,
+        truncated: !!(cut > 0 || (newUnit && newUnit.truncated)),
+        truncs: truncs, dropped: dropped,
+        newTruncated: cut > 0,                               // 守卫标记：新增**自身**被截（供 P18 读者）
+        prevArchivedChars: oldText.length,                   // 旧正文去向**显式化**（避免"消失得无声"）
+        prevArchivedIn: "ledger-points",                     // 由提示词的「已归档要点」块承载
+      };
     }
 
 // v1.11.0：记忆活跃界限（漏网检测过滤用）——
@@ -2977,12 +5044,55 @@ function refreshMemorySessionsIndex() {
   } catch (e) { MEMORY_SESSIONS_INDEX = ""; return ""; }
 }
 
-// 会话 id 是否已出现在记忆库 sessions/ 文件中（出现过 = 曾被总结/落档，不再视为漏网）
+// 会话 id 是否已出现在记忆库 sessions/ 文件中（出现过 = 曾被总结/落档）。
+// ★★ §9.11.4-8（**现场取证驱动**，2026-09-19）：**口径修正 + 用途澄清**（原实现有一处 3 年未察觉的错配）
+//   【错配】原判据只有两种形态：**完整 id**（`session-<uuid>`）与**去前缀完整 id**（`<uuid>`）。
+//     而 `sessions/*.md` 的归档块头写的是 **`### <sid12>`**（= 去 `session-` 前缀取 **12 位**，现场形态
+//     如 `### 7fbd82f9-ff9`）⇒ **两种形态都匹配不到**。
+//     现场实测（289 个已归档会话）：**原口径只命中 4 个（1.4%）**，加上 12 位短 id 后命中 **145 个**。
+//     ⇒ 那条"出现过就不再视为漏网"的防线**实际上几乎不存在**（注释里"凡内容落过盘的会话永远进不了候选"
+//       与事实**相反** —— 已在下方 `shouldReArchive` 注释处一并更正）。
+//   【修正】补第三种形态：**12 位短 id**（`unitSid()` = 去前缀取 12 位）⇒ 与块头口径对齐。
+//   【用途澄清（关键）】修好之后它**仍然不能当"禁止再归档"的硬闸**：
+//     `·补N` 是**正常特性**（续聊增量重档，现场取证：同一会话多块之间**内容 0 重叠**，非重复归档；
+//     `a79f71f7-25c` 正当补了 3 轮）⇒ 若拿它挡补档，**续聊将永不补档**。
+//     ⇒ 它只应参与"**首次归档**"的去重（见 `shouldReArchive` 里 `首次` 分支的用法与门 `T11` 的反空洞断言）。
 function sessionMentionedInMemory(sessionId) {
   if (MEMORY_SESSIONS_INDEX === null || Date.now() - MEMORY_SESSIONS_INDEX_AT > 300000) refreshMemorySessionsIndex();   // v2.0.9(L4): 5 分钟 TTL
   const idx = MEMORY_SESSIONS_INDEX || "";
   const idShort = sessionId.replace(/^session-/, "");
-  return idx.includes(sessionId) || idx.includes(idShort);
+  const id12 = unitSid(sessionId);   // ★ 走 `unitSid()` 单点所有者（**GR23b 宽度守则**：非注释行不许裸 `slice(0,12)` 作用于 sid —— 一致性门当场抓住了我第一版的写法）
+  return idx.includes(sessionId) || idx.includes(idShort) || idx.includes(id12);
+}
+// ★★ B1′（2026-10-07 现场）：盘面**强证据**判据 —— sessions/*.md 里是否已有该会话的**归档块头**。
+//   与落盘段 `existing.includes("### " + it.sid)` **同一口径**（不新造第二条判据）；
+//   只认 `### ` 前缀 ⇒ 压缩检查点（`<!-- intent: … sid:<sid8> -->`）与正文提及都不会命中。
+function archiveBlockOnDisk(sessionId) {
+  if (MEMORY_SESSIONS_INDEX === null || Date.now() - MEMORY_SESSIONS_INDEX_AT > 300000) refreshMemorySessionsIndex();
+  return (MEMORY_SESSIONS_INDEX || "").includes("### " + unitSid(sessionId));
+}
+// ★★ B1′：把"盘上已归档"补记进账本（幂等）。水位基准优先取该会话单元的 frames（= 块覆盖到的那一帧）；
+//   取不到则 0（⇒ 下轮整段重提取为补档，宁可多跑一轮，不静默跳帧）。
+//   round 固定 **2**：块已在盘上 ⇒ 该会话的下一轮**按定义是补档**（兑现"提及闸不得挡补档"）。
+function backfillArchivedFromDisk(s) {
+  try {
+    if (ARCHIVED_SESSIONS.has(s.id)) return false;
+    let base = 0;
+    try {
+      const u = readArchiveUnitForSkip(s.id);
+      if (u && u.ok && u.file) {
+        const d = JSON.parse(fs.readFileSync(portable(ARCHIVE_UNITS_DIR + "/" + u.file), "utf8"));
+        if (typeof d.frames === "number" && d.frames > 0) base = d.frames;
+      }
+    } catch (e) {}
+    ARCHIVED_SESSIONS.add(s.id);
+    ARCHIVE_WATERMARK.set(s.id, { frames: base, round: 2, at: Date.now(), incomplete: false, byFile: null,
+      witness: { mode: "backfill-from-disk", points: 0, chars: 0, reason: "sessions/ 已有归档块但账本无收据（部分失败轮）" } });
+    ARCHIVE_WM_DIRTY = true;   // 与懒置基线**同一落盘通道**（saveStaleNotified 在闭包内，本函数在模块级 ⇒ 不许直接调）
+    clog("[dsh-memory] 账本回填：sessions/ 已有归档块但账本无收据 ⇒ 记 archivedSessions + 水位（round=2, frames=" + base + "）：" + unitSid(s.id));
+    monitorEvent("archive", "ledger-backfill-from-disk " + unitSid(s.id) + " base=" + base);
+    return true;
+  } catch (e) { return false; }
 }
 
 // ═══════════ v2.4.3（续聊增量重档）：帧计数 + 重入判定 + 旧要点上下文提取 ═══════════
@@ -3000,11 +5110,54 @@ function countZstdFrames(filePath) {
 // 该会话当前是否「待归档」：不在账本=true（首次档）；在账本无水位（历史条目）=懒置基线返回 false（不追溯旧尾巴）；
 // 有水位且当前帧数>水位=true（续聊新增，增量重入）；读不到日志=false（保守不打扰）
 function archivePendingEntry(s) {
-  if (!ARCHIVED_SESSIONS.has(s.id)) return true;
-  const cur = countZstdFrames(SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd");
+  if (!ARCHIVED_SESSIONS.has(s.id)) {
+    // ★★ B1′（2026-10-07 现场取证）：**块已在盘上、账本没有收据** —— doneOk=false 的部分失败轮
+    //   （整轮与门）把已落盘的会话留在"首次归档"档 ⇒ 提及闸永久挡死它、连补档都进不去
+    //   （补档要 round>=2 的水位）。修法 = **按盘面强证据回填账本**（不是放宽提及闸）。
+    //   ★ 判据只用 `### <sid12>`（归档块头，与落盘段「已在库」判据同一口径）；
+    //     **绝不**把 `sid:<sid8>`（压缩检查点）或正文提及当证据 —— 检查点 ≠ 归档。
+    if (archiveBlockOnDisk(s.id)) { backfillArchivedFromDisk(s); return false; }
+    return true;
+  }
+  // v2.6.5: 水位帧数也必须走新名解析——旧硬编码对 v3-only 会话恒返回 null，
+  //   而本函数把 null 当作「读不到日志 = 保守不打扰」→ 归档过的会话续聊永不重档（设计退化）
+        // v2.8.4（P21/P22）：`cur` 用**同目录全部日志的 sum(frames)** —— 量纲必须与账本 `wm.frames` 一致，
+        //   否则双名会话因「按优先级只读到 v3」而 `cur` 恒小于 legacy 时代的水位 ⇒ 永不重入（实测 6/7 命中）。
+        const wmPaths = resolveSessionLogPaths(SESSIONS_ROOT + "/" + s.ws + "/" + s.id);
+        const cur = wmPaths.length ? sessionFramesTotal(wmPaths) : null;
   if (cur === null) return false;
   const wm = ARCHIVE_WATERMARK.get(s.id);
   if (!wm) {
+    // ★★ §9.11.4-10（**现场取证驱动：103 个"已归档但从未提取"的会话**）。
+    //   【原行为】无条件懒置基线 `{frames: cur, round: 1, at: now}` 并 `return false`（判"不待归档"）。
+    //   【实测缺陷】取证 2026-09-19：289 个已归档会话里 **103 个无单元**，且**全部**呈现同一签名 ——
+    //     `round=1` ∧ **无 `byFile`**（`byFile` 只在真提取时写）∧ `frames>0` ∧ 无单元文件 ∧
+    //     `empty`/`skipped`/`incomplete` 全为假（账本自己**不声称**它们"确无内容"）。
+    //     时间分簇：08-30 两簇 n=69+28 **有单元 0**；08-31 起各簇有单元数 ≈ 簇大小 ⇒
+    //     **是这条路径在批量为"从未提取"的会话盖"已消费"章**。且**34 个发生在 09-16 之后**（至今仍在发生）。
+    //   【后果】水位被基线化到当前帧数 ⇒ 重入条件 `cur > wm.frames` 需**新增**帧才成立 ⇒
+    //     该会话既有正文**永不提取**；若它此后再无新增 ⇒ **永久漏档**（只剩原始日志可 grep）。
+    //     用户诉求原话：「有些内容在记忆中可能不准确或者没计入」——这就是那个形态。
+    //   【修法】懒置基线**不再是无条件**：先问"这本账有没有**证据**表明它已被消费"。
+    //     允许懒置（保持原语义）的条件 —— 满足**任一**：
+    //       ① 盘上有单元文件（`readArchiveUnitForSkip(s.id).ok === true`）⇒ 确实提取过；
+    //       ② 水位表里有该 id 的**任一形态**条目（下面 `wm` 已为假，故此处查"确无内容"的**旁证**：
+    //          `archiveWmEmpty`/`archiveWmSkipped` 是**计数**不是逐 id 记录 ⇒ 不适用；改用最可靠的盘面事实）。
+    //     否则 ⇒ **不懒置**，直接 `return true`（判"待归档"）⇒ 它会进候选、被真提取、落库。
+    //   【为什么不是"一律 return true"】那会让**真正无内容**的历史会话每轮重选（僵尸候选每轮白轮、
+    //     并把真新会话压进退避）—— 正是本批 T5/修正十一反复处理的老问题。
+    //     `readArchiveUnitForSkip` 正是"该会话有没有可复用内容"的**既有单一判据** ⇒ 复用它，不自造第二条。
+    //   【代价与边界，如实】①每会话多一次单元读盘（仅"在已归档集但无水位"这一小群，非热路径）；
+    //     ②"确无内容"且**从未提取过**的会话会被真提取一次：提取器对无正文日志返回 `empty`，
+    //       落盘段随即写 `empty:true` 水位并消号 ⇒ **一次性收敛**，不会长期烧轮；
+    //     ③它**不**改变"有水位"会话的任何行为（下面那条 `cur > wm.frames` 原样）。
+    let hasUnit = false;
+    try { hasUnit = readArchiveUnitForSkip(s.id).ok === true; } catch (e) { hasUnit = false; }
+    if (!hasUnit) {
+      // 不盖"已消费"章 ⇒ 交回候选判定（`shouldReArchive` 的 mention 闸仍会照常拦已落库会话）。
+      try { monitorEvent("archive", "no-baseline pending（已归档但无水位且盘上无单元 ⇒ 不再懒置基线，转真提取）: " + unitSid(s.id)); } catch (e) {}
+      return true;
+    }
     ARCHIVE_WATERMARK.set(s.id, { frames: cur, round: 1, at: Date.now() });
     ARCHIVE_WM_DIRTY = true;
     return false;
@@ -3048,7 +5201,7 @@ function loadInjectSnapshot() {
         // v2.4.8：增量条目 used 缺失即存量旧格式 → 惰性判定 used（resolveInjectUsedOnce 首次消费时按日志补算）
         // v2.4.24（审查 P0-1）：补 p 字段——record 端 v2.4.17 起落 {p:hP} 但 load 端丢弃 → snap.p 恒 undefined →
         // 命中项目会话每次恢复进 notice 误报「项目 X 有更新」；旧条目 p 缺失=undefined → 首次恢复 mP=true 发一次通知即升级
-        INJECT_SNAPSHOT.set(k, { g: v.g, i: v.i, s: v.s, t: v.t || 0, used: v.used === undefined ? undefined : v.used, p: typeof v.p === "string" ? v.p : undefined });
+        INJECT_SNAPSHOT.set(k, { g: v.g, i: v.i, s: v.s, t: v.t || 0, used: v.used === undefined ? undefined : v.used, p: typeof v.p === "string" ? v.p : undefined });   // v2.7.0（拆 fixed）：原还带 f=耐久层 hash（读端白名单同型 bug 史见 L3314）；层已拆故字段删除
       } else if (typeof v.h === "string") {
         INJECT_SNAPSHOT.set(k, { g: "__legacy__", i: v.i || "", s: v.s || "", t: v.t || 0, used: v.used === undefined ? undefined : v.used });   // 更早版本只记整体哈希 → 三档无法判定，按「画像已变」处理一次并升级账本为新格式
       }
@@ -3076,7 +5229,7 @@ function injectSnapshotGet(sessionId) { return INJECT_SNAPSHOT.get(sessionId) ||
 function recordInjectSnapshot(sessionId, entry) {
   const prev = INJECT_SNAPSHOT.get(sessionId);
   // v2.4.8：used 保底——新会话（无 prev）首次记账 used=false（尚无真实回合）；有 prev 则保留其 used（不因恢复/重注翻转为 false）
-  INJECT_SNAPSHOT.set(sessionId, { g: entry.g, i: entry.i, s: entry.s, t: Date.now(), used: prev && typeof prev.used === "boolean" ? prev.used : (prev ? (prev.used === undefined ? undefined : prev.used) : false), p: entry.p !== undefined ? entry.p : "" });   // v2.4.24（审查 P0-1）：p 字段透传
+  INJECT_SNAPSHOT.set(sessionId, { g: entry.g, i: entry.i, s: entry.s, t: Date.now(), used: prev && typeof prev.used === "boolean" ? prev.used : (prev ? (prev.used === undefined ? undefined : prev.used) : false), p: entry.p !== undefined ? entry.p : "", f: entry.f !== undefined ? entry.f : (prev && typeof prev.f === "string" ? prev.f : "") });   // v2.4.24（审查 P0-1）：p 字段透传；v2.6.8：f 字段同规（未传则保留 prev）
   scheduleInjectStateSave();
 }
 // v2.4.8：用量日志判定 used——该会话是否出现过真实用户回合（turn/start 或 user/message 且 source.kind=user）。
@@ -3091,15 +5244,28 @@ function resolveInjectUsedOnce(sessionId) {
       try { sdirs = fs.readdirSync(path.join(SESSIONS_ROOT, ws.name), { withFileTypes: true }); } catch (e) { continue; }
       for (const s of sdirs) {
         if (!s.isDirectory() || s.name !== sessionId) continue;
-        const z = path.join(SESSIONS_ROOT, ws.name, s.name, "session.jsonl.zstd");
-        if (!fs.existsSync(z)) return true;   // 找不到日志 → 视为已用（保守方向安全）
-        const txt = decompressSessionLog(z);
-        if (txt === null) return true;
-        // 真实用户回合判定：日志含 turn/start，或含 user/message 且 source.kind=user（排除插件/系统 source）
-        const used =
-          txt.includes('"type":"turn/start"') ||
-          /"type":"user\/message"[\s\S]{0,400}"source":\{"kind":"user"/.test(txt);
-        return used;
+        // v2.8.4（P21）：**任一文件命中即 true**。旧实现只看优先级最高的一个文件 ⇒ 双名会话里
+        //   若 v3 只有插件注入的回合、真实用户回合在 legacy，会被判为「未使用」而错误地纳入漏网。
+        const zs = resolveSessionLogPaths(path.join(SESSIONS_ROOT, ws.name, s.name));
+        if (!zs.length) return true;   // 找不到日志 → 视为已用（保守方向安全）
+        let anyReadable = false;
+        for (const zp of zs) {
+          const txt = decompressSessionLog(zp);
+          if (txt === null) continue;                      // 该文件读不到 ⇒ 看下一个（而不是立刻保守 true）
+          anyReadable = true;
+          // 真实用户回合判定：日志含 turn/start，或含 user/message 且 source.kind=user（排除插件/系统 source）
+          if (txt.includes('"type":"turn/start"')) return true;
+          // [2026-09-23 V4] 旧正则尾部 "user"/ 在 V3 时代即从未命中（实为死代码，全靠 turn/start）；
+          //   且 user/message 的 content 可长达数万字符排在 source 前，400 窗口必漏。日志一行一事件 ⇒ 同行判真。
+          {
+            const tls = txt.split("\n");
+            for (const ln of tls) {
+              if ((ln.includes('"type":"user/message"') || ln.includes('"type": "user/message"'))
+                && (ln.includes('"kind":"user"') || ln.includes('"kind": "user"'))) return true;
+            }
+          }
+        }
+        return anyReadable ? false : true;   // 全部读不到 → 仍走保守方向（视为已用）
       }
     }
     return true;   // 全局找不到该会话目录 → 视为已用（保守方向安全）
@@ -3110,7 +5276,28 @@ function resolveInjectUsedOnce(sessionId) {
 //  - staleSessionDays: 漏网会话检测阈值（天），默认 5
 //  - staleAction:      漏网处理动作（v1.12.18 起同时决定 /dream 是否带归档）：remind=仅提醒，/dream 不含归档 | silent=后台自动归档，/dream 先归档再整合 | approval=确认后才归档，/dream 不含归档
 // v1.7.1：默认 staleAction=remind（仅提醒，不自动 spawn 子代理——实测漏网归档子代理单会话可烧数百万 token）
-const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true, monitorEnabled: true, spiralRemind: true, initGuideEnabled: true, updateCheckEnabled: true, regressionEnabled: true, maintTriggerChars: 1100, spiralBreak: true, brkLevel: 3, brkHardAbort: false, brkSameN: 3, brkMaxDeny: 3, brkMinSteps: 4 };
+const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabled: false, integrateDays: 7, active: true, monitorEnabled: true, spiralRemind: true, initGuideEnabled: true, updateCheckEnabled: true, regressionEnabled: true, maintTriggerChars: 1100, spiralBreak: true, brkLevel: 3, brkHardAbort: false, brkSameN: 3, brkMaxDeny: 3, brkMinSteps: 4,
+  // v3.2.0（2026-10-02 Wave 1）：折叠「一次逻辑调用被观测两次」——ptc 嵌套调用与其外壳 run_code 各产生一次观测
+  //   （2026-10-02 红队实证：同一次 pwsh 失败被双计 neg、两侧 resKey 略异又虚增 uniq ⇒ 被 batchLike 误判成"批量进展"）。
+  //   默认开；置 false 即回退旧口径（诊断对照用，不暴露到设置页以免动 client 半区）。
+  spiralFoldPtc: true,
+  // v3.2.0（2026-10-02 Wave 2 候选 C，用户拍板「直接上候选 C」）：batchLike（批量样态）命中**不再硬静默**，
+  //   改为「降级投递 + 冷却加倍」。动因：实测该判据把 67% 的 D 命中段整段判成"不需要提醒"
+  //   （09-29~10-01 连续 7 次命中全静默）；2026-10-02 18:49:48 真实埋点显示该类窗口 uniq=5/len=5/okN=3，
+  //   候选 A 也救不了。置 false = 回退旧口径（硬静默，只记 reason="batch"）。
+  batchSoftDeliver: true };
+
+// v2.6.5（2026-09-16 用户拍板）：手动 /dream 的漏网口径不吃 settings.staleSessionDays。
+//   用户实证诉求：阈值设 1 天，但会话实际 12 小时就结束了 → 手动触发时就该收走它。
+//   手动改固定「活跃下限」30 分钟——只挡仍在写入的活跃会话（含发起会话本身），否则会把
+//   进行中的半截内容当成完整会话归档。其余条件（启用界限/未落档/账本水位）不变；
+//   自动定时整合与 stale_archive 工具仍按 settings。数值调整只需改这一个常量。
+const MANUAL_STALE_MIN_IDLE_MS = 30 * 60000;
+
+// v2.6.6（用户拍板「dream 的等待时间也可以适当放长一点」）：手动 /dream 归档阶段等待上限 25 → 45 分钟。
+//   理由：并发闸生效后（在跑 ≤5、其余排队）队列清空更慢——31 会话/7 批约 2 轮、59 会话约 3 轮，
+//   旧 25 分钟容易把「等归档结算」判成 timeout 而提前整合。两处等待（等已有归档 / 等自己发起的归档）共用本值。
+const DREAM_ARCHIVE_WAIT_MS = 45 * 60000;
 // v1.11.0：active = 记忆活跃开关（独立于 DSH 进程启停）——
 // 用户显式关掉=记忆整合暂停（enabledAt 置空）；打开=重新启用（enabledAt 刷新为当前时间）。
 // DSH 重启/退出不再影响 enabledAt——「插件启停」与「DSH 进程启停」彻底解耦。
@@ -3125,35 +5312,62 @@ const INTEGRATE_STATE_FILE = MEMORY_ROOT + "/.integrate.json";
 const CRASH_LOG_FILE = MEMORY_ROOT + "/.crash.log";
 let PLUGIN_CFG = { ...DEFAULT_CFG };
 
+// ═══════════ [2026-09-23] 用户配置层（插件自持久化）═══════════
+// 背景：dsh 0.1.7 的 config-editor 写回校验走 composeEntries(55 层)，本地插件条目
+//   （profile 顶层 insert 注册）写入恒被拒（"overridden by a home patch"，已实测取证：
+//   docAfter 已改成 12 而 composed 仍为 {}）。故本插件改用**自持久化**：
+//   设置页 → POST /dsh-memory/config → 写本文件 → 热更新 PLUGIN_CFG + 回读校验。
+// 优先级（高→低）：.config.json(本层) > cordis.patch.yml 的 config(loader 层) > DEFAULT_CFG
+//   启动时打印实际来源，消除"两个真源"的歧义。
+const USER_CFG_FILE = portable(path.join(MEMORY_ROOT, ".config.json"));
+function readUserCfg() {
+  try {
+    if (!fs.existsSync(USER_CFG_FILE)) return {};
+    const j = JSON.parse(fs.readFileSync(USER_CFG_FILE, "utf8"));
+    return (j && typeof j === "object" && !Array.isArray(j)) ? j : {};
+  } catch (e) { return {}; }
+}
+function writeUserCfg(obj) {
+  const tmp = USER_CFG_FILE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
+  fs.renameSync(tmp, USER_CFG_FILE);          // 原子替换，防半截文件
+  const back = readUserCfg();                  // 回读校验（防 OneDrive 占位/静默截断）
+  return JSON.stringify(back) === JSON.stringify(obj);
+}
+// 合并三层：默认 → loader config → 用户文件（用户文件最后覆盖）
+function mergeCfgLayers(loaderCfg) {
+  return { ...DEFAULT_CFG, ...(unwrapVolatile(loaderCfg) || {}), ...readUserCfg() };
+}
+
 // v1.4.0：settings 命名空间 schema（设置 UI 渲染 + 校验；用户文档覆盖 base）
 // schemastery 语法：无 .int()/z.enum —— 整数用 number().min().max()，枚举用 union([const...])
 const SETTINGS_SCHEMA = z.object({
-  staleSessionDays: z.number().min(1).max(90).default(DEFAULT_CFG.staleSessionDays),
-  staleAction: z.union([z.const("remind"), z.const("silent"), z.const("approval")]).default(DEFAULT_CFG.staleAction),
+  staleSessionDays: z.number().min(1).max(90).default(DEFAULT_CFG.staleSessionDays).volatile(),
+  staleAction: z.union([z.const("remind"), z.const("silent"), z.const("approval")]).default(DEFAULT_CFG.staleAction).volatile(),
   // v1.5.0：定期自动整合（对标 mimocode AutoDream）
-  integrateEnabled: z.boolean().default(false),          // 开关：每 integrateDays 天自动整合记忆（默认关闭，避免自动耗 token）
-  integrateDays: z.number().min(1).max(90).default(7),   // 整合间隔（天）
+  integrateEnabled: z.boolean().default(false).volatile(),          // 开关：每 integrateDays 天自动整合记忆（默认关闭，避免自动耗 token）
+  integrateDays: z.number().min(1).max(90).default(7).volatile(),   // 整合间隔（天）
   // v1.11.0：记忆活跃开关（独立于 DSH 进程启停）——用户显式控制；DSH 重启不改变它
-  active: z.boolean().default(true),
+  active: z.boolean().default(true).volatile(),
   // v1.12.0：使用监控开关（默认开）——记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总
-  monitorEnabled: z.boolean().default(true),
+  monitorEnabled: z.boolean().default(true).volatile(),
   // v2.0.2：LLM循环试错提醒（D类）——打转探针双条件命中时注入提醒；关闭则回退纯影子记录
-  spiralRemind: z.boolean().default(DEFAULT_CFG.spiralRemind),
+  spiralRemind: z.boolean().default(DEFAULT_CFG.spiralRemind).volatile(),
   // v0.5：回归闭环开关（默认开）——B/C 触发后自动捕捉错误上下文落 pending-lessons + 被动监测闭环；关闭则完全回现状
-  regressionEnabled: z.boolean().default(DEFAULT_CFG.regressionEnabled),
+  regressionEnabled: z.boolean().default(DEFAULT_CFG.regressionEnabled).volatile(),
   // v2.3.0：新装用户初始化引导开关（关＝不再自动提，/memory-init 仍可用）
-  initGuideEnabled: z.boolean().default(DEFAULT_CFG.initGuideEnabled),
+  initGuideEnabled: z.boolean().default(DEFAULT_CFG.initGuideEnabled).volatile(),
   // v2.3.0：升级检查开关（每天最多一次远端 version.txt 比对；离线/内网失败静默）
-  updateCheckEnabled: z.boolean().default(DEFAULT_CFG.updateCheckEnabled),
+  updateCheckEnabled: z.boolean().default(DEFAULT_CFG.updateCheckEnabled).volatile(),
   // v2.6.0：LLM 打转熔断（D 级分级执法）——spiralBreak=D2 拒调总开关；brkLevel=D3 停轮深度（2=D1+D2 / 3=+D3）；brkHardAbort=D4 硬中断独立开关（默认关，最激进）；brkSameN/brkMaxDeny/brkMinSteps=判定阈值（True effectiveSpiralThresh 侧进覆盖层，此处进 schema 供设置 UI）
-  spiralBreak: z.boolean().default(DEFAULT_CFG.spiralBreak),
-  brkLevel: z.number().min(1).max(3).default(DEFAULT_CFG.brkLevel),
-  brkHardAbort: z.boolean().default(DEFAULT_CFG.brkHardAbort),
-  brkSameN: z.number().min(2).max(6).default(DEFAULT_CFG.brkSameN),
-  brkMaxDeny: z.number().min(1).max(6).default(DEFAULT_CFG.brkMaxDeny),
-  brkMinSteps: z.number().min(1).max(5).default(DEFAULT_CFG.brkMinSteps),
+  spiralBreak: z.boolean().default(DEFAULT_CFG.spiralBreak).volatile(),
+  brkLevel: z.number().min(1).max(3).default(DEFAULT_CFG.brkLevel).volatile(),
+  brkHardAbort: z.boolean().default(DEFAULT_CFG.brkHardAbort).volatile(),
+  brkSameN: z.number().min(2).max(6).default(DEFAULT_CFG.brkSameN).volatile(),
+  brkMaxDeny: z.number().min(1).max(6).default(DEFAULT_CFG.brkMaxDeny).volatile(),
+  brkMinSteps: z.number().min(1).max(5).default(DEFAULT_CFG.brkMinSteps).volatile(),
   // v0.5（step5-1 档）：合并维护触发阈值（真实要点面字符数；[600,1500]，默认 1100 目标水位≈预算×73%）
-  maintTriggerChars: z.number().min(600).max(1500).default(DEFAULT_CFG.maintTriggerChars),
+  maintTriggerChars: z.number().min(600).max(1500).default(DEFAULT_CFG.maintTriggerChars).volatile(),
   // 只读：监控汇总（客户端展示），宿主写入
   monitorSummary: z.string().required(false),
   // v2.3.0 只读：版本与初始化状态一行（客户端展示），宿主写入
@@ -3163,11 +5377,46 @@ const SETTINGS_SCHEMA = z.object({
   staleCount: z.number().min(0).required(false)
 });
 // v1.4.0：宿主侧 settings scope（register 返回），用于写只读统计 staleCount
+// [2026-09-23 dsh 0.1.7 适配] 旧 settings.register/get/watch/update 全套 API 已删除，HOST_SETTINGS_SCOPE 恒为 null（保留变量防旧引用 ReferenceError）。
+//   新模型：本文件导出 Config（用户字段 volatile，免 remount 热更新）；只读统计改走 LIVE_STATS，随 /dsh-memory/stats.json 下发。
 let HOST_SETTINGS_SCOPE = null;
+let LIVE_STATS = { staleCount: 0, monitorSummary: "", onboardSummary: "" };
+// loader 原子语义：本模块的 Config 即 fiber.runtime.Config；volatile-only 变更提交进运行引用 + 触发 loader/volatile-update（监听见 apply）。
+export const Config = SETTINGS_SCHEMA;
+
+// v2.8.4（T2·**生效配置可见**）：启动横幅那行读的是 `config`（cordis base 默认层），**不是**生效值 ——
+//   实测（2026-09-18 20:43:55 重启）：横幅打 `staleSessionDays=5 staleAction=remind integrate=关`，
+//   而 `~/.dsh/settings.yaml` 的 `dsh-memory:` 段写的是 `2 / silent / true`；行为侧硬证据：20:44:13 的自动归档 tick
+//   在账本留下 `archiveAutoLast.why = "未发起：…"` —— 该键**唯一写入者**是 `archiveAutoNote`（调用点全在 `runStaleSilentTick`），
+//   且「未发起：」这个前缀只在 **silent 闸之后**那一行生成 ⇒ **生效值 = silent**（若 not-silent，why 会是「非 silent 档或无 zstd」）。
+//   ★ 论证链更正（根因席复核 2026-09-18）：原写"必先过 `staleAction !== "silent"` 检查"是**顺序说反**——15 分闸在
+//     `runStaleArchive` 内、silent 闸在其调用方里，而 `runStaleArchive` 有 ≥4 个调用方 ⇒ 非 silent 档也能撞上 15 分闸；
+//     唯一点：**why 的写入点**。即横幅把"自动归档 + 自动消号 = 开着"报成了"只提醒"（方向最危险的那种错）。
+//   本函数在 settings 层真身就位处再报一行，并明写"以本行为准"。
+function cfgEffectiveLine() {
+  return "[dsh-memory] 生效配置（settings 层；★此行才是真值，上方「就绪」行是默认层）：staleSessionDays=" + PLUGIN_CFG.staleSessionDays
+    + " staleAction=" + PLUGIN_CFG.staleAction + (ZSTD_OK ? "" : "(降级remind:无zstd)")
+    + " active=" + PLUGIN_CFG.active
+    + " integrateEnabled=" + (PLUGIN_CFG.integrateEnabled ? "true(" + PLUGIN_CFG.integrateDays + "天/次)" : "false")
+    + " monitorEnabled=" + PLUGIN_CFG.monitorEnabled;
+}
 
 // 归一化配置：settings 值或 cordis config → 合法 PLUGIN_CFG
+// [2026-09-23] 新模型下 volatile 字段在 fiber.config 里是引用（须 .get() 解包，对标 cosmokit createVolatile / settings plainConfig）
+function unwrapVolatile(v) {
+  if (Array.isArray(v)) return v.map(unwrapVolatile);
+  if (v !== null && typeof v === "object") {
+    const proto = Object.getPrototypeOf(v);
+    if (proto !== Object.prototype && proto !== null) return v;   // Map/Set/Date 等实例原样（volatile 引用恒为普通对象）
+    if (typeof v.get === "function") { try { return unwrapVolatile(v.get()); } catch (e) { return undefined; } }
+    const out = {};
+    for (const [k, val] of Object.entries(v)) out[k] = unwrapVolatile(val);
+    return out;
+  }
+  return v;
+}
 function normalizeCfg(raw) {
-  const cfg = { ...DEFAULT_CFG, ...(raw || {}) };
+  const cfg = { ...DEFAULT_CFG, ...(unwrapVolatile(raw) || {}) };
   if (cfg.staleAction !== "remind" && cfg.staleAction !== "silent" && cfg.staleAction !== "approval") {
     cwarn("[dsh-memory] staleAction 非法值 " + cfg.staleAction + "，回退 remind");
     cfg.staleAction = "remind";
@@ -3606,20 +5855,21 @@ function renderStatsPage() {
 '  if (docs.length) {\n' +
 '    for (var di = 0; di < docs.length; di++) {\n' +
 '      var sec = docs[di];\n' +
-'      var injLayer = sec.layer === "稳定层" || sec.layer === "会话层（今日）";   // 注入层=global/index + 今日摘要；其余按需\n' +
+'      var injLayer = sec.layer === "稳定层" || sec.layer === "会话层（今日）";   // v2.7.0（拆 fixed）：原白名单第三项「耐久层」已删\n' +
 '      h += \'<div class="docsec"><div class="dsl">\' + esc(sec.layer) + (injLayer ? "" : " <span class=\'tag\'>按需</span>") + "</div>";\n' +
+'      if (sec.note) h += \'<div class="muted" style="font-size:12px;line-height:1.6;margin:-2px 0 6px">\' + esc(sec.note) + "</div>";   // v2.5.6：会话层总量提示（防误判日文件丢失）\n' +
 '      for (var di2 = 0; di2 < sec.docs.length; di2++) {\n' +
 '        var dc = sec.docs[di2];\n' +
-'        var over = injLayer && (dc.overSoft || dc.overHard) ? " <span class=\'tag warn\'>" + (dc.overHard ? "硬超" : "软超") + "</span>" : "";\n' +
+'        var over = injLayer && (dc.overSoft || dc.overHard || dc.nearHard) ? " <span class=\'tag warn\'>" + (dc.overHard ? "硬超" : (dc.nearHard ? "近限" : "软超")) + "</span>" : "";\n' +
 '        var staleTag = dc.stale ? " <span class=\'tag stale\'>过期复核</span>" : "";\n' +
 '        var bigTag = !injLayer && dc.bytes > 65536 ? " <span class=\'tag\'>大文件</span>" : "";\n' +
 '        var capTag = (dc.rel || "").indexOf("projects/") === 0 ? (dc.chars > 9000 ? " <span class=\'tag\' style=\'color:#c0392b\'>超限</span>" : (dc.chars > 6000 ? " <span class=\'tag\' style=\'color:#b7950b\'>偏大</span>" : "")) : "";\n' +
 '        var wp = injLayer ? Math.min(100, Math.round(dc.chars * 100 / Math.max(1, dc.charLimit))) : 0;\n' +
-'        var rectCol = injLayer ? (dc.overHard ? "linear-gradient(90deg,#ff4d6d,#ff6e8a)" : (dc.overSoft ? "linear-gradient(90deg,#ff9d3d,#ffb45b)" : "linear-gradient(90deg,#12b886,#39d9b0)")) : "linear-gradient(90deg,#5ba7ff,#7db8ff)";\n' +
-'        h += \'<div class="drow"\' + tip(dc.rel + "\\n字符 " + num(dc.chars) + (injLayer ? " / 硬限 " + dc.charLimit + "\\n字节 " + num(dc.bytes) + "B / 软限 " + dc.byteWarn + "B" : "\\n字节 " + num(dc.bytes) + "B（按需读取层，无注入预算，大文件属正常）") + "\\n更新 " + fmtT(dc.mtime) + (dc.stale ? "\\n⚠ 文件头最后更新 >180 天" : "")) + \'><span class="dfn ell">\' + esc(dc.rel) + "</span>" + over + capTag + bigTag + staleTag + \'<span class="dmeta muted">\' + num(dc.chars) + "字 / " + num(dc.bytes) + "B</span>" + (injLayer ? \'<div class="dbar-track"><div class="dbar" style="width:\' + wp + "%;--ac:" + rectCol + \'"></div></div>\' : "") + \'<span class="dmuted">\' + rel(dc.mtime) + "</span></div>";\n' +
+'        var rectCol = injLayer ? (dc.overHard ? "linear-gradient(90deg,#ff4d6d,#ff6e8a)" : (dc.nearHard ? "linear-gradient(90deg,#ffc94d,#ffd97a)" : (dc.overSoft ? "linear-gradient(90deg,#ff9d3d,#ffb45b)" : "linear-gradient(90deg,#12b886,#39d9b0)"))) : "linear-gradient(90deg,#5ba7ff,#7db8ff)";\n' +
+'        h += \'<div class="drow"\' + tip(dc.rel + "\\n字符 " + num(dc.chars) + (injLayer ? " / 硬限 " + dc.charLimit + "（告警线 " + dc.warnChars + "）\\n字节 " + num(dc.bytes) + "B / 兜底线 " + dc.byteWarn + "B" : "\\n字节 " + num(dc.bytes) + "B（按需读取层，无注入预算，大文件属正常）") + "\\n更新 " + fmtT(dc.mtime) + (dc.stale ? "\\n⚠ 文件头最后更新 >180 天" : "")) + \'><span class="dfn ell">\' + esc(dc.rel) + "</span>" + over + capTag + bigTag + staleTag + \'<span class="dmeta muted">\' + num(dc.chars) + "字 / " + num(dc.bytes) + "B</span>" + (injLayer ? \'<div class="dbar-track"><div class="dbar" style="width:\' + wp + "%;--ac:" + rectCol + \'"></div></div>\' : "") + \'<span class="dmuted">\' + rel(dc.mtime) + "</span></div>";\n' +
 '      }\n' +
 '    }\n' +
-'    h += \'<div class="thr"><span class="thr-l muted">参考阈值</span><span class="thr-i">软(字节) global/index 4608B · 摘要 4096B</span><span class="thr-i">硬(字符) global 3000 · index 2000 · 摘要 1500</span><span class="thr-i">按需层（工具/项目/知识/历史会话）无注入预算，仅展示大小</span></div>\';\n' +
+'    h += \'<div class="thr"><span class="thr-l muted">参考阈值</span><span class="thr-i">告警线(字符×0.9) global 2700 · index 1800 · 摘要 1350</span><span class="thr-i">硬限(字符) global 3000 · index 2000 · 摘要 1500</span><span class="thr-i">兜底线(字节) global/index 4608B · 摘要 4096B</span><span class="thr-i">按需层（工具/项目/知识/历史会话）无注入预算，仅展示大小</span></div>\';\n' +
 '    h += "</div>";   // 记忆文档状态卡闭合\n' +
 '  } else {\n' +
 '    h += \'<div class="muted">暂无文档状态数据（服务端未附加字段）</div></div>\';\n' +
@@ -3667,14 +5917,21 @@ function renderStatsPage() {
 '</body>\n' +
 '</html>\n';
 }
+// [2026-09-23 关键修复] loader 的 unwrapExports() 语义是 `exports.default ?? exports`：
+//   本模块同时有 default 与具名导出时 **default 胜出** ⇒ 只挂具名的 Config 会被丢弃，
+//   导致 entry.fiber.runtime.Config === undefined → settings.describe 跳过本条目 →
+//   设置页整片不可寻址（字段只读、写入无处落地）。官方 volatile 插件（如 dsh-llm-pi-ai）
+//   之所以正常，是因为它们**没有 default export**。此处把 Config 一并挂到 default 上，两种形状都安全。
 export default {
+  Config: SETTINGS_SCHEMA,
   inject: ["fs", "timer", "commands", "skills"],
   apply(ctx, config) {
     // v2.3.4(dream-hash)：候选函数绑定模块级 hash 版本（纯函数，见 export default 前的 >>> INT_HASH BEGIN 区）
     const listIntegrateCandidates = hashListIntegrateCandidates;
     // v1.4.0：设置机制 —— cordis.patch.yml config 作 base 默认层，settings.yaml 用户文档覆盖。
     // 手动 register 拿到宿主 scope（写只读统计 staleCount）；无 settings 服务时回退 cordis config。
-    PLUGIN_CFG = normalizeCfg(config);
+    // [2026-09-23] 三层合并：DEFAULT_CFG → loader config → 用户文件（.config.json 优先）
+    PLUGIN_CFG = normalizeCfg(mergeCfgLayers(config));
     // v1.11.0：enabledAt 与 DSH 进程启停彻底解耦——
     // DSH 重启/退出不再影响 enabledAt（dispose 不再置 null）。
     // enabledAt 只由「记忆活跃开关 active」驱动：
@@ -3698,17 +5955,23 @@ export default {
     } catch (e) { /* 状态记录失败不影响功能 */ }
     // v1.10.0：启动时加载 sessions/*.md 缓存（漏网检测高性能）
     refreshMemorySessionsIndex();
+    // [2026-09-23 dsh 0.1.7 适配] 新 settings 模型：Config 已导出（volatile 字段免 remount 热更新），旧 register/get/watch 全套 API 已删除。
+    //   生效值直接读运行引用（volatile 字段须 unwrapVolatile 解包）；settings.yaml 用户文档仍经 loader 合并进 config。
+    PLUGIN_CFG = normalizeCfg(mergeCfgLayers(config));
     try {
-      ctx.inject(["settings"], (sctx) => {
+      const uk = Object.keys(readUserCfg());
+      clog("[dsh-memory] 配置来源：默认层 + loader config" + (uk.length ? " + 用户文件(" + uk.join(",") + ")" : "（无用户覆盖）"));
+    } catch (e) { /* 来源打印失败不影响功能 */ }
+    clog(cfgEffectiveLine());   // v2.8.4（T2）：配置真身（settings 层）就位处再报一次——见 cfgEffectiveLine 头注释
+    applyThresholdMigrations();   // v3.2.0（Wave 1）：一次性事故回调 rep→0.75（记账 threshMigr.rep075，只跑一次）
+    // volatile-only 变更：loader 已提交进运行引用 + 向本 fiber 触发 loader/volatile-update（不 remount）；effect 绑 fiber 生命周期
+    try {
+      ctx.effect(() => ctx.on("loader/volatile-update", () => {
         try {
-          HOST_SETTINGS_SCOPE = sctx.settings.register("dsh-memory", SETTINGS_SCHEMA, {
-            base: config || DEFAULT_CFG
-          });
-          PLUGIN_CFG = normalizeCfg(HOST_SETTINGS_SCOPE.get());
-          HOST_SETTINGS_SCOPE.watch(() => {
-            const next = HOST_SETTINGS_SCOPE.get();
-            const prev = { ...PLUGIN_CFG };
-            PLUGIN_CFG = normalizeCfg(next);
+          const live = (ctx && ctx.config) || config;
+          const next = normalizeCfg(mergeCfgLayers(live));   // [2026-09-23] 用户文件优先级最高
+          const prev = { ...PLUGIN_CFG };
+          PLUGIN_CFG = next;
             // v1.11.0：active 开关变化驱动 enabledAt（用户显式，独立于 DSH 启停）
             try {
               const st = readIntegrateState() || {};
@@ -3724,29 +5987,40 @@ export default {
                 writeIntegrateState(st);
               }
             } catch (e) { /* 开关切换失败不影响配置 */ }
-            // v1.12.6：仅业务配置真变化才打日志（宿主自身 update({monitorSummary}) 触发的 watch 不再刷屏）
-            if (prev.staleSessionDays !== PLUGIN_CFG.staleSessionDays || prev.staleAction !== PLUGIN_CFG.staleAction || prev.active !== PLUGIN_CFG.active) {
+            // v1.12.6：仅业务配置真变化才打日志（monitorSummary 改走 LIVE_STATS，不再进本回调刷屏）
+            if (prev.staleSessionDays !== PLUGIN_CFG.staleSessionDays || prev.staleAction !== PLUGIN_CFG.staleAction || prev.active !== PLUGIN_CFG.active
+              || prev.integrateEnabled !== PLUGIN_CFG.integrateEnabled || prev.integrateDays !== PLUGIN_CFG.integrateDays || prev.monitorEnabled !== PLUGIN_CFG.monitorEnabled) {
+              // v2.8.4（T2·评审整改 工程席②/红队 R-7）：生效行**运行期也要刷新** —— 否则用户在设置界面改了
+              //   `integrateEnabled`/`monitorEnabled` 之后，那一行仍停在启动快照却自称"★此行才是真值"。
+              clog(cfgEffectiveLine());
               clog("[dsh-memory] 设置已更新: staleSessionDays=" + PLUGIN_CFG.staleSessionDays + ", staleAction=" + PLUGIN_CFG.staleAction + ", active=" + PLUGIN_CFG.active);
             }
-          });
-          // v1.12.1：启动时主动推送一次监控汇总（读磁盘历史数据），否则重启后界面一直显示"暂无统计"
-          updateMonitorSummary();
-        } catch (e) {
-          cwarn("[dsh-memory] settings register 失败，回退 cordis config:", e && e.message ? e.message : String(e));
+          } catch (e2) { cwarn("[dsh-memory] 热配置刷新失败:", e2 && e2.message ? e2.message : String(e2)); }
         }
+      ));
+    } catch (e) { /* 无 loader/volatile-update 事件的极老宿主：改配置走 remount，apply 重跑即生效 */ }
+    // 自带设置页的插件隐藏自动生成页（官方 README 指定写法；settings 缺失如 CLI 则回调不执行）
+    try {
+      ctx.inject(["settings"], (sctx) => {
+        try { ctx.effect(() => sctx.settings.configure({ auto: false }, ctx.fiber)); }
+        catch (e2) { /* 忽略 */ }
       });
-    } catch (e) {
-      cwarn("[dsh-memory] settings 注入失败，回退 cordis config:", e && e.message ? e.message : String(e));
-    }
+    } catch (e) { /* 无 settings 服务不影响功能 */ }
+    // v1.12.1：启动时主动推送一次监控汇总（读磁盘历史数据），否则重启后界面一直显示"暂无统计"
+    updateMonitorSummary();
     // ═══════════ v2.4.2 统计面板：webServer 路由（设置页超链接 → 同源 /dsh-memory/stats）═══════════
     // 页面同源 fetch /dsh-memory/stats.json 拿最新监控数据，打开即最新、手动刷新按钮 re-fetch。
     // 官方扩展点先例：webhook-github（ctx.effect+register exact 路由）、gateway（ctx.inject 动态可选注入）。
     // 不声明顶层 inject 依赖 webServer——CLI/headless 无此服务，声明会让整个插件加载失败；回调式注入=有则挂、无则静默。
     // 三重降级：①服务缺失回调不执行 ②回调体内 try/catch（register 抛错不逃逸 cordis）③ctx.effect 绑 fiber 生命周期（dispose 注销路由，防重启/切换后 duplicate path）。
+    let PANEL_PORT = 0;   // [logpane 20260930] 插件 webServer 端口（/memory-panel 命令与 /dsh-memory/open 用；CLI/headless 无此服务时保持 0）
+    let PANEL_WSRV = null;   // v3.1.1：持服务句柄——命令 handler 触发时**实时**读 port，不再只信注册期快照
     try {
       ctx.inject(["webServer"], (wctx) => {
         try {
           const wsrv = wctx && wctx.webServer;
+          PANEL_WSRV = wsrv || null;
+          PANEL_PORT = (wsrv && Number(wsrv.port)) || 0;   // [logpane 20260930] 记下端口，供 /memory-panel 命令构造面板地址
           if (!wsrv || typeof wsrv.register !== "function") return;
           // JSON 数据端点：实时读 .monitor.json（每次请求都读最新）
           ctx.effect(() => wsrv.register({
@@ -3766,6 +6040,7 @@ export default {
                   }
                   base.documents = buildMemoryDocStatus();
                   base.pendingLessons = buildPendingLessonsSummary();
+                  base.live = { staleCount: LIVE_STATS.staleCount, monitorSummary: LIVE_STATS.monitorSummary, onboardSummary: LIVE_STATS.onboardSummary };   // [2026-09-23] 只读统计新通道（scope 通道退役）
                   res.end(JSON.stringify(base));
                 } catch (e) {
                   res.end(raw);   // 附加字段失败则原样返回（不阻塞面板主功能）
@@ -3792,6 +6067,47 @@ export default {
               } catch (e) { res.statusCode = 500; res.end("stats render error"); }
             }
           }), "dsh-memory: /dsh-memory/stats");
+          // ═══ [logpane 20260930] 实时日志端点：本次启动以来 clog/cwarn/cerr 的环形缓冲 ═══
+          //   GET /dsh-memory/logs.json?since=<ms>&level=warn|error&limit=N
+          //   增量语义：只回 t > since 的行（面板每 2 秒轮询，首屏 since=0 取全量）。
+          //   为什么要它：桌面端 dsh.exe 里没有宿主控制台，出问题只能翻文件或猜；此端点把「本次启动」的日志端到面板。
+          ctx.effect(() => wsrv.register({
+            kind: "exact", path: "/dsh-memory/logs.json",
+            handler: (req, res) => {
+              try {
+                res.setHeader("content-type", "application/json; charset=utf-8");
+                res.setHeader("cache-control", "no-store");
+                let since = 0, level = "", limit = 0;
+                try {
+                  const u = new URL(String((req && req.url) || ""), "http://127.0.0.1");
+                  since = Number(u.searchParams.get("since")) || 0;
+                  level = String(u.searchParams.get("level") || "");
+                  limit = Number(u.searchParams.get("limit")) || 0;
+                } catch (e0) { /* 无查询串=全量 */ }
+                let lines = LOG_RING.filter((l) => l.t > since && (!level || l.level === level));
+                if (limit > 0 && lines.length > limit) lines = lines.slice(lines.length - limit);
+                res.end(JSON.stringify({ ok: true, bootAt: LOG_BOOT_AT, now: Date.now(), pid: process.pid, total: LOG_RING.length, lines: lines }));
+              } catch (e) { res.statusCode = 500; res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); }
+            }
+          }), "dsh-memory: /dsh-memory/logs.json");
+          // ═══ [logpane 20260930] 在系统默认浏览器里打开统计面板 ═══
+          //   桌面端（dsh-app:// 源）里 `<a target="_blank">` 被 Electron 的 setWindowOpenHandler 拦掉 ⇒ 点不开面板；
+          //   改由宿主进程自己拉起浏览器（客户端同源 fetch 触发），应用窗口不受影响。
+          ctx.effect(() => wsrv.register({
+            kind: "exact", path: "/dsh-memory/open",
+            handler: (_req, res) => {
+              const url = "http://127.0.0.1:" + (wsrv.port || 0) + "/dsh-memory/stats";
+              let ok = false, err = "";
+              try {
+                execFile("cmd", ["/c", "start", "", url], { windowsHide: true }, (e) => { if (e) cwarn("[dsh-memory] 拉起浏览器失败:", e.message); });
+                ok = true;
+              } catch (e) { err = String((e && e.message) || e); cwarn("[dsh-memory] 拉起浏览器失败:", err); }
+              try {
+                res.setHeader("content-type", "application/json; charset=utf-8");
+                res.end(JSON.stringify({ ok: ok, url: url, error: err }));
+              } catch (e2) { /* 客户端已断开 */ }
+            }
+          }), "dsh-memory: /dsh-memory/open");
           // v2.5（P2）：pending-lessons 清空入口（POST body { sig?, sessionId? }——按键删除；缺省清全部）
           ctx.effect(() => wsrv.register({
             kind: "exact", path: "/dsh-memory/pending-clear",
@@ -3820,6 +6136,74 @@ export default {
               } catch (e) { res.statusCode = 500; res.end(JSON.stringify({ ok: false, error: "clear failed" })); }
             }
           }), "dsh-memory: /dsh-memory/pending-clear");
+          // ═══ [2026-09-23] 用户配置读写端点（设置页专用；绕开 config-editor 的 55 层写回校验）═══
+          //   GET  → 返回 { ok, cfg, source }（cfg=三层合并后的生效值）
+          //   POST → body 为字段补丁，白名单校验后落盘 .config.json，热更新 PLUGIN_CFG，回读确认
+          //   安全性：仅允许白名单字段；仅接受同源（Origin 校验，非浏览器来源即拒绝跨站写）
+          ctx.effect(() => wsrv.register({
+            kind: "exact", path: "/dsh-memory/config",
+            handler: (req, res) => {
+              res.setHeader("content-type", "application/json; charset=utf-8");
+              const reply = (code, obj) => { res.statusCode = code; res.end(JSON.stringify(obj)); };
+              const method = (req.method || "GET").toUpperCase();
+              if (method === "GET") {
+                const u = readUserCfg();
+                return reply(200, { ok: true, cfg: { ...PLUGIN_CFG }, panelUrl: "http://127.0.0.1:" + (wsrv.port || 0) + "/dsh-memory/stats", userKeys: Object.keys(u), file: USER_CFG_FILE });
+              }
+              if (method !== "POST") return reply(405, { ok: false, error: "method not allowed" });
+              // 同源校验：带 Origin 头时必须与本机同源（无 Origin 的非浏览器调用放行，仅本机监听）
+              const org = req.headers && (req.headers.origin || req.headers.Origin);
+              try {
+                if (org && !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(String(org))) return reply(403, { ok: false, error: "cross-origin denied" });
+              } catch (e) { return reply(403, { ok: false, error: "bad origin" }); }
+              let body = "";
+              const finish = () => {
+                let patch;
+                try { patch = JSON.parse(body || "{}"); } catch (e) { return reply(400, { ok: false, error: "invalid json" }); }
+                if (!patch || typeof patch !== "object" || Array.isArray(patch)) return reply(400, { ok: false, error: "patch must be an object" });
+                // 白名单：仅可写字段（只读统计与内部态一律拒绝）
+                const WRITABLE = new Set(["staleSessionDays", "staleAction", "integrateEnabled", "integrateDays", "active",
+                  "monitorEnabled", "spiralRemind", "regressionEnabled", "initGuideEnabled", "updateCheckEnabled",
+                  "spiralBreak", "brkLevel", "brkHardAbort", "brkSameN", "brkMaxDeny", "brkMinSteps", "maintTriggerChars"]);
+                const clean = {};
+                for (const [k, v] of Object.entries(patch)) {
+                  if (!WRITABLE.has(k)) return reply(400, { ok: false, error: "field not writable: " + k });
+                  clean[k] = v;
+                }
+                if (!Object.keys(clean).length) return reply(400, { ok: false, error: "empty patch" });
+                // 与 DEFAULT_CFG 合并后用 normalizeCfg 强校验（非法值会被归一化回默认，不会落盘垃圾）
+                const merged = { ...readUserCfg(), ...clean };
+                const checked = normalizeCfg({ ...DEFAULT_CFG, ...merged });
+                // 只把校验后的白名单字段写回（避免把 DEFAULT_CFG 全量灌进用户文件）
+                const persist = {};
+                for (const k of Object.keys(merged)) if (WRITABLE.has(k)) persist[k] = checked[k];
+                // 若用户改回默认值，则从用户文件移除该键（保持"用户文件只存显式覆盖"语义）
+                for (const k of Object.keys(persist)) if (persist[k] === DEFAULT_CFG[k]) delete persist[k];
+                try {
+                  if (!writeUserCfg(persist)) return reply(500, { ok: false, error: "readback mismatch (未落盘)" });
+                } catch (e) { return reply(500, { ok: false, error: "write failed: " + (e && e.message ? e.message : String(e)) }); }
+                // 热更新生效值 + 复核
+                const prev = { ...PLUGIN_CFG };
+                PLUGIN_CFG = normalizeCfg(mergeCfgLayers(config));
+                try {
+                  const st = readIntegrateState() || {};
+                  const prevActive = (typeof prev.active === "boolean") ? prev.active : DEFAULT_CFG.active;
+                  if (prevActive !== PLUGIN_CFG.active) {
+                    if (PLUGIN_CFG.active === false) st.enabledAt = null;
+                    else st.enabledAt = Date.now();
+                    writeIntegrateState(st);
+                  }
+                } catch (e) { /* 开关联动失败不影响配置持久化 */ }
+                clog("[dsh-memory] 用户配置已更新（来源 " + USER_CFG_FILE + "）：" + JSON.stringify(persist));
+                return reply(200, { ok: true, cfg: { ...PLUGIN_CFG }, saved: persist });
+              };
+              try {
+                req.on("data", (c) => { body += c; if (body.length > 65536) { req.destroy(); } });
+                req.on("end", finish);
+                req.on("error", () => reply(400, { ok: false, error: "request error" }));
+              } catch (e) { return reply(400, { ok: false, error: "cannot read body" }); }
+            }
+          }), "dsh-memory: /dsh-memory/config");
           clog("[dsh-memory] 统计面板已挂载：http://127.0.0.1:" + (wsrv.port || "?") + "/dsh-memory/stats");
         } catch (e) { cwarn("[dsh-memory] 统计面板路由注册失败（降级，其余功能不受影响）：", e && e.message ? e.message : String(e)); }
       });
@@ -3831,6 +6215,22 @@ export default {
     const archivedCompactionIds = new Set();
     // v9：sessionId → agent（compaction 事件时按会话查 agent 注入提醒）
     const agentsBySession = new Map();
+    // [2026-09-23 dsh 0.1.7 适配] **parent 必填守卫**：宿主 spawn 驱动 startInProcessRun 无条件走
+    //   resolveChildDepth(request.parent) → delegationDepthOf(agent) → 读 agent.options.subagentDepth；
+    //   request.parent 缺省即抛 TypeError: Cannot read properties of undefined (reading 'options')
+    //   （已运行时复现：直接调宿主驱动得同一句；真机留痕 15:37:20 压缩子代理失败(intent-dc075f59)）。
+    //   旧宿主容忍缺 parent，故历史写法 "if (parent) opts.parent = parent" 兜底；0.1.7 起必须显式给。
+    //   择父顺序：调用方 preferred → 同会话 live agent → 最近顶层 agent → 任一 live agent；全无则如实跳过，绝不裸调。
+    function pickSpawnParent(preferred, sessionId) {
+      const live = (a) => !!(a && typeof a === "object" && a.options && a.session);
+      try { if (live(preferred)) return preferred; } catch (eP) {}
+      try {
+        if (sessionId) { const a = agentsBySession.get(sessionId); if (live(a)) return a; }
+        if (live(LAST_TOP_AGENT)) return LAST_TOP_AGENT;
+        for (const a of agentsBySession.values()) { if (live(a)) return a; }
+      } catch (eS) {}
+      return null;
+    }
     // v10.3：同实例维护提醒去重——一个 DSH 实例内只注入一次（第一个顶层会话），
     // 避免多个主会话并发收到整理指令、并发 edit 同一文件
     let maintenanceInjected = false;
@@ -3871,7 +6271,7 @@ export default {
     }
 
     // v2.3.2(archive-tool)：结构化检查点交付（子代理通过 memory_archive_checkpoint 工具提交）——A5 完整性 + 条目级幂等 + 落盘
-    function applyArchiveBlocks(blocks) {
+    function applyArchiveBlocks(blocks, batchIds) {
       if (!LAST_ARCHIVE_FLOW) return { ok: false, mode: "no-batch", wrote: 0, errors: ["归档批次未初始化（插件侧问题）"] };
       if (!Array.isArray(blocks) || blocks.length === 0) return { ok: false, mode: "bad-schema", wrote: 0, errors: ["blocks 必须是数组且非空"] };
       const ids = LAST_ARCHIVE_FLOW.sessionIds;
@@ -3888,14 +6288,61 @@ export default {
         const aw = assertMemoryWrite(b.file, "", { dateWindow: true, pathOpts: { scopes: ["sessions", "projects"], rootFiles: [] } });
         if (!aw.ok) { for (const ae of aw.errors) errors.push(tag + ".file " + ae); continue; }
         const rel = aw.rel;
-        if (b.skip === true) { norm.push({ rel: rel, sid: b.sessionId.trim(), skip: true, reason: String(b.reason || "无价值跳过") }); continue; }
+        if (b.skip === true) {
+          // ═══ §9.12②：**防静默丢弃闸**（改名见方案 §9.12.2）—— 跳过必须**可归因**，不是"必须被拒" ═══
+          // 动机：`skip=true` 意味着这个会话的内容**不进记忆库**；此前唯一的约束是"给个理由"，而理由是**自由文本**，
+          //   机器无法判真假（实测 09-18 那轮 5 个会话共约 5.4 万字符被声明跳过）。用户最怕的正是"内容没计入"。
+          // ★ 机器判据（经两轮评审收敛，**只有这一条**）：
+          //   **理由必须实质存在**（≥8 字，去空白）—— 空话/空白不算。
+          // ★ 明确**不再**参与控制流的（两轮评审各否掉一次，记下来防回退）：
+          //   ① 上一版 `!unitInfo.ok && !noUnitDeclared ⇒ 拒`：把 8 字闸变成**魔法词闸**（理由没写中那四个短语就恒被拒，
+          //      而"确实无内容"的会话又无 points 可写 ⇒ P0 死循环按措辞复现）；
+          //   ② 更早的"无单元 ⇒ 无条件拒"：直接死循环。
+          //   ⇒ 现在：**无单元一律放行**（`!unitInfo.ok` 已是完整机器谓词），但必须**留痕**：
+          //      `cwarn` + `monitorEvent` + 见证 `{unitWhy, unitChars, indexed}` + 无单元计数 `noUnitSkip`（进读者行）。
+          const sid0 = b.sessionId.trim();
+          const reason0 = String(b.reason || "").replace(/[\r\n]+/g, " ").trim();
+          if (reason0.length < 8) {
+            errors.push(tag + ".skip 需要给出**实质理由**（≥8 字；当前「" + reason0.slice(0, 20) + "」）—— 空话不算，机器无法据此复核");
+            continue;
+          }
+          const unitInfo = readArchiveUnitForSkip(sid0);
+          // ★★ 评审整改（根因席 P0 ① + rev3 复核）：**不再用理由里的措辞当控制流判据**。
+          //   上一版是 `if (!unitInfo.ok && !noUnitDeclared) 拒`：它把"8 字闸"升级成了**魔法词闸** ——
+          //   子代理只要没写中那四个短语（反例：「该会话抽取产物为空，无正文可依」）就恒被拒，而它对"确实无内容"
+          //   的会话又**无 points 可写** ⇒ P0 那条**死循环按措辞复现**（收敛只靠报错文案教它写魔法词）。
+          //   根因席裁定：`!unitInfo.ok` **本身就是完整的机器谓词** ⇒ **无单元一律放行**；拒的门只剩"理由 <8 字"。
+          //   ⇒ ② 的机器不变量随之改写为：**每一次 skip 都必须可归因**（不是"必须被拒"）——
+          //      见证必带三元组 `{unitWhy, unitChars, indexed}`；无单元者计入 `noUnitSkip`；并在读者行可见。
+          const wasExtracted = (LAST_ARCHIVE_FLOW.sessionIds || []).indexOf(unitSid(sid0)) >= 0;
+          // ★ 根因席补的分流：**本轮抽取过、盘上却没有文件** = `writeUnitCache` 写失败 / LRU 淘汰（**系统故障**，
+          //   不是"没有内容"）⇒ 不能与"抽取未产出"混在一个计数里（否则 `noUnitSkip` 上涨无法归因）。
+          //   ★★ 2026-09-20 **注释更正（B5 取证）**：下面那句"自动重试未实现"**已过时** ——
+          //     它写于 §9.11.4-10 之前。实测（`_b5-retry-check.mjs`）："已归档 ∧ 无单元 ∧ 非空"共 31 个，
+          //     其中 **22 个 `shouldReArchive=true`** ⇒ 会被自动重试。
+          //     §9.11.4-10 的"无单元 ⇒ 不盖章、判待归档"**事实上已把自动重试带上**。
+          //     剩下 9 个 `shouldReArchive=false` 的**不是漏档**：它们在 `sessions/*.md` 里**已有完整块**，
+          //     被"首次档提及闸"正确挡住（防重复归档）⇒ 该闸**无缺陷**。
+          const unitLost = (!unitInfo.ok) && wasExtracted;
+          if (!unitInfo.ok) {
+            cwarn("[dsh-memory] 无单元跳过" + (unitLost ? "（★ 系统故障：本轮曾抽取但盘上无文件）" : "（抽取未产出）")
+              + "：" + sid0 + " —— why=" + String(unitInfo.why || "") + " ｜ 理由：" + reason0.slice(0, 40));
+            try { monitorEvent("archive", "no-unit-skip " + sid0 + " why=" + String(unitInfo.why || "").slice(0, 48) + (unitLost ? " lost=1" : "")); } catch (e0) {}
+          }
+          const ix = unitIndexedInSearchCache(sid0);
+          norm.push({ rel: rel, sid: sid0, skip: true, reason: reason0, unitChars: unitInfo.chars || 0, indexed: ix, unitFile: unitInfo.file || null, noUnitSkip: !unitInfo.ok, unitWhy: unitInfo.ok ? null : String(unitInfo.why || ""), unitLost: unitLost, unitViaPrefix: unitInfo.viaPrefix === true, unitTruncated: unitInfo.truncated === true, unitSampled: unitInfo.sampled === true });
+          continue;
+        }
         if (!Array.isArray(b.points)) { errors.push(tag + " 非 skip 时必须提供 points 数组（3-6 条要点）"); continue; }
         // v2.4.28（D3）：points 条数机器校验 3-6 条下限（先滤空串再计数；原只拦空数组，1 条也放行）
         const _ptsF = b.points.map((p) => String(p)).filter((p) => p.trim());
         if (_ptsF.length < 3 || _ptsF.length > 6) { errors.push(tag + " 归档要点须 3-6 条（当前 " + _ptsF.length + " 条）——过少=信息不足、过多=需精简合并"); continue; }
-        norm.push({ rel: rel, sid: b.sessionId.trim(), title: String(b.title || ""), points: _ptsF });
+        norm.push({ rel: rel, sid: b.sessionId.trim(), title: String(b.title || ""), points: _ptsF, literals: sanitizeLiterals(b.literals) });
       }
-      const missing = ids.filter((id) => !declared.has(id));
+      // ★ 2026-09-25（A5 跨批口径修复）：`ids` 是**整轮全量**，而子代理只拿到**本批**清单 ⇒ 按本批校验，
+      //   否则会逼出"为别的批的 id 提交假 skip"。`batchIds` 缺失（拿不到子代理身份）时退回全量口径。
+      const a5Scope = (batchIds && batchIds.size > 0) ? Array.from(batchIds) : ids;
+      const missing = a5Scope.filter((id) => !declared.has(id));
       if (missing.length) errors.push("未声明处置的会话（每个要么 skip=true 要么提交归档块）: " + missing.join(", "));
       // v2.4.12（P1）：points/title 结构校验——points 拼进 `- `+p 与 `### sid（title）` 块头，换行/结构行
       // 会破坏归档块结构（评审 P1-④）；违规整批拒写、错误清单回给归档子代理修正
@@ -3908,15 +6355,33 @@ export default {
         }
       }
       if (errors.length) return { ok: false, mode: "bad-schema", wrote: 0, errors: errors };
+      // ═══ §9.12③：**精确字面量入独立通道**（`literals.md`：非注入层、幂等、memory_search 可检索）═══
+      //   放在"整批校验通过"之后 —— 被拒的批次**不写任何文件**（含字面量），与既有"整批拒写"语义一致。
+      let litRes = { ok: true, wrote: 0, existed: 0 };
+      try {
+        const litEntries = [];
+        for (const it of norm) {
+          if (it.skip) continue;
+          for (const L of (it.literals || [])) litEntries.push({ literal: L, sid: it.sid, date: todayStr2 });
+        }
+        if (litEntries.length) {
+          litRes = writeLiteralsIdempotent(MEMORY_ROOT, litEntries);
+          if (litRes.wrote > 0) clog("[dsh-memory] 字面量通道：写入 " + litRes.wrote + " 条（去重跳过 " + litRes.existed + " 条）→ knowledge/字面量.md");
+          if (!litRes.ok) cwarn("[dsh-memory] 字面量写入失败（不影响归档落盘）：" + litRes.why);
+        }
+      } catch (eL) { cwarn("[dsh-memory] 字面量通道异常（不影响归档落盘）：", eL && eL.message ? eL.message : String(eL)); }
       const applied = []; const skipped = [];
+      // v2.8.4（P18）：见证的 `chars` 口径 = **要点正文**（`- `+p 逐行拼接）字符数。
+      //   与"被丢内容量"同量纲 ⇒ written/dropped 可直接相加比较；不用 block.length（含块头/轮次标注噪声 ~60 字）。
+      const _wChars = (pts) => (pts || []).map((p) => "- " + p).join("\n").length;
       for (const it of norm) {
-        if (it.skip) { skipped.push(it.sid + "(跳过:" + it.reason + ")"); continue; }
+        if (it.skip) { skipped.push(it.sid + "(跳过:" + it.reason + ")"); LAST_ARCHIVE_WITNESS.set(it.sid, { mode: "declared-skip", points: 0, chars: 0, reason: String(it.reason || "无价值跳过").slice(0, 60), unitChars: Number(it.unitChars) || 0, unitFile: it.unitFile || null, indexed: it.indexed === true, noUnitSkip: it.noUnitSkip === true, unitWhy: it.unitWhy ? String(it.unitWhy).slice(0, 80) : null, unitLost: it.unitLost === true, unitViaPrefix: it.unitViaPrefix === true, unitTruncated: it.unitTruncated === true }); continue; }
         const fullPath = portable(MEMORY_ROOT + "/" + it.rel);
         let existing = ""; try { existing = fs.readFileSync(fullPath, "utf8"); } catch (e) { existing = ""; }
         // v2.4.3：轮次落盘——首轮沿用 v2.0.8 幂等；≥2 轮头「### sid ·补N」，幂等只拦同轮 ghost 重发，不拦下一轮
         const roundN = (LAST_ARCHIVE_FLOW.rounds && LAST_ARCHIVE_FLOW.rounds[it.sid]) || 1;
-        if (roundN === 1) { if (existing.includes("### " + it.sid)) { skipped.push(it.sid + "(已在库)"); continue; } }
-        else if (existing.includes("### " + it.sid + " ·补" + roundN + "（") || existing.includes("### " + it.sid + " ·补" + roundN + "\n")) { skipped.push(it.sid + "(本轮已记)"); continue; }
+        if (roundN === 1) { if (existing.includes("### " + it.sid)) { skipped.push(it.sid + "(已在库)"); LAST_ARCHIVE_WITNESS.set(it.sid, { mode: "dropped", points: it.points.length, chars: _wChars(it.points), reason: "已在库" }); continue; } }
+        else if (existing.includes("### " + it.sid + " ·补" + roundN + "（") || existing.includes("### " + it.sid + " ·补" + roundN + "\n")) { skipped.push(it.sid + "(本轮已记)"); LAST_ARCHIVE_WITNESS.set(it.sid, { mode: "dropped", points: it.points.length, chars: _wChars(it.points), reason: "本轮已记" }); continue; }
         const header = "### " + it.sid + (roundN > 1 ? " ·补" + roundN : "") + (it.title ? "（" + it.title + "）" : "");
         const block = "## 漏网会话补档（" + todayStr2 + " 归档）\n" + header + "\n" + it.points.map((p) => "- " + p).join("\n") + "\n";
         const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
@@ -3925,9 +6390,11 @@ export default {
           const newText = existing.replace(/\s+$/, "") + (existing ? "\n\n" : "") + block.trim() + "\n";
           writeFileAtomic(fullPath, newText, { tag: "archive", verify: true });   // v0.5（step2 内容闸 + N7 补回读）
           applied.push(it.sid + "→" + it.rel);
+          LAST_ARCHIVE_WITNESS.set(it.sid, { mode: "written", points: it.points.length, chars: _wChars(it.points), reason: "" });
         } catch (e) {
           cwarn("[dsh-memory] 归档块写盘失败（跳过）: " + it.sid + " - " + (e && e.message ? e.message : String(e)));
           skipped.push(it.sid + "(写盘异常)");
+          LAST_ARCHIVE_WITNESS.set(it.sid, { mode: "dropped", points: it.points.length, chars: _wChars(it.points), reason: "写盘异常" });
         }
       }
       LAST_ARCHIVE_A5_OK = missing.length === 0;
@@ -3951,7 +6418,8 @@ export default {
     }
 
     // v2.3.2(dream-tool)：核心校验+落盘（输入已结构化的 patches 数组）——memory_dream_patch 工具与 applyDreamJson 共用
-    const applyPatches = (patches) => {
+    // v2.6.4：opts.allowDangling=true 显式放行「指向未落盘目标」的引用（仅用于复述/描述既有指针，非正常写入路径）
+    const applyPatches = (patches, opts) => {
       if (!Array.isArray(patches)) return { ok: false, mode: "bad-schema", wrote: 0, errors: ["patches 必须是数组"] };
       if (patches.length === 0) return { ok: true, mode: "empty", wrote: 0 };
       const errors = []; const seen = new Set(); const valid = [];
@@ -4063,6 +6531,11 @@ export default {
             // v2.5.0（§4）：replace 收缩熔断（双门槛：比例<0.6 且 绝对差≥300，相对原盘现文度量，预校验读原始 p.full_rewrite）
             //   检查时机：折叠后对每个 "replace" patch 依次判（对自身 content 相对该 rel 原盘文）——先 edit 缩水再 replace 的绕过在此拆解：
             //   熔断基准=原盘 prevText，任何净收缩必须落在某条 replace 的 content 上、相对原盘必被拦（三审 Q3 确认不可绕过）。
+            // ═══ v2.7.0（拆 fixed）：耐久层写保护已随 fixed.md 层一并删除 ═══
+            //   原为 v2.6.8（P5.1-11/12/20）的「delete 一律拒 + 净删 ≥200 拒」＋ v2.6.9（P1）的 full_rewrite 显式声明通道。
+            //   拆除依据：①该层独特价值就是这套保护，而它自身有洞（任意 patch 带 full_rewrite 即整组解锁）；
+            //   ②实测下沉留指针不丢（global 2 / index 1 / projects 60 / tools 6 处引用，目标均在位）；
+            //   ③最硬一类（编号）召回 100%（295/295）⇒ "防丢"收益不成立。详见 docs/评估-会话原文检索三档.md §5。
             const SHRINK_FLOOR = 0.6, SHRINK_ABS = 300;
             for (const v2 of grp.patches) {
               if (v2.action !== "replace") continue;
@@ -4084,11 +6557,46 @@ export default {
                 }
               } else if (F > b.chars) {
                 const secTab = charSectionBreakdown(sim.text, { maxRows: 8 }).map((s) => s.title + " " + s.chars + " 字符").join("、");
-                errors.push("patches " + rel + " 写入后仍 " + F + " 字符，超预算 " + b.chars + "（当前超 " + (F - b.chars) + "）——按差数做整节下沉：按任务书 EXTRACTION 提取要求的选择标准挑低价值节（有 ## 归档 族则优先），整节提取到 knowledge/MEMORY-" + (rel === "index.md" ? "index" : "global") + "-<topic>.md，主文件删该节 + 尾部插 '- See knowledge/<文件>（N 项）— 一句话摘要'，一次成型提交；禁止逐条微调压缩字面量；delete 未命中会显示在 skipped 而非 errors；分节字符: " + secTab);
+                // v2.7.0（拆 fixed）：原按 rel 分「固定要点已满（禁下沉）」与「整节下沉」两支；fixed 层已拆，
+                //   分支与其内层命名表（`rel === "fixed.md" ? "fixed" : …`）一并删除——不再需要 MEMORY-fixed-* 命名。
+                const oversizeHint = "按差数做整节下沉：按任务书 EXTRACTION 提取要求的选择标准挑低价值节（有 ## 归档 族则优先），整节提取到 knowledge/MEMORY-" + (rel === "index.md" ? "index" : "global") + "-<topic>.md，主文件删该节 + 尾部插 '- See knowledge/<文件>（N 项）— 一句话摘要'，一次成型提交；禁止逐条微调压缩字面量；delete 未命中会显示在 skipped 而非 errors；分节字符: " + secTab;
+                errors.push("patches " + rel + " 写入后仍 " + F + " 字符，超预算 " + b.chars + "（当前超 " + (F - b.chars) + "）——" + oversizeHint);
               }
             }
           }
         } catch (eB) { cwarn("[dsh-memory] D1b 预算校验异常（跳过预算闸，落盘继续）: " + (eB && eB.message ? eB.message : String(eB))); }
+      }
+      // v2.6.4（L1）：同批指针闭合校验——本批**新增**的记忆库内指针，其目标必须「也在本批 rel 集合里」或「磁盘已存在」，
+      //   否则整批拒写（复用上方 errors/拒写机制，零新机制）。治本 2026-09-15 悬空指针事故：
+      //   旧行为下「调用#1 只提交指针行续期 + 调用#2 提交目标内容」若 #2 被拒/被打断/未发生 → 主文件留悬空指针而工具报成功；
+      //   批内原子（errors 非空整批不写）只覆盖单次调用，跨调用无事务 → 必须在写时把「指针与目标」的闭合要求表达出来。
+      // 判据面（只查新增、不查终文全部）：
+      //   addTxt = 本批引入的文本（edit=new_string，replace/append=content，delete=空——删除不会引入指针）；
+      //   preTxt = 该 rel 磁盘现文（现文里已有的历史悬空指针不追责，否则会永久卡死该文件的所有后续写入）；
+      //   新增指针若命中描述性豁免行（如「…未落盘」）或指向已轮转 archive 的 sessions 文件 → 放行。
+      if (errors.length === 0 && !(opts && opts.allowDangling === true)) {
+        try {
+          const batchRels = new Set(valid.map((v) => v.rel));
+          const newly = new Map();   // 悬空目标 rel -> 首个引入它的批内 rel
+          for (const v of valid) {
+            const addTxt = v.action === "delete" ? "" : (v.action === "edit" ? v.new_string : v.content);
+            if (!addTxt) continue;
+            let preTxt = "";
+            try { preTxt = fs.readFileSync(portable(MEMORY_ROOT + "/" + v.rel), "utf8"); } catch (eR) { preTxt = ""; }
+            const pre = new Set(memPointerHits(preTxt).map((h) => h.rel));
+            for (const h of memPointerHits(addTxt)) {
+              if (h.desc) continue;                        // 描述性提及（「…未落盘」等诚实标注）不视为指针
+              if (pre.has(h.rel)) continue;                // 现文里已有 → 非本批新增（历史存量不追责）
+              if (batchRels.has(h.rel)) continue;          // 同批创建/改写 → 闭合
+              if (memPointerTargetExists(h.rel)) continue; // 磁盘已存在 → 闭合
+              if (memPointerArchived(h.rel)) continue;     // sessions 已轮转进 archive → 内容未丢
+              if (!newly.has(h.rel)) newly.set(h.rel, v.rel);
+            }
+          }
+          for (const [rel, srcRel] of newly) {
+            errors.push("patches 指针指向未落盘文件 " + rel + "（" + srcRel + "）：请把该文件内容与指针放进**同一次** memory_dream_patch 调用（任务书 5. 同批原子），或把指针改指已存在文件（已轮转会话用 sessions/archive/…）；确系复述/描述既有指针、非指针意图，可在同批带 allowDangling:true 显式放行");
+          }
+        } catch (eL1) { cwarn("[dsh-memory] L1 指针闭合校验异常（跳过该闸）: " + (eL1 && eL1.message ? eL1.message : eL1)); }
       }
       if (errors.length) return { ok: false, mode: "bad-schema", wrote: 0, errors: errors };
       const applied = []; const skipped = [];
@@ -4208,6 +6716,12 @@ export default {
     // v2.6.1（V0.2 P0-2）：无落盘窗口内「所有非落盘工具活动」上限——防换壳空转（read/grep/glob/memory_search 循环等效
     // 09-07 的 244 次 preview 空转，活动也计预算）；preview 另由 PREVIEW_GATE 每会话 8 次/10min 闸独立兜底。
     const GUARD_ACTIVITY_BUDGET = 24;
+    // ★★ B5：活动预算的**第二级**（与 guardHardFire 的"首触提醒 → 3 分钟宽限 → 真杀"同构）。
+    //   24 次是"防换壳空转"的**计数**判据，而归档子代理的合法工作就是读 N 个单元；
+    //   现场（2026-10-07 21:17:34）它是**慢速真读**（3.5 次/分、且已落盘 2 个块）却被判空转 ⇒
+    //   首触只提醒、不杀；再攒满同样多**且期间一次落盘都没有**才进宽限。
+    //   置 0 = 逐字恢复旧行为（一键回滚旋钮）。
+    const GUARD_ACTIVITY_HARD_EXTRA = GUARD_ACTIVITY_BUDGET;
     // v2.4.31：slim 精简轮独立短超时——任务仅「精简上一版」（输入是上一版输出，工作量≈主轮一半），
     // hard 15→8 分 / soft 10→4 分；配合无进展即停，单轮 slim 烧 token 上限腰斩（实证 09-07 16:51 打转 15 分才 abort）
     const MAINT_SLIM_TIMING = { softMs: 4 * 60e3, hardMs: 8 * 60e3 };
@@ -4228,7 +6742,7 @@ export default {
     function guardRegister(spSid, kind, ctrl, hardMs, softMs) {
       try {
         if (!spSid || !ctrl) return null;
-        const g = { sid: spSid, ctrl: ctrl, hardMs: hardMs || SUBAGENT_HARD_MS, softMs: softMs || SUBAGENT_SOFT_MS, hardT: null, softT: null, graceT: null, aborted: false, kind: kind, graced: false, actN: 0 };
+        const g = { sid: spSid, ctrl: ctrl, hardMs: hardMs || SUBAGENT_HARD_MS, softMs: softMs || SUBAGENT_SOFT_MS, hardT: null, softT: null, graceT: null, aborted: false, kind: kind, graced: false, actN: 0, actBudget: null, budgetTold: false };
         const arm = () => {
           try { if (g.hardT) clearTimeout(g.hardT); if (g.softT) clearTimeout(g.softT); } catch (eC) {}
           g.softT = setTimeout(() => {
@@ -4289,7 +6803,7 @@ export default {
         const g = SUBAGENT_GUARDS.get(spSid);
         if (!g || g.aborted || typeof g.arm !== "function") return !!g;
         if (write) {
-          g.graced = false; g.actN = 0;
+          g.graced = false; g.actN = 0; g.budgetTold = false;   // ★ B5：落盘即清"已提醒"标记（下一窗可再提醒一次）
           try { if (g.graceT) clearTimeout(g.graceT); } catch (eC) {}
           g.graceT = null;
           g.arm();
@@ -4309,18 +6823,57 @@ export default {
         if (g.graced) return;   // 宽限期内活动不续期不计数（只有落盘能解除，见 guardRenew）
         g.actN = (g.actN || 0) + 1;
         guardRenew(spSid, false);
-        if (g.actN >= GUARD_ACTIVITY_BUDGET) {
-          guardGrace(spSid, "budget");
-          try { enqueueRegressionReminder(spSid, "PL:guard-budget", "<system-reminder>\n【dsh-memory 提示·无落盘活动超限】无落盘窗口内工具活动 " + g.actN + " 次（上限 " + GUARD_ACTIVITY_BUDGET + "）——纯读/预览循环等同空转。3 分钟内无 memory_dream_patch 成功落盘将硬停；立即提交最小 patch 或终止。\n</system-reminder>"); } catch (eQ) {}
+        // ★★ B5：两段式——首触只提醒（**不杀**），再攒满一个预算窗才进宽限（落盘随时清零 actN ⇒ 真在干活的不被杀）
+        const _v = guardBudgetVerdict(g.actN, g.actBudget || GUARD_ACTIVITY_BUDGET, GUARD_ACTIVITY_HARD_EXTRA);
+        if (_v !== "none" && !g.budgetTold) {
+          g.budgetTold = true;
+          try { enqueueRegressionReminder(spSid, "PL:guard-budget", "<system-reminder>\n【dsh-memory 提示·无落盘活动超限】无落盘窗口内工具活动 " + g.actN + " 次（上限 " + GUARD_ACTIVITY_BUDGET + "）已到，**这不是硬停**：继续读/写都行，但请尽快提交任何可落盘的最小 patch 续期；再攒满 " + GUARD_ACTIVITY_HARD_EXTRA + " 次且期间零落盘才会进 3 分钟宽限。\n</system-reminder>"); } catch (eQ) {}
         }
+        if (_v === "grace") guardGrace(spSid, "budget");
       } catch (e) {}
     }
     function guardClear(spSid) {
       try { const g = SUBAGENT_GUARDS.get(spSid); if (g) { try { if (g.hardT) clearTimeout(g.hardT); if (g.softT) clearTimeout(g.softT); if (g.graceT) clearTimeout(g.graceT); } catch (eC) {} SUBAGENT_GUARDS.delete(spSid); } } catch (e) {}
       try { clearRegressionQueue(spSid); } catch (eQ) {}   // v2.6.1（V0.2 P2）：清提醒队列（原 clearRegressionQueue 死代码未调用；abort/失败轮入队提醒滞留死 sid）
     }
+    // ═══════════ v3.2.1（宿主 0.2.x 子代理 API 适配）════════════════════════════════════════════
+    // 实证（2026-10-18）：桌面端 10-17 17:20:50 升到 dsh 0.2.1-rc.2 后，@deepseek-ai/dsh-subagent 的
+    //   服务方法表变成 startActivation / waitForChildren / sendMessage / interrupt / drainDescendants /
+    //   drainChildren / listChildren / listDescendants / prompt / interruptByParent / registerProvider /
+    //   getProvider / list / prepareContinuable / expectProvider / requireManager / observeActivation，
+    //   **`start()` 已被移除**；旧宿主 0.1.7-rc.2 仍是 `start(name, request)`。
+    //   于是旧判据 `typeof subagents.start !== "function"` 成了假阴性：服务本来在（agent-team 的
+    //   static inject 含 subagents ⇒ 属主 root，ctx.get 拿得到），却被判「不可用」静默跳过 —— 意图检查点 /
+    //   合并维护 / 漏网归档 / /dream 整合 四条链路在升级后全停（对账：.integrate.json lastSuccessAt=
+    //   10-17 15:55:28、archiveLastFailAt=10-17 23:12:45，夹着 app.asar 安装时间 10-17 17:20:50）。
+    // 修法：双协议守卫 + 就地适配层。旧宿主照旧走 start()；新宿主走
+    //   startActivation({ provider, label, request, signal, delivery:'caller' })，
+    //   再映射回调用方本来就假设的 { id, result, dispose } 三件套（三处 spawn 点语义不分叉）。
+    //   delivery:'caller' = 结果只回调用方、不往父会话塞完成通知（0.2.x README：「caller delivery lets
+    //   workflows await the result without a parent notice」）。
+    function subagentsHasStart(s) {
+      return !!s && (typeof s.start === "function" || typeof s.startActivation === "function");
+    }
+    async function startSubagentCompat(s, opts) {
+      if (typeof s.start === "function") return s.start("spawn", opts);   // 0.1.x 原路，一字不改
+      const req = Object.assign({}, opts || {});
+      const label = req.label; delete req.label;
+      const signal = req.signal; delete req.signal;   // signal 归 spec 层，不进 request（免语义重复）
+      const h = await s.startActivation({
+        provider: "spawn",
+        ...(label === undefined ? {} : { label: label }),
+        request: req,
+        ...(signal === undefined ? {} : { signal: signal }),
+        delivery: "caller"
+      });
+      return {
+        id: (h && h.childId) || "",
+        result: h && h.result,
+        dispose: (h && typeof h.dispose === "function") ? (() => h.dispose()) : undefined
+      };
+    }
     // v2.4.31：compactOnce 支持 per-call 超时覆盖（timingOverride={softMs,hardMs}，仅 slim 轮用更短预算；缺省=全局常量）
-    async function compactOnce(subagents, parent, promptText, tag, timingOverride) {
+    async function compactOnce(subagents, parent, promptText, tag, timingOverride, sessionId) {
       let _ctrl = null, _softT = null, _hardT = null;
       const _clearT = () => { try { if (_softT) clearTimeout(_softT); if (_hardT) clearTimeout(_hardT); } catch (eC) {} };
       try {
@@ -4331,7 +6884,14 @@ export default {
           signal: _ctrl.signal,
           toolFilter: { allow: ["memory_search"] }
         };
-        if (parent) opts.parent = parent;
+        const _spawnParent = pickSpawnParent(parent, sessionId);
+        if (!_spawnParent) {
+          // 0.1.7 parent 必填：无 live agent 时宁可不发起，也不能裸调（旧写法在此抛 options TypeError，白烧一轮）
+          clog("[dsh-memory] 压缩子代理(" + tag + ")：无可用父 agent，跳过（dsh 0.1.7 起 subagents.start 的 parent 必填）");
+          try { monitorEvent(String(tag || "").startsWith("intent") ? "intent" : "maint", "no-parent " + tag); } catch (eMP) {}
+          return null;
+        }
+        opts.parent = _spawnParent;
         const _softMs = (timingOverride && timingOverride.softMs) || SUBAGENT_SOFT_MS;   // v2.4.31：per-call 超时覆盖
         const _hardMs = (timingOverride && timingOverride.hardMs) || SUBAGENT_HARD_MS;
         _softT = setTimeout(() => {
@@ -4347,7 +6907,7 @@ export default {
           } catch (eH) {}
           try { _ctrl.abort(); } catch (eA) {}
         }, _hardMs);
-        const run = await subagents.start("spawn", opts);
+        const run = await startSubagentCompat(subagents, opts);   // v3.2.1：兼容 0.1.x/0.2.x
         markPluginSubagent(run.id);   // v2.4.27：登记插件子代理 sid（A/B/C/D 提醒隔离全关，只计 monitor）
         const result = await run.result;
         _clearT();
@@ -4449,7 +7009,7 @@ export default {
       "纪律（分节预算，严格）：本次目标≤120字；下一步行动≤200字；关键结论≤4条、每条≤140字。输出长度由插件机器测量并现场裁剪/重试（v2.4.28），无需自行数数字符。\n" +
       "超限处置：从「关键结论」尾部删整条——宁缺毋断，字面量禁止截半句，前两节永不删。不确定就写「未明确」，不编造。\n" +
       "结构纪律（v2.4.12）：正文禁止输出任何 `<!--` 注释行/HTML 注释（含 `<!-- compaction:`、`<!-- intent:` 字样）；如需示例代码请用成对 ``` 围栏包住且必须闭合。\n" +
-      "补全通道：摘要通常已全文直喂（≤20000 字原样入上下文）；仅超长时出现「本节截断/本节中省略」标记——见标记且需精确字面量时，先 memory_search 查当日要点区（sessions/日期.md 头部）；原始摘要逐字在会话日志 compaction/summary 事件（~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd）可查。再定稿。\n\n===== 宿主压缩摘要 =====\n";
+      "补全通道：摘要通常已全文直喂（≤20000 字原样入上下文）；仅超长时出现「本节截断/本节中省略」标记——见标记且需精确字面量时，先 memory_search 查当日要点区（sessions/日期.md 头部）；原始摘要逐字在会话日志 compaction/summary 事件（~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd 或新版 session.v3.jsonl.zstd）可查。再定稿。\n\n===== 宿主压缩摘要 =====\n";
     let INTENT_RUNNING = false;
     // v2.4.3：当日 md 合并维护阈值——口径=stripCompactionDumps + 剥 intent 块后 ≥1500 触发（B 方案，用户 08-30 拍板）。
     // 1500 与注入端硬预算 CHAR_LIMIT.summary 同源：真实要点面装满注入窗口才压缩；阈值即节流不变（无时间冷却），
@@ -4830,7 +7390,7 @@ export default {
       let beforeChars = 0;
       try {
         const subagents = ctx.get("subagents");
-        if (!subagents || typeof subagents.start !== "function") {
+        if (!subagentsHasStart(subagents)) {   // v3.2.1：双协议判据（0.1.x start / 0.2.x startActivation）
           clog("[dsh-memory] 合并维护：subagents 不可用，跳过（下次触发再试）");
           maintRetryRecordFail(fname, "no-subagents");   // v2.4.5：登记退避，避免每条消息都撞一次空通道
           recordMaintSample({ fname, beforeChars, afterChars: null, result: "no-subagents" });   // v0.5（P0-2）
@@ -4848,7 +7408,7 @@ export default {
         if (existingStripped.trim().length < 60) return false;     // 无要点可合并（空或仅剩 dump）
         const prompt = MAINT_MERGE_INSTRUCTION + existingStripped +
           (summaryText ? "\n\n（另：本次压缩事件宿主摘要，可参考补充最新进展）\n" + smartTrim(summaryText, 20000, "sessions/" + fname + "（memory_search 可查）") : "");
-        let sum = await compactOnce(subagents, parentAgent, prompt, "maint-" + fname.replace(/\..+$/, ""));
+        let sum = await compactOnce(subagents, parentAgent, prompt, "maint-" + fname.replace(/\..+$/, ""), null, sid8);
         if (sum) sum = extractBodyFromMarker(sum);   // v2.5.2（F1′）：剥前言——省得 head-test 假失败把整轮成果作废
         let malformed = false;
         let failReason = "malformed";
@@ -4896,6 +7456,7 @@ export default {
         // 「逼模型表态」（LLM 数不清字符，实证 09-07 16:51 maint-slim 打转 15 分 abort）；终点=直接注入不变。
         const MAINT_LIMIT_ALLOW = 1500;   // v2.4.31：1320→1500（用户拍板）
         let slimStats = null;   // v2.5.2（P2）：slim 轮统计捕获（calls/lens/reason），供 recordMaintSample 记录供 SLIM_FEASIBLE_MAX 校准
+        let overBudgetInject = false;   // ★ B4：本轮是否"超预算直接注入"（唯一判据：L7412 置位、L7482 读）
         if (merged.length > MAINT_LIMIT_ALLOW) {
           let cur = merged;
           let attempt = 0;
@@ -4919,7 +7480,7 @@ export default {
             try {
               slim = await compactOnce(subagents, parentAgent,
                 "上一版维护合并输出 " + prev.length + " 字符（插件实测），超出允许带 " + MAINT_LIMIT_ALLOW + "。请**目测删减约三分之一篇幅**（平均约每 3 行删 1 行：删次要旧要点、合并重复表述、压缩客套），**绝对禁止手工数数字符**——输出长度由插件机器测量并自动判定处理，你无需对齐任何数字，不要自测、不要反复重写、一次成型输出即可；保留全部精确字面量（路径/ID/命令/数字/报错串逐字）、保持三节结构与「关键结论」逐条分行（每条一句话）。只输出三节，不要任何额外说明（包括核对说明、开场白）。工具面：仅 run_code（内部可调 memory_search）。上一版原文如下：\n\n" + prev,
-                "maint-slim-" + fname.replace(/\..+$/, ""), MAINT_SLIM_TIMING);   // v2.4.31：slim 轮短超时（hard 8 分）
+                "maint-slim-" + fname.replace(/\..+$/, ""), MAINT_SLIM_TIMING, sid8);   // v2.4.31：slim 轮短超时（hard 8 分）
             } catch (e) {
               if (e && e.__maintFail === "aborted") { slimAborted = true; } else { throw e; }
             }
@@ -4955,6 +7516,7 @@ export default {
           merged = cur;
           slimStats = { calls: attempt, lens: slimLenLog.slice(), reason: stuckReason };   // v2.5.2（P2）
           if (merged.length > MAINT_LIMIT_ALLOW) {   // 重试耗尽/无进展/abort 后仍超 → 直接注入（用户口径，不裁剪）
+            overBudgetInject = true;   // ★ B4：置位（L7482 据此不再宣称"已收敛"）
             clog("[dsh-memory] 合并维护：重试 " + attempt + " 轮" + (stuck ? "（" + (stuckReason === "abort" ? "slim 硬停判死" : stuckReason === "infeasible" ? "深超限跳过" : "无进展判死") + "）" : "") + "后仍 " + merged.length + " 字符（>允许带 " + MAINT_LIMIT_ALLOW + "），按用户口径直接注入");
             try { monitorEvent("maint", "over-budget-inject " + merged.length + "字符" + (stuck ? " stuck=" + stuckReason : "") + " " + fname); } catch (eM) {}
           }
@@ -5024,10 +7586,10 @@ export default {
           cwarn("[dsh-memory] 合并维护：写回回读不一致 sessions/" + fname + "，内容可能未持久化");
           monitorEvent("maint", "readback-mismatch " + fname);
         }
-        clog("[dsh-memory] 合并维护完成 sessions/" + fname + "（" + merged.length + " 字符要点，注入面已收敛）");
+        clog("[dsh-memory] 合并维护完成 sessions/" + fname + "（" + merged.length + " 字符要点，" + (overBudgetInject ? "⚠️ 超预算直接注入（允许带 " + MAINT_LIMIT_ALLOW + "）—— 注入面**未收敛**，已按用户口径保留全文" : "注入面已收敛") + "）");
         maintRetryClear();   // v2.4.5：成功落盘清零重试状态
         maintRecordSuccessBase(fname, finalText);   // v2.4.31-2（审核 P1-1）：记录合并后注入面基准（防乒乓增长闸；含 over-budget-inject 直接注入）
-        recordMaintSample(Object.assign({ fname, beforeChars, afterChars: merged.length, result: "ok" }, slimStats ? { slimCalls: slimStats.calls, slimLens: slimStats.lens, stuckReason: slimStats.reason } : {}));   // v0.5（P0-2）；v2.5.2（P2）：slim 统计随样入账
+        recordMaintSample(Object.assign({ fname, beforeChars, afterChars: merged.length, result: "ok", overBudget: overBudgetInject }, slimStats ? { slimCalls: slimStats.calls, slimLens: slimStats.lens, stuckReason: slimStats.reason } : {}));   // v0.5（P0-2）；v2.5.2（P2）：slim 统计随样入账
         try { refreshMemorySessionsIndex(); } catch (e2) {}
         return true;
       } catch (e) {
@@ -5134,7 +7696,7 @@ export default {
       INTENT_RUNNING = true;
       try {
         const subagents = ctx.get("subagents");
-        if (!subagents || typeof subagents.start !== "function") {
+        if (!subagentsHasStart(subagents)) {   // v3.2.1：双协议判据（0.1.x start / 0.2.x startActivation）
           clog("[dsh-memory] 意图检查点：subagents 不可用，跳过");
           return;
         }
@@ -5144,7 +7706,7 @@ export default {
         try { existing = fs.readFileSync(targetFull, "utf8"); } catch (e) { existing = ""; }
         if (existing.includes("<!-- intent: " + compactionId)) return;   // 幂等：前缀匹配（marker 已带 sid 后缀）
         const sid8 = String(sessionId || "anon").replace(/^session-/, "").slice(0, 8);
-        let sum = await compactOnce(subagents, parentAgent, INTENT_INSTRUCTION + smartTrim(summaryText, 20000, "sessions/" + fname + "（memory_search 可查）"), "intent-" + String(compactionId).slice(0, 8));
+        let sum = await compactOnce(subagents, parentAgent, INTENT_INSTRUCTION + smartTrim(summaryText, 20000, "sessions/" + fname + "（memory_search 可查）"), "intent-" + String(compactionId).slice(0, 8), null, sessionId);
         if (!sum) { clog("[dsh-memory] 意图检查点：子代理无输出，跳过"); return; }
         sum = extractBodyFromMarker(sum);   // v2.5.2（F1′）：intent 同上剥前言，防 ghost 轮检查点整块丢弃（compact 不重发，后果更重）
         if (!/^##\s*本次目标/.test(sum.trim())) {   // v2.3.8 F4: 格式护栏——拒绝非检查点文本入正文（ghost 轮跑题回复曾顶替正解落盘）
@@ -5208,10 +7770,43 @@ export default {
 
     // v2.0.5: 防重入——模型反复调 stale_archive 会重复提取消息流+重复 spawn 烧 token，不信任模型自觉
     let STALE_RUNNING = false;
+    // v2.6.6（2026-09-16 用户拍板）：当前在跑的归档结算链句柄——供手动 /dream 在撞车（防重入拒绝）
+    //   时等待其结算，保住「先归档再整合」语义（旧行为：被拒后直接 spawnIntegrate，归档与整合并行）。
+    let STALE_ACTIVE_DONE = null;
     // v2.3.2(archive-tool): memory_archive_checkpoint 交付状态——批初始化+累计声明集+落盘/完整性标志
     let LAST_ARCHIVE_FLOW = null;            // { sessionIds: [], todayStr, declared: Set }
+    // ★★ 2026-09-25（A5 跨批口径修复）：批 → 本批短 id 清单（按子代理 child session id 归位）。
+    //   背景（现场实证 2026-09-25 那轮）：`LAST_ARCHIVE_FLOW.sessionIds` 是**整轮全量**，而每批任务书只带
+    //   **本批**的短 id 清单 ⇒ 旧的"缺声明会话"判据会要求子代理为**别的批**的会话也提交声明，逼出这类假 skip：
+    //   「插件校验要求声明该 id，但本批任务说明（第 4/6 批）的短 id 清单与消息流均未包含它…故无要点可写」
+    //   —— 该轮 7 个内容丰富的会话被这样"声明跳过"（要点实际由各自批次写入，故内容未丢，但造成误导性留痕、
+    //   白烧 token，并可能污染「有内容却声明跳过」计数）。
+    //   修法：本批完整性只按**本批清单**校验（`batchIds`），`declared` 仍按轮累计供结算期 A5 使用；
+    //   拿不到子代理身份时退回旧的全量口径（行为不劣化）。LRU 上限 64 防长驻泄漏。
+    const ARCHIVE_BATCH_IDS = new Map();
+    function rememberArchiveBatch(childSid, sidList) {
+      try {
+        const key = String(childSid || "");
+        if (!key) return;
+        if (ARCHIVE_BATCH_IDS.size >= 64) { const k0 = ARCHIVE_BATCH_IDS.keys().next().value; ARCHIVE_BATCH_IDS.delete(k0); }
+        ARCHIVE_BATCH_IDS.set(key, new Set((Array.isArray(sidList) ? sidList : []).map((s) => unitSid(s))));
+      } catch (e) { /* 登记失败只影响校验口径，绝不阻断发起 */ }
+    }
+    function archiveBatchIdsFor(exec) {
+      try {
+        const aid = exec && exec.agent && exec.agent.id ? String(exec.agent.id) : "";
+        return aid ? ARCHIVE_BATCH_IDS.get(aid) : void 0;
+      } catch (e) { return void 0; }
+    }
     let LAST_ARCHIVE_WROTE_AT = 0;
     let LAST_ARCHIVE_A5_OK = false;
+    // v2.8.4（P18）：**内容见证** —— sid → {mode, points, chars, reason}。
+    //   缺口：旧判据只有 `LAST_ARCHIVE_WROTE_AT`（"本轮有人写过"）+ A5（"声明全覆盖"）两个**整体标量**，
+    //   不区分"某 sid 真写入"与"子代理自己声明 skip"。§8.6 选了 (D) 方向后，旧正文不再随本轮提供，
+    //   所有旧结论只由 `extractExistingArchiveBlock`（旧要点）承载 ⇒ 一旦**机制层**丢弃（已在库/本轮已记/
+    //   写盘异常）或子代理声明 skip，水位照常推进 ⇒ **内容静默消失且事后不可区分**。
+    //   本见证把每一轮、每个 sid 的**实际去向**写进账本（含被丢内容量），并交给下面两处「指定读者」报出来。
+    let LAST_ARCHIVE_WITNESS = new Map();
     // v2.0.9/v2.1.4: 归档节流时间戳（跨重启持久化 .integrate.json archiveLastRunAt；发起即重置、窗内一律拒绝）
     let ARCHIVE_LAST_RUN_AT = 0;
     const ARCHIVE_THROTTLE_MS = 60 * 60000;
@@ -5260,10 +7855,145 @@ export default {
       }
       return r;
     }
+    // ═══════ v2.8.4（自动归档包，用户裁决 2026-09-18）：静默归档不再依赖"每进程一次" ═══════
+    // 缺口：`maintenanceInjected`（L4688，**进程内变量**）使自动归档**每插件实例只跑一次**；`/dream` 要人主动；
+    //   定期整合要满 `integrateDays`（默认 7 天）⇒ 长跑不重启时该归档的会话最长被拖 7 天。用户配置是
+    //   `staleAction: silent`（要它自动）⇒ 必须补这条通道。
+    // 设计（组评审 5 席收敛 + 用户裁决 A/B1–B4）：
+    //   ① **指纹闸（主闸）**：候选集（sid + 各自水位）未变 ⇒ **不发起**。实测候选集绝大部分时刻是不变的
+    //      ⇒ 把"每小时盲发起"变成"候选真变了才跑"，实际轮数贴**到达率**（实测 1.8 轮/天）而非贴上上限。
+    //      它**原本声称**能天然掐死红队指出的"僵尸会话永动机"（整轮全无流 ⇒ 候选集不变 ⇒ 不再重复起火），
+    //      ★ 2026-09-18 组评审更正：这句话**不成立** —— ① 旧代码只在 `r.ok` 记指纹，白轮不记；
+    //      ② 更关键的是指纹本身对内容变化**不敏感**：`fp` 取的是 `ARCHIVE_WATERMARK` 的 `frames`，而水位只在
+    //      "成功归档"时才推进，**从未归档过**的候选更是永远没有水位条目（懒置基线只在 `has(id)` 分支里写）
+    //      ⇒ `fp` 恒为 `id@undefined`。所以「候选集未变」只说明"集合 id 没变"，**不能**说明"内容没变化"。
+    //      本批**没有**动这条闸的语义（改它要重做取值口径），只把白轮路径的退避改为**作用域**退避（见下 ②），
+    //      并明确记下这个既存局限（红队 R-1，列入待办）。
+    //      ★ 另一条自伤与回退：我一度在白轮分支里补记 `ARCHIVE_AUTO_FP = fp` 想"兑现"上面那句话 ⇒ 会造成**永久静默**
+    //      （同一集合在 24h 后仍被指纹闸挡死）。该行已回退，见 `runStaleSilentTick` 的 whiteRun 分支注释。
+    //   ② **退避（第二层）**：整轮 `whiteRun`（候选全无可归档消息流）⇒ **24h 内不再自动发起**。
+    //   ③ **不新增节流参数**（用户裁决 A）：频率上限就用既有的 `ARCHIVE_THROTTLE_MS`（60 min，在 `runStaleArchive` 内）。
+    //   ④ **只挂归档层**：本 tick **绝不**调 `runDreamPipeline` ⇒ 整合（改写 global/index/projects）仍守 `integrateDays`。
+    //   ⑤ **可读信号**：每次 tick 结论（跑没跑 + 原因）写账本 `archiveAutoLast`，供 `/dream` 体检行与自检读取。
+    //   ⑥ 节流戳**每次调用前读盘**（修多实例：另一实例刚跑过时，本实例内存旧戳会误判"可跑"）。
+    //   ⑦ 形状可测（回归门席）：**具名函数 + 可注入时钟**（`now` 形参）—— 门直调它，不碰定时器。
+    let ARCHIVE_AUTO_FP = null;       // 上次**发起**时的候选集指纹
+    let ARCHIVE_AUTO_UNTIL = 0;       // whiteRun 退避截止
+    let ARCHIVE_AUTO_UNTIL_FP = null; // v2.8.4（T5）：该退避只针对**这一份候选集**（新候选到达 ⇒ 立即放行；旧实现是全局 24h 硬压）
+    function archiveAutoNote(t, ran, why) {
+      try {
+        const st = readIntegrateState() || {};
+        st.archiveAutoLast = { at: t, ran: !!ran, why: String(why || "").slice(0, 160), fp: ARCHIVE_AUTO_FP || null, until: ARCHIVE_AUTO_UNTIL || 0, untilFp: ARCHIVE_AUTO_UNTIL_FP || null };
+        writeIntegrateState(st);
+      } catch (e) {}
+    }
+    // v2.8.4（P18）：账本 → 一行人类可读信号（心跳行与启动自检的唯一格式源；格式逻辑本身在模块级，门可直测）
+    function archiveSignalLine() {
+      try { return formatArchiveSignal(readIntegrateState() || {}, Date.now()); }
+      catch (e) { return "自动归档 账本读取失败：" + (e && e.message ? e.message : String(e)); }
+    }
+    __archiveSignalLine = archiveSignalLine;
+    async function runStaleSilentTick(now) {
+      const t = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+      // ★ 2026-09-19（重写 T5 门时**实测**抓到的一处真实缺口，不是推演）：本 tick **自己不加载账本**。
+      //   `ensureStaleNotified()` 此前只被三个"人在场"的入口调用（维护提醒注入 / `stale_archive` 工具 / `/dream`）
+      //   ⇒ 若本 tick 抢在它们之前跑（重启后定时器首跳而该进程还没注入过维护提醒），内存里的
+      //   `ARCHIVED_SESSIONS` / `ARCHIVE_WATERMARK` **是空的**，两个后果都很重：
+      //     ① `archivePendingEntry` 对**每个**存量会话都返回 true（= 全当新候选）⇒ 单轮最多 32 个会话被重复归档；
+      //     ② 紧接着的 `saveStaleNotified()` 会把 `st.archivedSessions = <空集合>` **写进磁盘**
+      //        （它读盘后覆盖三个键再整对象写回）⇒ 账本被清空 ⇒ 此后每次重启全量重档（token 爆炸，正是 09-18 评审
+      //        反复划线的风险）。
+      //   实测证据：`_test-t5-white-scope.mjs` 预置了 `archiveWatermarks`，而 tick 算出的指纹却恒为
+      //   `session-zom1@undefined|…`（= 内存无水位）且被消号的会话仍走了完整提取路径 ⇒ 账本确实没被加载。
+      //   修法：本 tick 自己保证账本已加载（幂等，一次读盘）—— 候选判定与指纹不再依赖**调用顺序**。
+      ensureStaleNotified();
+      // ★ §9.11.4-3 修正六（红队 rev8c B② 实测形态：账本半截 JSON ⇒ 本 tick 静默变成「无待归档候选」并把账本写空）：
+      //   账本读不出来 ⇒ **整轮不动**：不做候选枚举、不做提取、**不写任何盘**（连 `archiveAutoNote` 都不调 —— 它本身就是写盘）。
+      //   为什么必须在这里拦：`getEnabledAt()` 读账本失败时会退化成 `Date.now()` ⇒ `findStaleSessions` 把**所有**会话挡掉
+      //   ⇒ 表面"没有候选"，实际是"读不到账本"；那正是最容易被误读成"一切正常"的静默降级。
+      // ★ 修正七（红队 rev8d P1，实测）：**不得用粘滞标志**。作者上一版把"账本不可读"记成模块级 `LEDGER_UNREADABLE`
+      //   且**永不清零** ⇒ 一次瞬时读失败（EISDIR / 权限 / 半截写被别的进程修好）就把归档轮**永久压住到重启**，
+      //   而一次性 cwarn 之后**再无任何痕迹**（这条路径刻意不调 `archiveAutoNote`，心跳行也读不到）⇒「静默停摆数天」。
+      //   现在改成**每次现问**：这一轮能不能读出账本来？读得出就照常跑（瞬时失败**自愈**，无需重启）；
+      //   读不出则本轮不动，并且**每轮都发一条 monitorEvent**（不再只发一次）—— 留痕可查、可计数。
+      if (ledgerUnreadableNow()) {
+        try { monitorEvent("archive", "ledger-unreadable paused（本轮不动：不归档、不写盘；修复账本后自动恢复）"); } catch (e) {}
+        return { ok: false, ran: false, why: "ledger-unreadable" };
+      }
+      if (PLUGIN_CFG.staleAction !== "silent" || !ZSTD_OK) { archiveAutoNote(t, false, "非 silent 档或无 zstd"); return { ok: false, ran: false, why: "not-silent" }; }
+      // v2.8.4（T5）：退避判定**移到候选集算出之后**（见下方 fp 段）—— 退避是"对某一份候选集"的，不是对时间的全封锁。
+      //   实测后果：两份**每轮都判"整轮无消息流"**的僵尸候选（更正：不是"1 字节日志"，见文件头 T5 段说明）⇒ 全局 24h 退避把
+      //   **真正的新会话**的自动归档一起压住了（旧实现里那 24h 是纯时间闸，与候选是谁无关）。
+      if (STALE_RUNNING) { archiveAutoNote(t, false, "上一轮归档仍在跑"); return { ok: false, ran: false, why: "busy" }; }
+      if (MAINT_RUNNING || INTENT_RUNNING || DREAM_TRACK) { archiveAutoNote(t, false, "记忆链忙（维护/整合进行中）"); return { ok: false, ran: false, why: "chain-busy" }; }
+      // ⑥ 每次读盘刷新节流戳（多实例）
+      try {
+        const st0 = readIntegrateState() || {};
+        if (st0.archiveLastRunAt) ARCHIVE_LAST_RUN_AT = st0.archiveLastRunAt;
+        if (st0.archiveLastFailAt) ARCHIVE_LAST_FAIL_AT = st0.archiveLastFailAt;
+        // v2.8.4（T5）：指纹/退避**跨重启保持**（旧实现是内存变量 ⇒ 重启即失效，白轮退避形同虚设：
+        //   实测 2026-09-18 20:42:58 记了"退避 24h"，20:43:55 重启后 20:44:13 立刻又跑了一轮）。
+        //   ★ 但**只恢复能归属到候选集的退避**（带 `untilFp`）—— 见下方修订注释（09-19 生产观测事故）。
+        const al0 = st0.archiveAutoLast || {};
+        if (al0.fp && !ARCHIVE_AUTO_FP) ARCHIVE_AUTO_FP = al0.fp;
+        // v2.8.4（T5 修订 · 2026-09-19 生产观测）：`until` 有值但**没有 `untilFp`**（= v2.8.4 之前写下的旧式退避，
+        //   无法归属到某份候选集）⇒ 一律视为**已失效、不恢复**。
+        //   事故：旧式退避会落进"保守分支"（`UNTIL_FP === null` ⇒ 对**任何**候选集生效），再叠加本批新增的
+        //   "退避跨重启恢复" ⇒ **重启后自动归档被全局封锁到该 until 到期**（本机实测：09-19 00:16 重启后封锁到
+        //   09-19 21:43 = 21.4 小时；而旧实现在重启时会把内存里的退避丢掉，不会封这么久）。
+        //   代价至多多跑一次白轮（有 15 分失败窗兜着），收益是"真来了的新会话不被压" —— 与 P0-1「宁重试不静默丢」同向。
+        if (Number(al0.until) > t && al0.untilFp) { ARCHIVE_AUTO_UNTIL = Number(al0.until); ARCHIVE_AUTO_UNTIL_FP = al0.untilFp; }
+        // v2.8.4（T5 修订二 · 同一事故的对称面）：**磁盘无有效退避 ⇒ 清掉内存态**。
+        //   为什么必须对称：只"设"不"清"会让外部/人工解封**失效** —— 本机实测：我在 00:2x 把账本的 `until` 置 0，
+        //   但运行中的进程内存里仍是 00:16 恢复的那份 21:43 ⇒ 每个 tick 只做"若磁盘值在未来则赋值"⇒ 依旧封锁到 21:43。
+        //   ⇒ 让**账本成为 tick 的唯一真值源**：磁盘说没有有效退避，内存态就跟着清空（人工解封下一次 tick 即生效，
+        //     也顺带消灭"幽灵退避"）。多实例下不会误伤：真正在跑的退避其 `until/untilFp` 本来就写在账本里。
+        else if (!(Number(al0.until) > t)) { ARCHIVE_AUTO_UNTIL = 0; ARCHIVE_AUTO_UNTIL_FP = null; }
+      } catch (e) {}
+      const cands = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
+        .filter((s) => shouldReArchive(s, reArchiveOpts()));
+      if (ARCHIVE_WM_DIRTY) { saveStaleNotified(); ARCHIVE_WM_DIRTY = false; }   // 复用既有懒置基线
+      if (!cands.length) { archiveAutoNote(t, false, "无待归档候选"); return { ok: false, ran: false, why: "empty" }; }
+      const fp = cands.map((s) => s.id + "@" + ((ARCHIVE_WATERMARK.get(s.id) || {}).frames)).join("|") + "#" + cands.length;
+      // ★★ 修正十三·补（**红队 rev8h B 实测："incomplete 旁路 + 24h 退避 + 15 分窗不足以收敛"**）：
+      //   `wmSkip` 候选是**有活干**的（去读那些"账本说读过、其实没读"的帧）⇒ 不该被"白轮退避"当白轮压住，
+      //   否则 3 轮重试要花 3 天（每轮吃一次 24h 退避）⇒ 重试等于没有。候选集含 wmSkip 候选即放行。
+      const hasWmSkipCand = cands.some((s) => { const w = ARCHIVE_WATERMARK.get(s.id); return !!(w && w.wmSkip === true && (Number(w.wmSkipRounds) || 0) < WM_SKIP_MAX_ROUNDS); });
+      // v2.8.4（T5）：退避只作用于**同一份候选集**；候选集变了（= 真来了新会话）⇒ 立即放行。
+      //   `untilFp` 为空 = v2.8.4 之前的旧账本 ⇒ 保守按"同一份"处理（旧账本行为不变）。
+      if (!hasWmSkipCand && t < ARCHIVE_AUTO_UNTIL && (ARCHIVE_AUTO_UNTIL_FP === null || ARCHIVE_AUTO_UNTIL_FP === fp)) {
+        archiveAutoNote(t, false, "whiteRun 退避中（同一候选集，" + cands.length + " 个；新候选到达即放行）");
+        return { ok: false, ran: false, why: "backoff" };
+      }
+      if (!hasWmSkipCand && fp === ARCHIVE_AUTO_FP) { archiveAutoNote(t, false, "候选集未变（" + cands.length + " 个）"); return { ok: false, ran: false, why: "unchanged" }; }
+      const r = await runStaleArchive(cands);      // 60min/15min 冷却 + STALE_RUNNING 三道守卫都在它内部
+      if (r && r.ok) {
+        ARCHIVE_AUTO_FP = fp;
+        archiveAutoNote(t, true, "已发起 " + r.count + " 个会话 / " + r.started + " 批" + (r.overflow > 0 ? "，余 " + r.overflow + " 留待下次" : ""));
+      } else if (r && r.whiteRun) {
+        // v2.8.4（T5）：白轮**只**记"这份候选集退避到何时"（`until` + `untilFp`），**不记指纹**。
+        //   ★ 一次自伤与回退（红队 R-1 + 工程席③，2026-09-18 评审）：我最初在这里也写了 `ARCHIVE_AUTO_FP = fp`，
+        //     想兑现上方设计注释那句"指纹闸天然掐死僵尸永动机" —— 但那一行会造成**永久静默**：
+        //     `fp` 由 `id + "@" + (ARCHIVE_WATERMARK.get(id)||{}).frames` 组成，而**从未归档过**的候选
+        //     **永远没有水位条目**（懒置基线只在 `has(id)` 分支里写）⇒ `fp` 恒为 `id@undefined`、**对内容变化完全盲**；
+        //     于是 24h 之后 `fp === ARCHIVE_AUTO_FP` 依旧成立 ⇒ 这份集合**再也不会被归档**（真·永久）。
+        //     旧行为的 24h 退避到期是会重试的 ⇒ 那一行等于把"内容没计入"（用户最怕的）从"延迟 1 天"变成"永不"。
+        //     ⇒ 回退该行。**承重的是 `untilFp` 作用域退避**：同一份集合 24h 内不重复起火、**到期自然重试**，
+        //       候选集一变（真来了新会话）立刻放行。上方设计注释里"指纹闸掐死永动机"随之改为"靠作用域退避 24h 收敛"。
+        //   ② 「不消号 / 宁重试不静默丢」（P0-1）语义**不变**。
+        ARCHIVE_AUTO_UNTIL = t + 24 * 3600000;
+        ARCHIVE_AUTO_UNTIL_FP = fp;
+        archiveAutoNote(t, false, "整轮无消息流 ⇒ 同一候选集退避 24h（到期重试；候选集变化即放行）");
+      } else {
+        archiveAutoNote(t, false, "未发起：" + ((r && r.reason) || "?"));
+      }
+      return r || { ok: false, ran: false, why: "no-result" };
+    }
+    __staleSilentTick = runStaleSilentTick;        // 供门直调（带可注入时钟）
 
     async function runStaleArchiveInner(staleSessions) {
       const subagents = ctx.get("subagents");
-      if (!subagents || typeof subagents.start !== "function") {
+      if (!subagentsHasStart(subagents)) {   // v3.2.1：双协议判据（0.1.x start / 0.2.x startActivation）
         cwarn("[dsh-memory] subagents 服务不可用，漏网归档降级为提醒");
         monitorEvent("archive", "failed reason=subagents-unavailable");
         return { ok: false, reason: "subagents 服务不可用" };
@@ -5273,70 +8003,357 @@ export default {
       const overflow = staleSessions.length - batch.length;
       const flowSessions = [];
       const skippedNoFlow = [];
-      const batchFrames = new Map(); // v2.4.3：发起时记 {frames, round}（settle 消号即写入水位账本，含无流/跳过项）
+      const batchFrames = new Map(); // v2.4.3/P14：发起时记 {frames, round, incomplete}（settle 消号即写入水位账本）
+      // v2.8.4（P15）：**整轮**墙钟预算 —— 所有会话共享同一截止点；只限单会话是不够的（旧路径曾顶住会话启动 6 分 14 秒）。
+      const roundDeadline = Date.now() + ROUND_EXTRACT_BUDGET_MS;
       for (const s of batch) {
         await new Promise((r2) => setImmediate(r2));
-        const logPath = SESSIONS_ROOT + "/" + s.ws + "/" + s.id + "/session.jsonl.zstd";
-        clog("[dsh-memory] 提取消息流 " + (flowSessions.length + skippedNoFlow.length + 1) + "/" + batch.length + ": " + s.id.slice(0, 12) + "...");
+        // v2.8.4（P21）：取**同目录全部日志**（时间顺序 `[legacy, v3]`）—— 双名目录旧实现只看优先级最高的一个。
+        const logPaths = resolveSessionLogPaths(SESSIONS_ROOT + "/" + s.ws + "/" + s.id);
+        if (!logPaths.length) {
+          clog("[dsh-memory] 归档跳过（日志文件不可识别）: " + sidLabel(s.id) + "...");
+          skippedNoFlow.push(sidLabel(s.id));
+          batchFrames.set(s.id, { frames: null, round: 1, incomplete: false });
+          continue;
+        }
+        clog("[dsh-memory] 提取消息流 " + (flowSessions.length + skippedNoFlow.length + 1) + "/" + batch.length + ": " + sidLabel(s.id) + (logPaths.length > 1 ? "（" + logPaths.length + " 个日志）" : "") + "...");
         // v2.4.3：增量重档——账本有水位且有新帧 → 只提取水位后帧；轮次 = 已归档轮 + 1
         const wm = ARCHIVE_WATERMARK.get(s.id);
-        const curF = countZstdFrames(logPath);
-        const isRe = !!(wm && typeof wm.frames === "number" && curF !== null && curF > wm.frames);
+        // ★★ 2026-10-14 水位信任闸（wmTrusted）：P14 起写水位时**必带 `byFile` 逐文件向量**
+        //   （真实消费帧数），而 P14 之前的 legacy 条目是 `byFile: null` 的乐观水位 —— 正是红队
+        //   rev8h A/B 防的"水位虚高 ⇒ 整文件跳过 ⇒ 真内容永不进候选"形态。二者必须区别对待：
+        //     · 可信（有 byFile）：`skip > 0` = **这些帧前几轮真读过**，本轮从该处续读**不是漏读**
+        //       ⇒ 旧码把它记成 `wmSkippedFiles > 0`，令 `emptyOnly` 恒假、**永不消号**，重试到上限后
+        //         留下永久误报（2026-10-14 现场实测：7 个会话全部卡死，其中 2 个是有正文的本日会话）。
+        //     · 不可信（legacy / 无 byFile）：**保持旧行为不变** —— 保守认定"账本说的不算读过"。
+        const wmTrusted = !!(wm && wm.byFile && typeof wm.byFile === "object");
+        const logNames = logPaths.map((p) => path.basename(p));
+        const perFile = logPaths.map((p) => { const c = countZstdFrames(p); return c === null ? -1 : c; });
+        // ★★ §9.11.4-3 修正三（**红队 rev8b B-1 实测抓出，本批自己的洞**）：
+        //   旧写法 `c === null ? 0` 把「**文件读不出来**」塌成 `perFile=0`，于是下方 `skip(0) >= perFile[i](0)`
+        //   成立 ⇒ 该文件被记为「已消费 0 帧」、**根本不调用提取器** ⇒ `failed` 仍是 false ⇒ 走 `emptyOnly`
+        //   并落盘「确无内容消号…无正文可丢」 —— 正是"读失败伪装成没有内容"的最危险形态，而 `!failed` 挡不住它
+        //   （`failed` 只在提取器**返回 null** 时置位，而这条路压根不调提取器）。
+        //   ⇒ `-1` 专表「计数失败/读不出来」，且**本会话整轮按失败处理**：不推进、不消号、下轮重试（P0-1）。
+        //   （与 `perFile=0`（真·空文件）严格区分：后者是"读出 0 帧"，语义上确实没有内容可丢。）
+        if (perFile.some((c) => c < 0)) {
+          clog("[dsh-memory] 归档跳过（日志帧计数失败=读不出来，**不消号、下轮重试**）: " + sidLabel(s.id) + "...");
+          try { monitorEvent("archive", "extract-skip frames-count-failed sid=" + sidLabel(s.id)); } catch (e) {}
+          skippedNoFlow.push(sidLabel(s.id));
+          batchFrames.set(s.id, { frames: null, round: 1, incomplete: false, empty: false });
+          continue;
+        }
+        // v2.8.4（P22）：**sum** 量纲 —— `curF` / `wm.frames` / `unit.frames` / `readUnitCache` 的 `curFrames`
+        //   四者必须同维；混用「sum」与「单文件」会出现"恒判陈旧（每轮全量重提取）"或"前半段永不进单元"。
+        const curF = perFile.reduce((a, b) => a + b, 0);
+        const isRe = !!(wm && typeof wm.frames === "number" && curF > wm.frames);
         const nextRound = wm ? (isRe ? (wm.round || 1) + 1 : (wm.round || 1)) : 1;
-        batchFrames.set(s.id, { frames: curF, round: isRe ? nextRound : (wm ? (wm.round || 1) : 1) });
+        const offsets = distributeOffsets(logNames, perFile, wm);   // P21：聚合水位 → 逐文件偏移
+        // v2.8.4（P14）：**先占位为 null**（= 不推进水位），提取完成后才写入**真实已消费帧数**。
+        //   旧码在此处就写 `curF`（文件总帧数）—— 那是"乐观假设提取一定跑完"；一旦被掐断/抛错，
+        //   水位就被推到文件尾 ⇒ 余下帧**永不提取且完全不可观测**。占位 null 让"没跑完"退化为"下轮重试"。
+        batchFrames.set(s.id, { frames: null, round: isRe ? nextRound : (wm ? (wm.round || 1) : 1), incomplete: false, empty: false });
+        // v2.8.4（P14/P15/P21）：本会话实际消费量 —— 聚合标量 + **逐文件向量**（向量让下一轮精确续跑）。
+        let consumed = null;
+        let incomplete = false;
+        // §9.11.4-3（用户 2026-09-19 拍板「按你推荐的来」）：与 `incomplete` **正交的第三态 = 提取失败**。
+        //   失败（`null`：抛错 / frames=0）⇒ 该文件**不推进**、水位留在原处、下轮重试（P0-1「宁重试不静默丢」不变）；
+        //   "真·无内容"（结构化空）⇒ 帧已全部检查 ⇒ **可消号**。旧码把这二者共用 `null`（源头 L4034 就短路成 null），
+        //   于是下游那条「真·无内容 ⇒ 视为已消费」的分支永远不可达 ⇒ 空候选**永不消号**（僵尸）。
+        //   本变量 + `emptyOnly` 就是"把那两条路重新分开"的最小代价：任何一处失败都不得被当成"没有内容"。
+        let failed = false;
+        // §9.11.4-3 配套可观测：这些"确无内容"的文件里**有多少帧压根解不开**（`badFrames`）——
+        //   汇总进 batchFrames ⇒ 消号留痕能如实写出"其中 x 帧坏帧"，而不是只报"无内容"。
+        let emptyBadFrames = 0;
+        // ★★ §9.11.4-12：**有正文**文件里的坏帧累计（与 `emptyBadFrames` 同口径、分开计 —— 两者语义不同：
+        //   前者是"这批帧有内容、但其中若干帧读不出"（内容进单元了，副本可能不全）；
+        //   后者是"整批无内容、且其中若干帧读不出"（消号留痕用）。混在一处会让读者分不清是哪一种。
+        let bodyBadFrames = 0;
         // v2.4.7（方案C·L2b 单元缓存）：增量重档时先读缓存，只提取新增帧合并——避免重新提取/压缩全量
-        const sidShort = s.id.replace(/^session-/, "").slice(0, 12);
+        const sidShort = unitSid(s.id);
         let unit = null;
         let isMerge = false;
-        if (isRe) {
-          const cached = readUnitCache(sidShort);
-          const rNew = await extractMessageFlowAsync(logPath, wm.frames);
-          if (cached && rNew && (rNew.flow || (rNew.segments && rNew.segments.length > 0))) {
-            const newUnit = compressUnit(rNew, "");
-            unit = mergeUnitCache(cached, newUnit, curF, nextRound);
-            isMerge = true;
-          } else if (cached) {
-            unit = cached;
-            isMerge = true;
-          } else if (rNew && (rNew.flow || (rNew.segments && rNew.segments.length > 0))) {
-            unit = compressUnit(rNew, "");
+        const rs = [];                       // 各文件的提取产物（P21：双名目录会有两个）
+        const consumedVector = [];
+        // ★ §9.11.4-3 修正四（红队 rev8b B-2）：**"帧被跳过（水位已覆盖）" ≠ "我读过这些帧"**。
+        //   本变量只回答一个问题：本轮**有没有真的把某个文件喂给提取器**（`r` 非 null，含"结构化空结果"）。
+        //   它决定账本里那句 `empty:true` 能不能写 —— 那是"我读过、里面没有正文"的断言，一个字都没读时不得写。
+        let readAny = false;
+        // ★★ §9.11.4-3 修正十一（**上线后现场实测抓出的真漏档，2026-09-19**）：与 `readAny` **正交**的第二个事实 ——
+        //   "有没有文件是**按水位**跳过（压根没调提取器）"。见下方该分支上方的详细说明。
+        let wmSkippedFiles = 0;    // 按水位跳过的**文件数**（帧数 > 0 才算，空文件不算）
+        let wmSkippedFrames = 0;   // 这些文件合计帧数（留痕用）
+        WM_PROBE_EMPTY_ROUND = 0;  // ★ 2026-09-25：本轮"空壳证人"计数（模块级：批次级日志要在块外读它）
+        for (let i = 0; i < logPaths.length; i++) {
+          const skip = offsets[i];
+          if (skip >= perFile[i]) {
+            // ★★ §9.11.4-3 修正十一（同上）：这条分支**根本不调用提取器**，只凭**账本水位**断定"该文件已消费完"。
+            //   而水位可能是**虚高**的 —— 现场 `574b8af7`：v3 日志 **3747 帧 / 12183 字正文**（source=compaction，
+            //   含压缩点摘要），水位恰好 `frames=3747`（旧码 P14 之前"乐观把水位写到底"留下的伤 / 量纲误写）
+            //   ⇒ 这里把 v3 **整文件跳过** ⇒ 只读了 legacy 那 2 帧（无内容）⇒ `emptyOnly` 成立 ⇒ **消号**
+            //   ⇒ 那 12183 字正文**永久不再进候选**（正是用户最怕的「内容没计入」）。
+            //   判据：**"账本说读过" ≠ "真读过"** ⇒ 只要有文件是"按水位跳过且有帧"，本轮**不许消号**。
+            consumedVector.push(perFile[i]);
+            // ★★ 2026-10-14 水位信任闸：可信水位（有 byFile）下"整文件跳过" = 这些帧**前几轮已真读过**，
+            //   不是漏读 ⇒ 不计 wmSkip（否则完整归档过的会话每轮都被计入、永不消号）。legacy 水位
+            //   （无 byFile）**保持旧行为**（照旧做有界对话探测 + 计 wmSkip），红队防线一字不动。
+            if (Number(perFile[i]) > 0 && !wmTrusted) {
+              // ★★ 2026-09-25（现场实证 session-28a52c6a）：水位跳过分支里混着**永远无法通过重读变成
+              //   有内容**的空壳会话（日志只有 agent/inbox/spliced 通知帧 + 会话元数据，零对话事件）。
+              //   它们每轮都进"有帧却没读"，把重试配额耗到上限后留下永久告警「内容可能未入档，请人工核查」。
+              //   处置：先做**有界**对话探测（等距采样 ≤12 帧 / 累计 ≤2MB）——
+              //     · 命中任一对话/摘要事件 → 维持旧行为（计 wmSkip，不许消号）；
+              //     · 全程无命中 → 空壳证人，计 wmProbeEmpty，**不计 wmSkip**（可正常消号，止住误报）；
+              //     · 读不了 / 超预算 → null（不确定）⇒ 同样维持旧行为，绝不因探测而放松防线。
+              if (probeDialogueEvents(logPaths[i], skip) === false) {
+                WM_PROBE_EMPTY_ROUND += 1;
+              } else {
+                wmSkippedFiles += 1; wmSkippedFrames += Number(perFile[i]) || 0;
+              }
+            }
+            continue;
           }
-        } else {
-          const r3 = await extractMessageFlowAsync(logPath, 0);
-          if (r3 && (r3.flow || (r3.segments && r3.segments.length > 0))) unit = compressUnit(r3, "");
+          const r = await extractMessageFlowAsync(logPaths[i], skip, { deadlineTs: roundDeadline });
+          const hasBody = !!(r && (r.flow || (Array.isArray(r.segments) && r.segments.length > 0)));
+          if (!r) {                                   // 提取抛错/返回 null ⇒ 保守：该文件**不推进**
+            failed = true;                            // §9.11.4-3：**失败**必须与"无内容"分开 —— 失败不得消号
+            consumedVector.push(skip);
+            break;
+          }
+          readAny = true;                             // 提取器确实被调用且给出了答复（无论空不空）
+          // ★★ 修正十一·补（**红队 rev8h A：形态X 逃逸**）：**"读过一部分"也不算读过全部**。
+          //   红队实测的边界形态：单文件、水位**恰比帧数小**（`perFile=[100], wm=99`）⇒ `skip=99 < 100`
+          //   **不进**上面那条"整文件跳过"分支 ⇒ 只读**最后 1 帧**；若那帧是控制帧 ⇒ `rs=[] ∧ !failed ∧ !incomplete ∧ wmSkipped=0`
+          //   ⇒ `emptyOnly` 仍为真 ⇒ **照旧消号**，而 0..98 共 99 帧从未被读（比"整文件跳过"更隐蔽）。
+          //   ⇒ 判据从"整文件跳过"放宽为「**本文件本轮实读帧数 < 它剩余应读帧数**」。
+          //   `consumedFrames` 是**全局帧位置** ⇒ 本文件实读 = consumedFrames − skip；应读 = perFile[i] − skip。
+          if (!r.incomplete) {
+          //   ★ 修法（第二版。**我第一版判据错了**：提取器"读到文件尾"时 `consumedFrames == perFile[i]`，
+          //     从"读了多少帧"根本看不出"前 99 帧从未被本轮验证"）⇒ 正确判据：该文件有 `skip > 0` 帧是
+          //     **"账本说已消费"**的，而本轮**没有任何产出证明过它们** ⇒ 它们属于"未被本轮验证"。
+          //     一句话：**只要存在 skip > 0 的文件，本轮就不许按"确无内容"消号**（账本说的不算读过）。
+          //     ★ 2026-10-14 水位信任闸：该判据只对**不可信水位（legacy / 无 byFile）**成立 ——
+          //       可信水位下 `skip > 0` 表示这些帧**前几轮已真读过**（P14 起写的是真实消费量），
+          //       再据它拒绝消号 ⇒ 任何增量归档的会话都会在 3 轮后变成永久误报。
+          if (!r.incomplete && skip > 0 && !wmTrusted) { wmSkippedFiles += 1; wmSkippedFrames += skip; }
+          }
+          if (!hasBody) {
+            if (r.incomplete) {                       // 掐断且无产出 ⇒ 按已消费帧推进并停
+              consumedVector.push(Number.isFinite(r.consumedFrames) ? r.consumedFrames : skip);
+              incomplete = true;
+              break;
+            }
+            consumedVector.push(perFile[i]);           // 真·无内容 ⇒ 帧**已全部检查** ⇒ 视为已消费
+            if (r.empty) emptyBadFrames += (Number(r.badFrames) || 0);   // §9.11.4-3：坏帧数照实上报（消号留痕用）
+            continue;
+          }
+          rs.push(r);
+          // ★★ §9.11.4-12：**有正文的文件也要累计坏帧**（原先只有 `!hasBody` 那条累计 ⇒
+          //   "有正文但部分帧读不出"在本模块内**完全没有读数**）。口径与空路径一致：`r.badFrames`。
+          bodyBadFrames += (Number(r.badFrames) || 0);
+          consumedVector.push(Number.isFinite(r.consumedFrames) ? r.consumedFrames : perFile[i]);
+          if (r.incomplete) { incomplete = true; break; }   // 掐断 ⇒ 停止后续文件（它们是更晚的时间段）
         }
+        // 聚合消费量：消费严格按时间顺序推进 ⇒ 向量是**前缀**，求和即为有效聚合水位
+        let sumConsumed = consumedVector.reduce((a, b) => a + b, 0);
+        // 不变量（P14）：水位**永不后退**（日志被外部重写/缩水 / 本轮一无所获 都不得把水位改小）
+        if (wm && typeof wm.frames === "number" && sumConsumed < wm.frames) sumConsumed = wm.frames;
+        consumed = sumConsumed;
+        const byFile = {};
+        logNames.forEach((n, i) => { byFile[n] = consumedVector[i] === undefined ? 0 : consumedVector[i]; });
+        // ★★ §9.11.4-3（用户 2026-09-19 拍板）：**"确实无内容" ⇒ 帧已全部检查 ⇒ 可消号**。
+        //   四个条件**同时**成立才算"确无内容"，任一不成立即回退到"不消号、下轮重试"：
+        //     ① 有日志文件（`logPaths.length === 0` 是"日志不可识别"，在上方已按 `frames:null` 跳出）；
+        //     ② 没有任何文件产出正文（`rs` 为空 —— 结构化空结果不进 `rs`，见 `hasBody` 分支）；
+        //     ③ 没被墙钟掐断（掐断 ⇒ 尾帧还没看 ⇒ 必须下轮续跑）；
+        //     ④ **没有任何提取失败**（`null`）。④ 的**精确覆盖面**（红队 rev8b F-① 指出我原先说法夸大，已更正）：
+        //        它覆盖"提取器被调用了并返回 null"这条；而"压根不调提取器"的两种形态已被**上游**分别挡住 ——
+        //        `perFile < 0`（帧计数失败）在本会话开头就 `continue`（修正三），`logPaths.length === 0` 由 ① 挡住。
+        //        ⇒ 四条件合起来才是"读失败不得被当成没有内容"的**完整**保障，单靠 `!failed` 不是。
+        //     ⑤ ★★ 修正十一（**现场实测，2026-09-19**）：**没有任何文件是"按水位跳过且有帧"**。
+        //        这是五条件里唯一防"**水位虚高导致真内容被整文件跳过**"的一条 —— 现场 `574b8af7` 的 v3
+        //        有 3747 帧/12183 字正文，水位恰好等于帧数 ⇒ 被整文件跳过 ⇒ 前四条**全部为真** ⇒ 会消号 ⇒ 永久漏档。
+        //        ⇒ 加 `wmSkippedFiles === 0`：只要有一个文件是"按水位跳过且有帧"，本轮**不消号**（保住候选、下轮重试）。
+        const emptyOnly = (logPaths.length > 0 && rs.length === 0 && !incomplete && !failed && wmSkippedFiles === 0);
+        const cached = isRe ? readUnitCache(sidShort, curF) : null;   // 批0（P0-5）：传当前帧数（sum 量纲）判陈旧
+        const combined = combineExtracts(rs, consumed, incomplete);   // P21：多文件产物并成一个单元原料
+        if (combined) {
+          if (cached) {
+            const newUnit = compressUnit(combined, "");
+            unit = mergeUnitCache(cached, newUnit, consumed, nextRound);
+            isMerge = true;
+          } else {
+            unit = compressUnit(combined, "");
+            unit.sampled = !!combined.sampled; unit.truncated = !!combined.truncated;   // 批0（P0-6）：透传真实覆盖信号
+          }
+        } else if (cached) {
+          // 批0（P0-5）：**显式标注**"新增帧提取失败/为空 → 回退旧缓存"。原实现静默把旧缓存当本轮成功单元。
+          unit = Object.assign({}, cached);
+          unit.staleFallback = true;
+          isMerge = true;
+        }
+        // v2.8.4（P14/P21）：把**已消费帧数**（聚合 sum）+ **逐文件向量**交回 settle 写入水位账本。
+        // ★★ §9.11.4-12：新增 `bodyBadFrames`（**有正文**文件里的坏帧），与既有 `badFrames`
+        //   （仅在 `emptyOnly` 时非零）**并列**，不改后者语义 —— 后者已被健康行/消号留痕读取，改它等于改既有口径。
+        batchFrames.set(s.id, { frames: consumed, byFile: byFile, round: isRe ? nextRound : (wm ? (wm.round || 1) : 1), incomplete: incomplete, empty: emptyOnly, badFrames: emptyOnly ? emptyBadFrames : 0, bodyBadFrames: bodyBadFrames, readAny: readAny, wmSkippedFiles: wmSkippedFiles, wmSkippedFrames: wmSkippedFrames });
         if (unit && unit.text) {
-          unit.sid = sidShort; unit.frames = curF; unit.round = nextRound; unit.at = Date.now();
+          // v2.8.4（P12）：**口径版本**随单元落盘 —— 缺它则下一轮 `readUnitCache` 直接拒收（每轮全量重提取），
+          //   且 `unitCounterVerMismatch` 恒 true ⇒ 候选旁路永不收敛。
+          unit.sid = sidShort; unit.frames = (consumed === null ? curF : consumed); unit.round = nextRound; unit.at = Date.now();
+          unit.counterVer = EXTRACT_COUNTER_VER;
           writeUnitCache(unit);
-          flowSessions.push({ session: s, unit: unit, sampled: unit.source === "messageflow", isRe: isRe, round: nextRound });
+          flowSessions.push({ session: s, unit: unit, sampled: (unit.sampled === undefined ? unit.source === "messageflow" : !!unit.sampled), truncated: !!unit.truncated, staleFallback: !!unit.staleFallback, isRe: isRe, round: nextRound, incomplete: incomplete, consumedFrames: consumed });
         } else {
-          skippedNoFlow.push(s.id.slice(0, 12));
+          skippedNoFlow.push(sidLabel(s.id));
         }
       }
       // v2.4.7（方案C）：删除 v1.12.18.3 逐段 spawn 子代理的 map-reduce 仿真压缩循环——
       // 该循环 16 个大会话×每会话多段≈几十次子代理调用烧巨量 token，且产出仍要进单巨型 prompt。
       // 现在 compressUnit 已在提取时完成确定性压缩（零子代理）。
 
-      const handledIds = []; // v1.12.19: 本轮实际处置名单（送审会话 + 无流跳过），供调用方登记 ARCHIVED_SESSIONS；overflow 不在内
+      const handledIds = []; // 本轮实际处置名单 —— **只有真提取到内容的会话**才进（供调用方登记 ARCHIVED_SESSIONS + 写水位）
+      // 批0（P0-1）：**提取失败/为空的会话不得进 handledIds**。
+      //   原实现把 skippedNoFlow 也 push 进 handledIds ⇒ settle 时 ARCHIVED_SESSIONS.add + 水位写成 curF
+      //   ⇒ archivePendingEntry 只在 cur > wm.frames 时重入 ⇒ **该会话的帧永远不会再被提取**，且不可观测。
+      //   现改为：只保留"已提醒"去重（STALE_NOTIFIED），不消号、不写水位 ⇒ 下一轮会重试（宁重试，不静默丢）。
       skippedNoFlow.forEach((id) => {
         const s = batch.find((x) => x.id.startsWith(id));
-        if (s) { STALE_NOTIFIED.add(s.id); handledIds.push(s.id); }
+        if (s) STALE_NOTIFIED.add(s.id);
       });
       flowSessions.forEach((f) => handledIds.push(f.session.id));
+      // 批0（P0-1）：把"提取异常"变成**可观测**（原来只有"整批全无流"才单列，混在成功批次里只剩一个聚合数）
+      const nInc = flowSessions.filter((f) => f.incomplete).length;
+      if (skippedNoFlow.length > 0 || flowSessions.some((f) => f.staleFallback || f.truncated) || nInc > 0) {
+        const nFb = flowSessions.filter((f) => f.staleFallback).length;
+        const nTr = flowSessions.filter((f) => f.truncated).length;
+        const nWmSkip = batchFrames ? Array.from(batchFrames.values()).filter((m) => m && m.wmSkippedFiles > 0).length : 0;
+        cwarn("[dsh-memory] 归档提取异常：无内容跳过 " + skippedNoFlow.length + " 个（**不消号，下轮重试**）" + (nWmSkip > 0 ? "、**按水位跳过（账本说已消费但本轮没读）** " + nWmSkip + " 个（不消号，防真内容被漏档）" : "") + "、旧缓存回退 " + nFb + " 个、预算截断 " + nTr + " 个" +
+          (WM_PROBE_EMPTY_ROUND > 0 ? "、**空壳证人（探测确认无对话事件）** " + WM_PROBE_EMPTY_ROUND + " 个（按确无内容处置、正常消号）" : "") +
+          (nInc > 0 ? "、**墙钟掐断 " + nInc + " 个（水位只推进到已消费帧，下轮由 shouldReArchive 从该帧续跑）**" : ""));
+        try { monitorEvent("archive", "extract-anomaly skippedNoFlow=" + skippedNoFlow.length + " staleFallback=" + nFb + " truncated=" + nTr + " incomplete=" + nInc + " wmSkip=" + nWmSkip + " wmProbeEmpty=" + WM_PROBE_EMPTY_ROUND); } catch (e) {}
+      }
+      // ★★ §9.11.4-3 落盘段（**没有它，上面的修复等于不存活**）：
+      //   把"确无内容"的候选本轮**已消费帧**写进水位账本并消号。
+      //   为什么必须在**这里**做、而不能复用 settle 路径：settle 只遍历 `handledIds`（= 真提取到内容的会话，
+      //   L7033 注释），空候选**永远进不去** ⇒ 水位永不推进 ⇒ 下一轮 `shouldReArchive` 照样判"有新增"
+      //   ⇒ 僵尸候选每轮重选、每轮白轮，并把**真正的新会话**的自动归档一起压进 24h 退避。
+      //   安全性：`emptyOnly` 已排除"失败/掐断"（见其定义）⇒ 这里推进帧的都是**没有内容可丢**的；
+      //   消号也**不封死**未来 —— 该会话一旦追加新帧，`cur > wm.frames` ⇒ 立刻重新成候选（与 P21 量纲一致）。
+      const emptyConsumed = [];
+      // ★ 变量改名（回归门席 rev8 复核抓出的**可读性缺陷**）：循环体内另有一个同名 `emptyBadFrames`（逐会话），
+      //   复核者据缩进判成"外层不可达的死代码"——实测两份都在用（L7018/L7057 用循环体那份，本处用这份轮汇总），
+      //   不是死代码，但同名确实会让人读错归属 ⇒ 本轮汇总改名 `roundBadFrames` 以示区别。
+      let roundBadFrames = 0;
+      let notReadCount = 0;
+      // ★★ 修正十三（**红队 rev8h B：修正十一的收敛语义与实际相反**）：`wmSkip` 的**真重试 + 有限次终局**。
+      //   红队实测：修正十一之后 wm-skip 会话**既不全消号、也不会重试**（`shouldReArchive` 三条路全 false：
+      //   `incomplete` 未置 / 旁路默认关 / `archivePendingEntry` 要 `cur > wm.frames` 而水位已虚高 ⇒ 恒假）
+      //   ⇒ "不消号但永久静默挂起" 与 "消号后永久漏档" **结果等价**（同一份 12183 字都不再进候选）。
+      //   ⇒ 这里给它们一个**显式凭据**（`wmSkip` + `wmSkipRounds`），由 `shouldReArchive` 据此**真重入**，
+      //     并在重试到上限后**升级为可见告警**（不再无限重试、也不再静默）。
+      // （常量已上提为模块级单点所有者 —— 工程席 rev8k A1）
+      let wmSkipMarked = 0, wmSkipExhausted = 0;
+      // ★★ 修（**上线后现场实测抓出的真缺陷**）：`wmSkipItems` 原先是 **`try` 块内的 `const`** ⇒ 块外不可见
+      //   ⇒ 打印语句里 `typeof wmSkipItems !== "undefined"` 恒为 `"undefined"` ⇒ **留痕行的 sid 标签永远为空**
+      //   （线上 18:11 实测：`…上限 3 次）: ` 后面空白）。**必须声明在 try 块外**（与 `wmSkipMarked` 同级）。
+      let wmSkipItems = [];
+      try {
+        for (const s of batch) {
+          const m = batchFrames.get(s.id);
+          if (!m || m.empty !== true || typeof m.frames !== "number") continue;
+          // §9.11.4-3 修正四（红队 rev8b B-2）：**`empty:true` 是"我读过、里面没有正文"的断言** ——
+          //   只有本轮**真的把某个文件喂给过提取器**（`readAny`）时才配写它。若全部文件都被水位判为"已消费"
+          //   （一次提取都没发生），照写 `empty:true` 就是**无证据的断言**；那种情形改记 `skipped:true`
+          //   （如实说"本轮没读、这些帧按账本已消费"）—— 水位照常推进、`incomplete` 照常清零，收敛不受影响。
+          const claimEmpty = m.readAny === true;
+          if (!claimEmpty) notReadCount++;
+          // ★★ 修正八（**根因席 rev8f C-3，本批自己引入的风险**）：**不得把 round 推进**。
+          //   `m.round` 取自 `nextRound = isRe ? (wm.round||1)+1 : …` —— 那是"本轮**准备**归档第几轮"的语义。
+          //   但空候选**从未真正归档**（没有单元、没有落库）⇒ 把 round 写进水位等于把轮次记高；
+          //   而补档去重是按 header `### <sid> ·补<N>（` 判"已在库"的 ⇒ **后续真归档会被误判"已在库"而静默丢弃**
+          //   （`LAST_ARCHIVE_FLOW.rounds` 与水位 round 是两处来源，一旦水位被推高就不再同源）。
+          //   ⇒ 这里只推进**帧位**（水位），轮次沿用账本原值；"为什么判它已归档"由 `empty/skipped` 自答。
+          const keepRound = (ARCHIVE_WATERMARK.get(s.id) && ARCHIVE_WATERMARK.get(s.id).round) || 1;
+          // 见证不继承：空候选从不进 `flowSessions`，`LAST_ARCHIVE_WITNESS` 里可能**是别人的结论**
+          //   （根因席 B：子代理对未送候选发 skip 时会写 witness）⇒ 写 null，避免 `{empty:true, witness:{declared-skip}}` 自相矛盾。
+          ARCHIVE_WATERMARK.set(s.id, { frames: m.frames, round: keepRound, at: Date.now(), incomplete: false, byFile: m.byFile || null, witness: null, empty: claimEmpty, skipped: !claimEmpty });
+          ARCHIVED_SESSIONS.add(s.id);
+          roundBadFrames += (Number(m.badFrames) || 0);
+          emptyConsumed.push(sidLabel(s.id) + "@" + m.frames);
+        }
+        if (emptyConsumed.length > 0) { ARCHIVE_WM_DIRTY = false; saveStaleNotified(); }
+        // ★★ 修正十三：给**因按水位跳过而没消号**的会话写显式凭据（真重试的依据 + 有限次终局）。
+        // （`wmSkipItems` 已提到 try 块外声明 —— 否则块外看不到它、留痕标签恒空；见上方注释）
+        for (const s of batch) {
+          const m = batchFrames.get(s.id);
+          if (!m || m.empty === true) continue;                       // 消号的那些已在上面的分支处理
+          if (!(Number(m.wmSkippedFiles) > 0)) continue;              // 只处理"有帧却被按水位整文件跳过"的
+          const prev = ARCHIVE_WATERMARK.get(s.id) || {};
+          const rounds = (Number(prev.wmSkipRounds) || 0) + 1;
+          ARCHIVE_WATERMARK.set(s.id, Object.assign({}, prev, {
+            wmSkip: true, wmSkipRounds: rounds, wmSkippedFiles: Number(m.wmSkippedFiles) || 0,
+            wmSkippedFrames: Number(m.wmSkippedFrames) || 0, wmSkipAt: Date.now(),
+          }));
+          wmSkipMarked++;
+          if (rounds >= WM_SKIP_MAX_ROUNDS) { wmSkipExhausted++; wmSkipItems.push(sidLabel(s.id) + "×" + rounds); }
+          else wmSkipItems.push(sidLabel(s.id) + "×" + rounds + "（下轮重试）");
+        }
+        if (wmSkipMarked > 0) { ARCHIVE_WM_DIRTY = false; saveStaleNotified(); }
+      } catch (e) {}
+      // ★★ 修正十三（红队 rev8h B／P1）：**wm-skip 的留痕分两级** —— 未到上限=可自愈（clog + monitor::每轮）；
+      //   到上限=**升级为用户可见告警**（不再重试，但也不再静默）。
+      if (typeof wmSkipMarked !== "undefined" && wmSkipMarked > 0) {
+        clog("[dsh-memory] 按水位跳过（有帧却没读）" + wmSkipMarked + " 个 ⇒ **不消号**、下轮重试（上限 " + WM_SKIP_MAX_ROUNDS + " 次）: " + (typeof wmSkipItems !== "undefined" ? wmSkipItems.join(", ") : ""));
+        try { monitorEvent("archive", "wm-skip count=" + wmSkipMarked + " exhausted=" + (typeof wmSkipExhausted !== "undefined" ? wmSkipExhausted : 0) + " items=" + (typeof wmSkipItems !== "undefined" ? wmSkipItems.join("|") : "")); } catch (e) {}
+        if (typeof wmSkipExhausted !== "undefined" && wmSkipExhausted > 0) {
+          cwarn("[dsh-memory] ⚠ **按水位跳过已达重试上限** " + wmSkipExhausted + " 个：这些会话的日志里**有帧却从未被读取**"
+            + "（水位虚高 → 整文件跳过），重试 " + WM_SKIP_MAX_ROUNDS + " 轮仍未成功 ⇒ **停止自动重试**。"
+            + "内容可能未入档 —— 请人工核查，或把该会话的水位手工降为真实已读帧数后重跑。");
+        }
+      }
+      if (emptyConsumed.length > 0) {
+        clog("[dsh-memory] 无正文类内容可丢 ⇒ 消号 " + emptyConsumed.length + " 个（水位推进到已消费帧"
+          + (roundBadFrames > 0 ? "；⚠其中 " + roundBadFrames + " 帧解压失败（坏帧 / 幻影 magic / 截断写），已随本行留痕；对同一份字节重试不会改变结果" : "")
+          + (notReadCount > 0 ? "；另有 " + notReadCount + " 个本轮**一个文件都没读**（水位已判其帧消费完）⇒ 只推进水位、**不写 `empty` 断言**，账本记 `skipped:true`" : "")
+          + "）: " + emptyConsumed.join(", "));
+        try { monitorEvent("archive", "empty-consumed count=" + emptyConsumed.length + " badFrames=" + roundBadFrames + " notRead=" + notReadCount + " items=" + emptyConsumed.join("|")); } catch (e) {}
+      }
+      // ★★ §9.11.4-12（**有正文会话的坏帧可见性**）：原先**只有空会话**的坏帧会被上报（上面那一行）。
+      //   ⇒ 若某会话"有正文但部分帧解不开"，单元照样产出、日志**一句都不提** ⇒ 读者无从知道"副本可能不全"。
+      //   这正是 L4232 注释承诺过的事（「事后能回答『这批帧读出来了吗』」）**只在空会话上兑现**。
+      //   ⇒ 本轮**有正文**文件的坏帧合计，单列一行；并且只在 >0 时打印（不制造噪音）。
+      {
+        let roundBodyBad = 0, badItems = [];
+        for (const s of batch) {
+          const m = batchFrames.get(s.id);
+          const n = Number(m && m.bodyBadFrames) || 0;
+          if (n > 0) { roundBodyBad += n; badItems.push(sidLabel(s.id) + "×" + n); }
+        }
+        if (roundBodyBad > 0) {
+          cwarn("[dsh-memory] ⚠ 有正文会话里**共 " + roundBodyBad + " 帧解压失败**（坏帧 / 幻影 magic / 截断写）："
+            + badItems.slice(0, 6).join(", ") + (badItems.length > 6 ? " …共 " + badItems.length + " 个会话" : "")
+            + " —— 这些会话的单元**已产出**，但**副本可能不全**（缺的正是那些帧）；对同一份字节重试不会改变结果。");
+          try { monitorEvent("archive", "body-badframes total=" + roundBodyBad + " items=" + badItems.slice(0, 8).join("|")); } catch (e) {}
+        }
+      }
       if (flowSessions.length === 0) {
-        clog("[dsh-memory] 无可归档会话（全部无消息流，跳过 " + skippedNoFlow.length + " 个）");
-        monitorEvent("archive", "settled mode=no-flow wrote=0 skipped=" + skippedNoFlow.length + " flow=0");
+        clog("[dsh-memory] 无可归档会话（全部无消息流，跳过 " + skippedNoFlow.length + " 个" + (emptyConsumed.length > 0 ? "，其中无正文类内容已消号 " + emptyConsumed.length + " 个" : "") + "）");
+        monitorEvent("archive", "settled mode=no-flow wrote=0 skipped=" + skippedNoFlow.length + " flow=0 emptyConsumed=" + emptyConsumed.length);
         // v2.4.7.1: 本路径已把整批消息流白提一遍且无流会话不消号 → 吃 15 分短窗（不改消号语义：日志稍后出现仍能重入）
+        //   §9.11.4-3 补注：上面的"不消号"只对**失败/掐断**成立；"确无内容"已在进入本分支前消号并写水位。
+        //   退避仍按候选集指纹作用（`untilFp`）⇒ 消号后候选集即变小，下一 tick 的 `fp` 不同 ⇒ 立即放行，
+        //   不会被这 24h 压住（这也是"僵尸候选不再反复起火"的收敛点）。
         return { ok: false, whiteRun: true, reason: "全部会话无消息流", overflow: overflow };
       }
       const todayStr = dateStr(new Date());   // v2.4.25（审查 P2-6）：本地日期——原 toISOString 是 UTC，本地 00:00-08:00 归档时「补档日期」错一天
       // v2.4.7（方案C·L3 分桶）：单元 → 确定性分桶（预算 60K 字符/5 单元/批）
-      const allSidShort = flowSessions.map((f) => f.session.id.replace(/^session-/, "").slice(0, 12));
-      const buckets = bucketUnits(flowSessions.map((f) => ({ sid: f.session.id.replace(/^session-/, "").slice(0, 12), text: f.unit.text, chars: f.unit.chars || f.unit.text.length, sampled: !!f.sampled, isRe: !!f.isRe, round: f.round, session: f.session })));
+      const allSidShort = flowSessions.map((f) => unitSid(f.session.id));
+      const buckets = bucketUnits(flowSessions.map((f) => ({ sid: unitSid(f.session.id), text: f.unit.text, chars: f.unit.chars || f.unit.text.length, sampled: !!f.sampled, isRe: !!f.isRe, round: f.round, session: f.session })));
       // v2.3.2(archive-tool): 批次状态初始化——sessionIds 为全量（所有批），declared 跨批累计，A5 全量校验
       LAST_ARCHIVE_FLOW = { sessionIds: allSidShort, todayStr: todayStr, declared: new Set(), rounds: {} };
-      flowSessions.forEach((f) => { if (f.isRe && f.round > 1) LAST_ARCHIVE_FLOW.rounds[f.session.id.replace(/^session-/, "").slice(0, 12)] = f.round; });
+      flowSessions.forEach((f) => { if (f.isRe && f.round > 1) LAST_ARCHIVE_FLOW.rounds[unitSid(f.session.id)] = f.round; });
       LAST_ARCHIVE_WROTE_AT = 0; LAST_ARCHIVE_A5_OK = false;
+      LAST_ARCHIVE_WITNESS = new Map();   // v2.8.4（P18）：见证按**轮**重置——混轮会让"谁被丢"指向错的轮
       const startedAt = Date.now();
       monitorEvent("archive", "started count=" + flowSessions.length + " buckets=" + buckets.length + " overflow=" + overflow);
       // v2.4.7（方案C·L4 并行结算）：每批一个子代理，并发 ARCHIVE_MAX_CONCURRENT=2；批间小并发
@@ -5359,6 +8376,7 @@ export default {
           "**禁止使用 write/edit 写任何文件**——落盘统一走 memory_archive_checkpoint 工具（插件现场校验+落盘；写 ~/.dsh 会被沙箱拒绝且你无审批通道）。\n" +
           "\n===== 本批待归档会话的对话消息流 =====\n" + flowBlocks + "\n" +
           "\n===== 本批会话短 id 清单（逐字取用，不得自行截取完整 uuid）=====\n" + shortIdList + "\n" +
+          "（清单**只含本批会话**；插件的完整性校验按本批结算 —— **不需要**为不在清单内的 id 提交任何声明。）\n" +
           "\n===== 你的职权（完全自主决策）=====\n" +
           "1. 逐会话判断归档价值：无实质内容（寒暄/空会话/记忆库已覆盖）→ 跳过并在报告说明理由。\n" +
           "1b. **补档轮次会话**（块头标有【补档第N轮】并附「已归档要点」）：该会话此前已归档过，本次消息流**只含上次归档之后的新增内容**——points 只写新增部分的新事实，与旧要点重叠的一律不复述、禁止改写旧条目；确无增量价值则该会话 skip=true + 理由。sessionId 照用同一短 id，轮次落盘标记由插件生成，你不用管。\n" +
@@ -5367,6 +8385,9 @@ export default {
           "4. **交付（唯一方式）**：对每个会话调用 memory_archive_checkpoint 工具提交检查点，参数 { blocks: [ { file, sessionId, title, points[], skip?, reason? } ] }：\n" +
           "   - file 只能是 sessions/|projects/ 前缀相对路径（归属日期从消息流推断，推断不出用最后交互日）；sessionId 必须从短 id 清单逐字取用；\n" +
           "   - 有价值 → 填 title + points（3-6 条要点，精确字面量（文号/路径/命令/参数/报错串/数值）逐字保留绝不概括改写；与已有归档重叠只记增量并标注）；\n" +
+          // §9.12③：字面量**单独一条通道**（进 literals.md，不进注入层）—— 要点是概括句，字面量在概括里会被自然丢掉
+          "   - **另填 `literals[]`**（可选但强烈建议）：把本轮出现的**精确字面量**逐条列进去（GUID/URL/文件路径/命令/参数/文号/报错串/数值），\n" +
+          "     每条一行、原样复制不概括；插件会去重后追加到记忆库 `knowledge/字面量.md`（**不进注入层**、不占前缀缓存，供 memory_search 检索）。\n" +
           "   - 无价值（寒暄/空会话/记忆库已覆盖）→ 填 skip=true + reason；\n" +
           "   - 工具会校验完整性（含缺声明会话检查）+ 落盘（追加到目标文件，条目幂等）；失败会在工具结果返回错误清单，按清单修正后再次调用，可多次调用直到全部通过。\n" +
           "5. **整批一次性交付**：全部会话处置于单次 memory_archive_checkpoint 调用（有价值全填 points / 无价值 skip）；插件按 25 分钟上限看护（v2.4.28），请勿中途长时间停顿。\n";
@@ -5381,11 +8402,14 @@ export default {
             //   dsh-alpha 的 subagent 非 restrictable + run_code PTC 红线双坑；allow 内均为宿主确定存在的名字）
             toolFilter: { allow: ["read", "grep", "glob", "memory_search", "memory_archive_checkpoint"] }
           };
-          if (LAST_TOP_AGENT) spawnOpts.parent = LAST_TOP_AGENT;
+          const _arcParent = pickSpawnParent(LAST_TOP_AGENT, null);
+          if (!_arcParent) throw new Error("无可用父 agent（dsh 0.1.7 起 subagents.start 的 parent 必填）");
+          spawnOpts.parent = _arcParent;
           // v2.4.7.1（回归修复②）：本函数只做「发起」——subagents.start 秒级返回，供上层判定
           //   r.ok=已发起 并当场落节流戳；run.result 的长等待移进 settle 链后台跑。发起失败抛出交调用方收集。
-          const run = await subagents.start("spawn", spawnOpts);
+          const run = await startSubagentCompat(subagents, spawnOpts);   // v3.2.1：兼容 0.1.x/0.2.x
           markPluginSubagent(run.id);   // v2.4.27：登记插件子代理 sid（A/B/C/D 提醒隔离全关，只计 monitor）
+          rememberArchiveBatch(run.id, sidList);   // ★ 2026-09-25：登记本批短 id 清单（A5 按本批校验）
           // v2.4.28（D4 方案 B）：archive 硬停 25 分（对齐既有 race 上限）——spSid=run.id 注册，tools/result 续期
           const _g = guardRegister(String(run.id || ""), "archive", _ctrl, ARCHIVE_HARD_MS, SUBAGENT_SOFT_MS);   // v2.6.1（V0.2 P1-1）：archive 保持 10/25 现状（softMs 显式传 SUBAGENT_SOFT_MS）
           if (_g && run.id) _g._runId = run.id;
@@ -5404,12 +8428,12 @@ export default {
           const notCompleted = result && result.stopReason && result.stopReason !== "completed";
           clog("[dsh-memory] 归档批完成（" + h.label + "，stopReason=" + (result && result.stopReason) + ", 输出 " + outText.length + " 字符" + (notCompleted ? "，非正常完成——不消号" : "") + "）");
           if (h.sid) guardClear(h.sid);   // v2.4.28（D4）：settle 注销看护
-          if (notCompleted) return { ok: false, label: h.label, err: "stopReason=" + result.stopReason };
-          return { ok: true, label: h.label };
+          if (notCompleted) return { ok: false, label: h.label, batchIdx: h.batchIdx, err: "stopReason=" + result.stopReason };
+          return { ok: true, label: h.label, batchIdx: h.batchIdx };   // ★ B1″：批标识随结果带出（逐批记账要用）
         } catch (e) {
           cwarn("[dsh-memory] 归档批失败: " + h.label + " - " + (e && e.message ? e.message : String(e)));
           if (h.sid) guardClear(h.sid);   // v2.4.28（D4）：异常路径也注销
-          return { ok: false, label: h.label, err: e && e.message ? e.message : String(e) };
+          return { ok: false, label: h.label, batchIdx: h.batchIdx, err: e && e.message ? e.message : String(e) };
         }
       };
       // v2.4.7.1（回归修复②）：两段式——第一段在并发上限内把所有批「发起」（秒级返回），第二段 settle 链后台「结算」。
@@ -5417,18 +8441,14 @@ export default {
       //   节流戳与水位也随之推迟落盘：归档中途重启 = 两者皆空 = 新实例立刻重提整批并重送子代理（真重复烧 token）。
       const handles = [];
       const startErrs = [];
-      let bi = 0;
-      const starters = [];
-      for (let w = 0; w < Math.min(ARCHIVE_MAX_CONCURRENT, buckets.length); w++) {
-        starters.push((async () => {
-          while (bi < buckets.length) {
-            const curIdx = bi++;
-            try { handles.push(await startOneBatch(buckets[curIdx], curIdx)); }
-            catch (e) { startErrs.push(e && e.message ? e.message : String(e)); }
-          }
-        })());
+      const firstWave = Math.min(ARCHIVE_MAX_CONCURRENT, buckets.length);
+      for (let i = 0; i < firstWave; i++) {
+        try { handles.push(await startOneBatch(buckets[i], i)); }
+        catch (e) { startErrs.push(e && e.message ? e.message : String(e)); }
       }
-      await Promise.all(starters);
+      if (buckets.length > firstWave) {
+        clog("[dsh-memory] 归档并发闸：首批 " + firstWave + "/" + buckets.length + " 批已发起，其余 " + (buckets.length - firstWave) + " 批排队（在跑上限 " + ARCHIVE_MAX_CONCURRENT + "）");
+      }
       if (handles.length === 0) {
         monitorEvent("archive", "failed reason=spawn err=" + (startErrs[0] || "?"));
         cwarn("[dsh-memory] 漏网归档子代理全部发起失败（" + startErrs.length + " 批）：" + (startErrs[0] || ""));
@@ -5438,7 +8458,24 @@ export default {
       // v2.4.7.1: settle 链（后台）——等已发起的批全部跑完 → A5 全量判定 → 消号；session-start 调用方不 await 本链
       const settle = (async () => {
         try {
-          const batchResults = await Promise.all(handles.map((h) => joinOneBatch(h)));
+          // v2.6.6：队列补批——每个槽位结算完一批后，从等待队列取下一批发起，使
+          //   「在跑子代理数 ≤ ARCHIVE_MAX_CONCURRENT」真实成立（旧版把全部批一次发起、闸门失效）。
+          //   发起失败只记 startErrs 并继续取下一批（不卡队列）；失败批的会话本轮不消号。
+          const batchResults = [];
+          let nextIdx = firstWave;
+          const runner = async (h) => {
+            let cur = h;
+            while (cur) {
+              batchResults.push(await joinOneBatch(cur));
+              cur = null;
+              while (nextIdx < buckets.length) {
+                const idx = nextIdx++;
+                try { cur = await startOneBatch(buckets[idx], idx); handles.push(cur); break; }
+                catch (e) { startErrs.push(e && e.message ? e.message : String(e)); }
+              }
+            }
+          };
+          await Promise.all(handles.map((h) => runner(h)));
           // v2.4.7（方案C·L5 A5 聚合）：全部批 settle 后按全量判定（发起失败的批同样计不完整）
           const allOk = batchResults.every((r) => r.ok) && startErrs.length === 0;
           if (!allOk) monitorEvent("archive", "settled mode=batch-partial-fail ok=" + batchResults.filter((r) => r.ok).length + "/" + buckets.length);
@@ -5453,12 +8490,63 @@ export default {
                 ? (startErrs.length > 0 ? "有 " + startErrs.length + " 批发起失败——不消号留待下轮" : "有批子代理未正常完成（interrupted/failed）——不消号留待下轮")
                 : (LAST_ARCHIVE_WROTE_AT >= startedAt ? "已落盘但 A5 未全覆盖（缺声明会话）——不消号留待下轮" : "未通过 memory_archive_checkpoint 落盘任何文件——留待下轮"));
           monitorEvent("archive", "settled mode=" + (doneOk ? "tool-ok" : !allOk ? "batch-fail" : "tool-incomplete") + " wrote=" + (LAST_ARCHIVE_WROTE_AT >= startedAt ? "Y" : "N") + " ok=" + doneOk + (allOk ? "" : " allOk=false"));
+          // v2.8.4（P18）：本轮**内容见证**入账 —— 每次结算都写（含失败轮：失败轮的见证正是"内容去哪了"的唯一线索）。
+          //   口径由 `summarizeArchiveWitness` 单一给出（纯函数，门直测），读者不再各自解释账本字段。
+          try {
+            // v2.8.4（P18）：把**本轮该 sid 的单元字符数**附给每条见证 ⇒ 读者能回答方案原文要求的那个问题：
+            //   「有没有哪个会话**明明提取到了内容（单元非空）却被声明跳过**」= (D) 方向下最危险的静默丢弃形态。
+            const unitCharsBySid = new Map();
+            for (const f of flowSessions) { try { unitCharsBySid.set(unitSid(f.session.id), (f.unit && (f.unit.chars || (f.unit.text || "").length)) || 0); } catch (e) {} }
+            const entries = Array.from(LAST_ARCHIVE_WITNESS.entries()).map((kv) => [kv[0], Object.assign({}, kv[1], { unitChars: unitCharsBySid.get(kv[0]) || 0 })]);
+            const wsum = summarizeArchiveWitness(entries, LAST_ARCHIVE_A5_OK);
+            const stW = readIntegrateState() || {};
+            stW.archiveWitnessLast = Object.assign({ at: Date.now(), startCount: flowSessions.length, doneOk: doneOk }, wsum);
+            writeIntegrateState(stW);
+          } catch (e) {}
           if (!doneOk) cwarn("[dsh-memory] " + archNote);
+          // ★★ B1″（2026-10-07 现场取证）：**逐批记账** —— 旧实现把账本写入挂在整轮 `doneOk` 与门上，
+          //   任一批失败 ⇒ **已成功落盘的会话也不记账** ⇒ 账本丢收据，而盘上的块已经写成"已归档"强证据
+          //   ⇒ 该会话被提及闸永久挡死（连补档都进不去；现场 35a85221 / b41ae2f2）。
+          //   判据**只收紧不放松**：①该会话所属批正常完成（别批失败不再连坐）
+          //   ②且该会话确实被处置（written / declared-skip / dropped-非写盘异常）。
+          //   本块**纯追加**：doneOk 路径一字未动。
+          if (!doneOk) {
+            try {
+              const sidBatchIdx = new Map();
+              buckets.forEach((bu, i) => bu.forEach((u) => sidBatchIdx.set(u.sid, i)));
+              const okBatchIdx = new Set(batchResults.filter((r) => r.ok).map((r) => r.batchIdx));
+              const recordIds = handledIds.filter((id) => {
+                const s = unitSid(id);
+                return okBatchIdx.has(sidBatchIdx.get(s)) && archiveWitnessDisposed(LAST_ARCHIVE_WITNESS.get(s));
+              });
+              if (recordIds.length > 0) {
+                recordIds.forEach((id) => {
+                  ARCHIVED_SESSIONS.add(id);
+                  const m = batchFrames.get(id);
+                  if (m && typeof m.frames === "number") ARCHIVE_WATERMARK.set(id, { frames: m.frames, round: m.round, at: Date.now(), incomplete: !!m.incomplete, byFile: m.byFile || null, witness: LAST_ARCHIVE_WITNESS.get(unitSid(id)) || null });
+                });
+                ARCHIVE_WM_DIRTY = false; saveStaleNotified();
+                clog("[dsh-memory] 逐批记账（整轮 doneOk=false）：已正常完成的批记账 " + recordIds.length + "/" + handledIds.length + " 个会话（别批失败不再连坐）");
+                monitorEvent("archive", "per-batch-record n=" + recordIds.length + "/" + handledIds.length + " okBatches=" + okBatchIdx.size + "/" + buckets.length);
+              }
+            } catch (ePB) { cwarn("[dsh-memory] 逐批记账失败:", ePB && ePB.message ? ePB.message : String(ePB)); }
+          }
           if (doneOk) {
-            try { handledIds.forEach((id) => { ARCHIVED_SESSIONS.add(id); const m = batchFrames.get(id); if (m && typeof m.frames === "number") ARCHIVE_WATERMARK.set(id, { frames: m.frames, round: m.round, at: Date.now() }); }); ARCHIVE_WM_DIRTY = false; saveStaleNotified(); } catch (e) {}
+            try {
+              handledIds.forEach((id) => {
+                ARCHIVED_SESSIONS.add(id);
+                const m = batchFrames.get(id);
+                // v2.8.4（P14/P15）：水位记 **`consumedFrames`（已消费帧数）**，不再是文件总帧数；
+                //   `incomplete` 随账本落盘 ⇒ 下一轮 `shouldReArchive` 会放行该会话**从该帧续跑**。
+                // v2.8.4（P18）：水位条目**随身携带内容见证** —— 事后查"这个 sid 为什么被判已归档"时，
+                //   账本自己就能回答（written N 字 / declared-skip / dropped 原因+被丢字数），不靠推断。
+                if (m && typeof m.frames === "number") ARCHIVE_WATERMARK.set(id, { frames: m.frames, round: m.round, at: Date.now(), incomplete: !!m.incomplete, byFile: m.byFile || null, witness: LAST_ARCHIVE_WITNESS.get(id) || null });
+              });
+              ARCHIVE_WM_DIRTY = false; saveStaleNotified();
+            } catch (e) {}
             try {
               const remain = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && archivePendingEntry(s)).length;
-              if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") HOST_SETTINGS_SCOPE.update({ staleCount: remain }).catch(() => {});
+              LIVE_STATS.staleCount = remain;   // [2026-09-23] scope 通道退役，随 stats.json 下发
               saveStaleNotified();
             } catch (e) {}
             try {
@@ -5469,19 +8557,41 @@ export default {
           clog("[dsh-memory] 漏网归档完成: " + buckets.length + " 批/" + flowSessions.length + " 会话（" + archNote + "）");
           const sdir2 = findNewestSpawnedSession(startedAt);
           if (sdir2) {
-            const u2 = summarizeSubagentUsage(sdir2);
-            if (u2) { clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟"); trackMaintain("arch", u2); }
+            const u2 = await summarizeSubagentUsageRetry(sdir2);   // §9.12④：读不到 usage 时有界重试（≤4 次 × 1.5s）
+            if (u2) { clog("[dsh-memory] 归档消耗: 总输入 " + (u2.totalIn || u2.input) + " tokens（其中缓存命中 " + u2.cache + "）| 输出 " + u2.output + (u2.reasoning > 0 ? " | 推理 " + u2.reasoning : "") + " tokens | 总时长 " + u2.durMin + " 分钟" + (u2.usageEmpty ? "（⚠️ usage 读取失败：重试 " + u2.usageRetry + " 次仍无 usage，账本记 usageEmpty=true，**别当成 0 消耗**）" : (u2.usageRetry > 1 ? "（读取重试 " + u2.usageRetry + " 次）" : ""))); trackMaintain("arch", u2); 
+              // v2.8.4（自动归档包⑤）：每轮 token 消耗**入账**（原来只有 clog —— 控制台一滚就再也查不到"这轮花了多少"）
+              try {
+                const stT = readIntegrateState() || {};
+                stT.archiveTokenLast = { at: Date.now(), inT: u2.totalIn || u2.input || 0, cacheT: u2.cache || 0, outT: u2.output || 0, durMin: u2.durMin || 0, usageRetry: u2.usageRetry || 1, usageReadAt: u2.usageReadAt || Date.now(), usageEmpty: u2.usageEmpty === true };
+                writeIntegrateState(stT);
+              } catch (e) {}
+            } else {
+              // §9.12④：**读不到也要留痕**（旧实现这里静默——账本连"这轮没读到"都不知道，于是 0 消耗与"没读"不可区分）
+              try {
+                const stT0 = readIntegrateState() || {};
+                stT0.archiveTokenLast = { at: Date.now(), inT: 0, cacheT: 0, outT: 0, durMin: 0, usageEmpty: true, usageRetry: USAGE_RETRY_N };
+                writeIntegrateState(stT0);
+              } catch (e) {}
+              cwarn("[dsh-memory] 归档消耗读取失败：子代理会话日志在重试 " + USAGE_RETRY_N + " 次后仍无 usage（账本记 usageEmpty=true，别当成 0 消耗）");
+            }
           }
           // v2.4.7.1: done 的 resolve 值给 runDreamPipeline 的 Promise.race([r.done, 25min]) 直接可读
-          return doneOk ? "已落盘+A5通过" : (!allOk ? "批失败未消号（留待下轮）" : (LAST_ARCHIVE_WROTE_AT >= startedAt ? "已落盘但A5未全覆盖" : "未落盘"));
+          // ★ B3（2026-10-07 现场：备注「已归档 4 个」而 written=3）：结算串必须自带本轮**真实去向**
+          //   （written/skip/dropped），否则调用方只能拿"派发数"当"已归档数"。
+          const _wz = summarizeArchiveWitness(Array.from(LAST_ARCHIVE_WITNESS.entries()), LAST_ARCHIVE_A5_OK);
+          const _cnt = "（落盘 " + _wz.written + "/" + flowSessions.length + " 个"
+            + (_wz.declaredSkip ? "、声明跳过 " + _wz.declaredSkip : "") + (_wz.dropped ? "、机制丢弃 " + _wz.dropped : "") + "）";
+          return (doneOk ? "已落盘+A5通过" : (!allOk ? "批失败未消号（留待下轮）" : (LAST_ARCHIVE_WROTE_AT >= startedAt ? "已落盘但A5未全覆盖" : "未落盘"))) + _cnt;
         } catch (e) {
           monitorEvent("archive", "settled mode=exception err=" + (e && e.message ? e.message : String(e)));
           cwarn("[dsh-memory] 漏网归档结算异常:", e && e.message ? e.message : String(e));
           return "结算异常";
         } finally {
           STALE_RUNNING = false;   // v2.4.7.1: 互斥随结算链复位（发起段返回后仍有子代理在途，期间禁止二次发起）
+          STALE_ACTIVE_DONE = null;   // v2.6.6: 结算链结束 → 摘句柄（等待者此刻已被唤醒并已可读账本）
         }
       })();
+      STALE_ACTIVE_DONE = settle;   // v2.6.6: 暴露结算链句柄（手动 /dream 撞车时等它结算完再补一轮归档）
       return { ok: true, count: flowSessions.length, overflow: overflow, done: settle, handled: handledIds, started: handles.length, startFailed: startErrs.length };
     }
 
@@ -5647,14 +8757,7 @@ export default {
       return out.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
     }
 
-    // v7：UTF-8 字节数（沙箱无 Buffer，用 TextEncoder）
-    function utf8Bytes(text) {
-      try {
-        return new TextEncoder().encode(text).length;
-      } catch (e) {
-        return text.length;
-      }
-    }
+    // v2.6.7：utf8Bytes 已提级到模块级（见文件头 CHAR_LIMIT 之前）——闭包内副本删除，防两处实现漂移
 
     // v7：软性维护阈值（字节，超过=该整理了，仅告警不截断）——常量已提级到模块级（见 PROJECT_CHAR_SOFT 后，CHAR_LIMIT/SIZE_WARN 同源注释）
     const ROTATE_DAYS = 30;
@@ -5677,9 +8780,15 @@ export default {
           const _stripTxt = layer.indexOf("会话层") === 0 ? stripCompactionDumps(text) : null;
           const layerChars = _stripTxt ? _stripTxt.length : text.length;
           const layerBytes = _stripTxt ? utf8Bytes(_stripTxt) : bytes;
-          const key = rel === "global.md" ? "global.md" : rel === "index.md" ? "index.md" : "summary";
-          const byteWarn = SIZE_WARN[key] !== undefined ? SIZE_WARN[key] : SIZE_WARN.summary;
-          const charLimit = CHAR_LIMIT[key] !== undefined ? CHAR_LIMIT[key] : CHAR_LIMIT.summary;
+          // v2.6.8（P5.1-5）：按 CHAR_LIMIT 表查 key（hasOwnProperty 保原型键防护）——一处同时修正面板与本函数下游的口径
+          const key = Object.prototype.hasOwnProperty.call(CHAR_LIMIT, rel) ? rel : "summary";
+          // v2.6.7（W1）：阈值统一走 limitOf（同一真源）；新增 warnChars/clearChars/nearHard 供面板显示「近限」。
+          //   ⚠ 本函数对会话层用「剥 dump 后」的 layerChars/layerBytes（v2.4.22 用户拍板口径）——**不可**改用
+          //   sizeStateOf(raw)，否则会复活当时修掉的 dump 误报。
+          const byteWarn = limitOf(key, SIZE_WARN);
+          const charLimit = limitOf(key, CHAR_LIMIT);
+          const warnChars = warnCharsOf(key);
+          const clearChars = clearCharsOf(key);
           // 过期复核：解析文件头「最后更新」日期行（>180 天）
           let stale = false;
           try {
@@ -5687,27 +8796,38 @@ export default {
             const dm = stampLine.match(/([0-9]{4})-([0-9]{2})-([0-9]{2})/);
             if (dm) { const dt = new Date(dm[1], dm[2] - 1, dm[3]).getTime(); if (dt < cutoff && dt > 0) stale = true; }
           } catch (e0) {}
-          collected.push({ rel, layer, bytes, chars: layerChars, byteWarn, charLimit, overSoft: layerBytes > byteWarn, overHard: layerChars > charLimit, mtime: stt.mtimeMs, stale });
+          collected.push({ rel, layer, bytes, chars: layerChars, byteWarn, charLimit, warnChars, clearChars, overSoft: layerBytes > byteWarn, overHard: layerChars > charLimit, nearHard: layerChars <= charLimit && layerChars >= warnChars, mtime: stt.mtimeMs, stale });
         } catch (e) {}
       };
       // 稳定层 + 工具层 + 项目层 + 知识层
       addFile("global.md", "稳定层"); addFile("index.md", "稳定层");
+      // v2.7.0（拆 fixed）：面板原 addFile("fixed.md", "耐久层") 已删除（层不存在 → 不再出现在文档状态里）
       for (const tool of safeLs("tools")) addFile("tools/" + tool, "工具层");
       for (const proj of safeLs("projects")) addFile("projects/" + proj, "项目层");
       for (const kn of safeLs("knowledge")) addFile("knowledge/" + kn, "知识层");
-      // 会话层：今日 + 最近 3 份（按 mtime）
+      // 会话层：今日 + 最近 3 个「非空」日文件（按文件名日期倒序）
+      // v2.5.6 修复「面板看起来只有两天的日文件」：旧口径按 mtime 取最近 3 份——30 天轮转把过期文件复制进
+      //   sessions/archive/ 后清空原文件会刷新其 mtime，0 字节的已轮转文件（实证 sessions/2026-08-14.md）
+      //   于是挤占名额，把 09-11/09-10 等真文件顶掉；合并维护重写历史文件同样会刷 mtime。
+      //   现改为：排除空文件 + 按文件名日期排序（mtime 不再参与）+ 输出总量提示（防「只列几条=文件丢了」误判）。
+      const layerNotes = {};
       try {
         const todayName = dateStr(new Date()) + ".md";
-        const sess = safeLs("sessions").filter((f) => f.endsWith(".md") && f !== todayName);
-        sess.sort((a, b) => { const sa = fs.statSync(portable(MEMORY_ROOT + "/sessions/" + a)).mtimeMs, sb = fs.statSync(portable(MEMORY_ROOT + "/sessions/" + b)).mtimeMs; return sb - sa; });
-        const picks = sess.slice(0, 3);
+        const allDays = safeLs("sessions").filter((f) => /^[0-9]{4}-[0-9]{2}-[0-9]{2}\.md$/.test(f)).sort();
+        const nonEmpty = allDays.filter((f) => { try { return fs.statSync(portable(MEMORY_ROOT + "/sessions/" + f)).size > 0; } catch (e) { return false; } });
+        const picks = nonEmpty.filter((f) => f !== todayName).slice(-3).reverse();
         addFile("sessions/" + todayName, "会话层（今日）");
         for (const f of picks) addFile("sessions/" + f, "会话层");
+        if (allDays.length) {
+          const emptyN = allDays.length - nonEmpty.length;
+          layerNotes["会话层"] = "sessions/ 共 " + allDays.length + " 个日文件（" + allDays[0].slice(0, 10) + " ~ " + allDays[allDays.length - 1].slice(0, 10) + "）"
+            + "；本卡只列今日 + 最近 3 份" + (emptyN ? "，另有 " + emptyN + " 个已轮转为空（原文在 sessions/archive/）" : "");
+        }
       } catch (e) {}
       // 按层归组
       const byLayer = {};
       for (const d of collected) { (byLayer[d.layer] = byLayer[d.layer] || []).push(d); }
-      for (const layer of Object.keys(byLayer)) docSections.push({ layer, docs: byLayer[layer] });
+      for (const layer of Object.keys(byLayer)) docSections.push({ layer, docs: byLayer[layer], note: layerNotes[layer] || "" });
       return docSections;
     }
     // 目录安全读取（点文件/状态账本排除）
@@ -5743,15 +8863,21 @@ export default {
       const issues = [];
       const check = async (label, key, raw) => {
         if (!raw) return null;
-        const bytes = utf8Bytes(raw);
-        const chars = raw.length;
-        const byteWarn = SIZE_WARN[key] !== undefined ? SIZE_WARN[key] : SIZE_WARN.summary;
-        const charLimit = CHAR_LIMIT[key] !== undefined ? CHAR_LIMIT[key] : CHAR_LIMIT.summary;
-        // 软超（字节>软阈值）或硬超（字符>硬预算）都提示；标注是否已截断
-        if (bytes > byteWarn || chars > charLimit) {
-          return { label, key, bytes, byteWarn, chars, charLimit, truncated: chars > charLimit };
-        }
-        return null;
+        const st = sizeStateOf(key, raw);
+        // v2.6.7（W1）：三态 —— 硬超（字符 > 硬预算，注入已按节截断）/ 近限（字符 ≥ 硬预算×0.9）/ 字节兜底。
+        //   ⚠ⓐ `truncated` 字段名与语义**必须保持不变**：下游 L8288（超限摘要强制入 dream 候选）与 L8576
+        //      （整合健康）依赖它；把 nearHard 混入 truncated 会导致**每轮强制 spawn 整合子代理**。
+        //   ⚠ⓑ 旧版 OR 含 `chars > charLimit`，故「已超硬预算」本就是可达的；本改动补的是 **近限带**与
+        //      ASCII 密集文件的字节不可达，不是新增「超限」这一态。
+        if (!(st.overHard || st.nearHard || st.overSoft)) return null;
+        return {
+          label, key,
+          bytes: st.bytes, byteWarn: st.byteWarn,
+          chars: st.chars, charLimit: st.charLimit,
+          warnChars: st.warnChars, clearChars: st.clearChars,
+          near: st.nearHard,
+          truncated: st.overHard,   // 语义锚点：仅「字符 > 硬预算」
+        };
       };
       const globalRaw = await readText(MEMORY_ROOT + "/global.md");
       const indexRaw = await readText(MEMORY_ROOT + "/index.md");
@@ -5759,6 +8885,7 @@ export default {
       if (g) issues.push(g);
       const i = await check("index.md", "index.md", indexRaw);
       if (i) issues.push(i);
+      // v2.7.0（拆 fixed）：原「耐久层纳入 /dream 健康体检」三行（readText fixed.md → check → issues.push）已删除。
       const latest = await latestSessionSummary();
       if (latest && latest.text) {
         // v2.4.4（A）：剥 intent 块后计数（与 needMaintenanceMerge/注入面收敛口径一致）
@@ -5816,7 +8943,28 @@ export default {
         try {
           fs.mkdirSync(arcDir, { recursive: true });
           const arcFull = arcDir + "/" + name;
-          fs.copyFileSync(srcFull, arcFull);
+          // ═══ v2.6.8（P1/④）轮转副本完整性校验 ═══
+          // 旧实现只校验"源已清空"（下一行的 back !== ""），**从不校验副本**——这正是 2026-08-31 原文变 867B 空壳
+          //   （事故①）的机制缺口：复制若失败/半截，源照样被清空，库里就只剩坏副本。
+          // 并发注意：arcFull 是固定名，归档子代理可能正在覆写它 → 取"复制前源 hash"与"复制后副本 hash"比对；
+          //   ⚠ hash 必须在清空**之前**取（写在清空之后 → 全库恒判不一致 → sessions 永不轮转、静默堆积）。
+          // 不一致先重试一次（覆盖并发瞬时态）；仍不一致则**不清空源**并留 monitor 事件（源在 → 下轮会重选，非永久卡死）。
+          const shaOf = (p) => createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+          let copyOk = false, copyErr = "";
+          for (let attempt = 0; attempt < 2 && !copyOk; attempt++) {
+            try {
+              const srcHash = shaOf(srcFull);
+              fs.copyFileSync(srcFull, arcFull);
+              if (shaOf(arcFull) === srcHash) copyOk = true;
+              else copyErr = "副本 sha 不一致";
+            } catch (eA) { copyErr = (eA && eA.message ? String(eA.message) : "复制异常").slice(0, 40); }
+          }
+          if (!copyOk) {
+            failed.push(name + "(" + copyErr + "，源未清空)");
+            try { monitorEvent("archive", "rotate-copy-mismatch file=" + name); } catch (eM) {}
+            cwarn("[dsh-memory] 轮转副本校验失败，已跳过清空: " + name + " - " + copyErr);
+            continue;
+          }
           // 原文先读（复制后清空，防占位/并发读到空）
           fs.writeFileSync(srcFull, "", "utf8");
           const back = fs.readFileSync(srcFull, "utf8");
@@ -5856,12 +9004,34 @@ export default {
       // 底座 3：根目录 global/index（与 fixedTargets 按 file 去重，fixed 优先）
       put("global.md", "全局画像");
       put("index.md", "记忆索引");
+      // §9.12③（2026-09-19 **自捕 + 评审整改**）：字面量落点**定在 `knowledge/字面量.md`**，因此**不需要**在这里
+      //   登记特例 —— `listMdNames("knowledge")` 会把它自动收进候选集。★ 我第一版落在**根目录** `literals.md`，
+      //   并在文档/工具描述/任务书里写"记忆库里的 .md ⇒ memory_search 天然覆盖"，**那是错的**：候选集是
+      //   **白名单式枚举**（knowledge/ tools/ projects/ sessions/ + 根目录 global/index）⇒ 根目录新增的 .md
+      //   一律看不见（写了却搜不到＝等于白写）。提案人席独立复核也指出了同一点，并建议改落点（本条即采纳）。
+      //   保留这句注释是为了**防止有人"顺手"把它挪回根目录**。见 `LITERALS_FILE` 定义处的三条理由。
+      // v2.7.0（拆 fixed）：原 put("fixed.md", "耐久事实") 已删除——检索候选集不再含该文件
       // 底座 4：sessions/ 近 7 天——0 结果引导文案承诺"查会话/sessions"，此前候选集里根本没有（断链三）
       const sessCutoff = Date.now() - 7 * 24 * 3600 * 1000;
       for (const name of await listMdNames("sessions")) {
         const m = /^(\d{4})-(\d{2})-(\d{2})\.md$/.exec(name);
         if (m && new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() >= sessCutoff) put("sessions/" + name, "会话摘要 " + name.slice(0, 10));
       }
+      // 底座 5（v2.6.8 / 提案①）：sessions/archive/ 全量纳入候选集
+      //   根因：轮转过去的旧摘要**从不在候选集**（本函数此前只扫 sessions/ 直下），而指针闭合闸（L8751）
+      //   却叫模型去指 sessions/archive/… ⇒「指针指得到、检索够不着」。实测盲区 252,902 字符
+      //   ＝ sessions 总量 373,727 的 67.7%（顶层失联 26 文件 127,135 + archive 10 文件 125,767）。
+      //   纪律：只加"可搜"、**不动任何排序权重**；label 加「归档 」前缀（与顶层日档同名时靠 label 区分）；
+      //   size > 200 才收（过滤 0 B 已轮转空档与纯说明页这类噪声）。
+      try {
+        for (const name of await listMdNames("sessions/archive")) {
+          if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(name)) continue;
+          let szA = 0;
+          try { szA = fs.statSync(portable(MEMORY_ROOT + "/sessions/archive/" + name)).size; } catch (eS) { continue; }
+          if (szA <= 200) continue;
+          put("sessions/archive/" + name, "归档 " + name.slice(0, 10));
+        }
+      } catch (eArc) {}
       // 增强：index.md 解析出的中文主题词按 basename 对应覆盖 label；
       //   兼容「一行多条目｜分隔」与省略 .md 后缀两种书写；对应不上真实文件的条目直接丢弃（不再产生幽灵候选）。
       try {
@@ -5952,6 +9122,69 @@ export default {
       return { score, hitLines };
     }
 
+    // v2.8.6（2026-09-27）：记忆**时间衰减 + 重要度 + 时间窗**（B 档）。
+    //   动因：检索此前是**纯词频**，三年前的条目与昨天的同权——学术侧实测「时间感知查询扩展 +6.8~11.3%」、
+    //   多键索引 recall@k +9.4%（LongMemEval）；Generative Agents 的 `0.995^Δt(小时)` + LLM 重要度打分
+    //   是主流三件套（另一支 MemoryBank 用 `R=e^(−t/S)`，复习增大 S 减缓衰减）。
+    //   设计原则：**只做重排、不改打分量级**——衰减乘子落在 [DECAY_FLOOR, 1]，不制造「新条目碾压相关条目」。
+    //   frontmatter 可选（缺省 = 中性 1.0，与旧行为等价）；解析失败一律中性，绝不因元数据坏而丢结果。
+    const DECAY_PER_HOUR = 0.995;   // Generative Agents 同源：每小时保留 99.5%
+    const DECAY_FLOOR = 0.70;       // 衰减下限——再旧的条目也不会被压到 0.7 以下（防「老但关键」被埋）
+    const IMPORTANCE_MIN = 1, IMPORTANCE_MAX = 10;
+
+    // 解析可选 YAML frontmatter（只认平铺 key: value；**不引 yaml 依赖**，坏格式返回空对象）
+    function parseFrontmatter(text) {
+      const out = {};
+      if (!text || !text.startsWith("---")) return out;
+      const end = text.indexOf("\n---", 3);
+      if (end < 0) return out;
+      for (const line of text.slice(3, end).split("\n")) {
+        const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$/);
+        if (!m) continue;
+        out[m[1]] = m[2].replace(/^["']|["']$/g, "");
+      }
+      return out;
+    }
+
+    // 衰减乘子：以 last_used（缺省 created，再缺省文件 mtime）为基准
+    function decayFactor(fm, mtimeMs) {
+      let baseMs = NaN;
+      for (const k of ["last_used", "updated", "created"]) {
+        if (fm[k]) { const t = Date.parse(fm[k]); if (!isNaN(t)) { baseMs = t; break; } }
+      }
+      if (isNaN(baseMs)) {
+        if (!mtimeMs || !isFinite(mtimeMs)) return 1;   // 无任何时间信号 ⇒ 中性（旧行为）
+        baseMs = mtimeMs;
+      }
+      const hours = Math.max(0, (Date.now() - baseMs) / 3600000);
+      return Math.max(DECAY_FLOOR, Math.pow(DECAY_PER_HOUR, hours));
+    }
+
+    // 重要度乘子：importance 1~10 ⇒ 0.9~1.1（**温和**，避免元数据主导排序）
+    function importanceFactor(fm) {
+      const n = Number(fm.importance);
+      if (!isFinite(n) || n < IMPORTANCE_MIN || n > IMPORTANCE_MAX) return 1;
+      return 0.9 + (n - IMPORTANCE_MIN) / (IMPORTANCE_MAX - IMPORTANCE_MIN) * 0.2;
+    }
+
+    // 时间窗：query 含「最近/上次/刚才/近期/昨天/上次说」等 ⇒ 收集近 N 天条目的文件名集合供加权
+    const RECENCY_QUERY_RE = /(最近|上次|近期|刚才|最新|昨天|前天|这几天|上次说)/;
+    const RECENCY_WINDOW_DAYS = 30;
+    function isRecencyQuery(q) { return RECENCY_QUERY_RE.test(String(q || "")); }
+    function recentnessFactor(fm, mtimeMs, recencyQuery) {
+      if (!recencyQuery) return 1;
+      let baseMs = NaN;
+      for (const k of ["last_used", "updated", "created"]) {
+        if (fm[k]) { const t = Date.parse(fm[k]); if (!isNaN(t)) { baseMs = t; break; } }
+      }
+      if (isNaN(baseMs)) baseMs = mtimeMs;
+      if (!baseMs || !isFinite(baseMs)) return 1;
+      const days = (Date.now() - baseMs) / 86400000;
+      if (days > RECENCY_WINDOW_DAYS) return 1;
+      return 1 + 0.15 * (1 - days / RECENCY_WINDOW_DAYS);   // 近 30 天内线性加成，最多 +15%
+    }
+
+
     // v12：知识文件过期复核（只读）——解析文件头"最后更新: YYYY-MM-DD"，
     //   超过 STALE_DAYS 天未更新的文件列入提醒清单（内容级过期信号，替代不可用的 mtime）。
     //   无日期标记的文件不提醒（不强制标注）；最多返回 5 个最旧的。
@@ -6008,8 +9241,13 @@ export default {
           const pairs = [];
           for (const line of idxText.split("\n")) {
             for (const seg of line.split("｜")) {
-              const m = seg.trim().match(/^(?:-\s*)?(.+?)\s*→\s*([^\s（）()|]+)$/);
-              if (m && !m[2].includes("/")) pairs.push({ word: m[1].trim(), base: m[2].replace(/\.md$/i, "").toLowerCase() });
+              // v2.8.5：正则与 buildMemoryHintTable 同源收紧（name 组禁 ｜/→），否则新格式行（含 `何时:`）
+              //   会被 m[1] 整段吃成搜索词 ⇒ 自检 P3 抽样失真。
+              const m = seg.trim().match(/^(?:-\s*)?([^｜→]+?)\s*→\s*([^\s（）()|]+)$/);
+              if (!m) continue;
+              // 触发语段不参与对账（它是路由提示，不是关键词）
+              const word = m[1].includes("何时:") ? m[1].slice(0, m[1].indexOf("何时:")).replace(/[（(]\s*$/, "").trim() : m[1].trim();
+              if (word && !m[2].includes("/")) pairs.push({ word, base: m[2].replace(/\.md$/i, "").toLowerCase() });
             }
           }
           const cache = new Map();
@@ -6021,7 +9259,8 @@ export default {
               if (!cache.has(t.file)) cache.set(t.file, await readText(MEMORY_ROOT + "/" + t.file) || "");
               const text = cache.get(t.file);
               if (!text) continue;
-              const r = scoreTarget(t, text.toLowerCase(), tokens, (t.label || "").toLowerCase(), t.file.toLowerCase());
+              // v2.8.5：与主检索同源——scoreTarget 只接受 (t, text, tokens)，此前多传 2 个参数被静默忽略
+              const r = scoreTarget(t, text, tokens);
               if (r.score > 0) results.push({ f: t.file.toLowerCase(), s: r.score });
             }
             results.sort((a, b) => b.s - a.s);
@@ -6080,11 +9319,25 @@ export default {
         fs.writeFileSync(BACKUP_ROOT + "/.last", String(Date.now()), "utf8");
         // 保留策略：目录名即时间序，超出 BACKUP_KEEP 的最旧快照直接删除
         const snaps = fs.readdirSync(BACKUP_ROOT).filter((n) => /^\d{8}_\d{4}$/.test(n)).sort();
-        let removed = 0;
+        let removed = 0, chilled = 0;
+        // ═══ v2.6.8（P1/④）最旧快照转冷档，不再直接删 ═══
+        // 动机：BACKUP_KEEP=4 × 7 天 ≈ 只覆盖一个月，超期即无快照（事故③的暴露面）。
+        //   cold/ 不匹配 ^\d{8}_\d{4}$ → 不计入保留份数、不会被二次清理。
+        // 顺序纪律：复制 → 校验目标完整 → **才**删原档（"先删源后校验"正是本轮 P1 要修的同类缺陷）。
+        const coldDir = BACKUP_ROOT + "/cold";
         for (const s of snaps.slice(0, Math.max(0, snaps.length - BACKUP_KEEP))) {
-          try { fs.rmSync(BACKUP_ROOT + "/" + s, { recursive: true, force: true }); removed++; } catch (e) {}
+          try {
+            fs.mkdirSync(coldDir, { recursive: true });
+            const srcC = BACKUP_ROOT + "/" + s, dstC = coldDir + "/" + s;
+            copyRec(srcC, dstC);
+            if (!fs.existsSync(dstC + "/global.md")) throw new Error("冷档缺 global.md");
+            fs.rmSync(srcC, { recursive: true, force: true });
+            chilled++; removed++;
+          } catch (eC) {
+            cwarn("[dsh-memory] 冷档转移失败（原档保留）: " + s + " - " + (eC && eC.message ? eC.message : String(eC)));
+          }
         }
-        clog("[dsh-memory] 记忆库自动备份完成 → memory_backup/" + dir.split("/").pop() + "（" + copied + " 个文件；共 " + (snaps.length - removed) + " 份快照" + (removed ? "，清理最旧 " + removed + " 份" : "") + "）");
+        clog("[dsh-memory] 记忆库自动备份完成 → memory_backup/" + dir.split("/").pop() + "（" + copied + " 个文件；共 " + (snaps.length - removed) + " 份快照" + (removed ? "，清理最旧 " + removed + " 份（已转冷档 cold/）" : "") + "）");
         return { ok: true, dir, files: copied };
       } catch (e) {
         cerr("[dsh-memory] ⚠️ 自动备份失败:", e && e.message || e, "→ 本次降级为会话内人工提醒");
@@ -6167,11 +9420,13 @@ export default {
           const lines = manualIssues.map((i) => {
             const status = i.truncated
               ? "⚠️ 字符超硬预算，注入已截断（完整内容可用 memory_search 读取）"
-              : "⚠️ 字节超软阈值（未截断，但建议整理）";
+              : (i.near
+                ? "⚠️ 接近硬限，再增内容即触发按节截断（告警线 " + i.warnChars + "，剩 " + Math.max(0, i.charLimit - i.chars) + " 字符）"
+                : "⚠️ 字节超兜底线（未截断，但建议整理）");
             const fusedNote = (i.key === "summary" && i.isToday && todayFused)
               ? "（当日：合并维护已熔断——" + String((MAINT_RETRY && MAINT_RETRY.lastReason) || "?").slice(0, 20) + "×" + ((MAINT_RETRY && MAINT_RETRY.attempts) || "?") + "，未自动收敛）"
               : "";
-            return "- " + i.label + "：字节 " + i.bytes + "B（软阈值 " + i.byteWarn + "B）/ 字符 " + i.chars + "（硬预算 " + i.charLimit + "）→ " + status + fusedNote;
+            return "- " + i.label + "：字节 " + i.bytes + "B（兜底线 " + i.byteWarn + "B）/ 字符 " + i.chars + "（告警线 " + i.warnChars + " · 硬预算 " + i.charLimit + "）→ " + status + fusedNote;
           });
           const manualSuggest = sizeIssues.some((i) => i.key === "summary" && !i.isToday)
             ? "非当日摘要：把可下沉细节提升到 knowledge/ 或 projects/ 对应文件（合并维护只自动覆盖当日文件）"
@@ -6180,7 +9435,7 @@ export default {
             "【dsh-memory 超限整理提醒】以下记忆文件超限（阈值=软信号，预算=硬截断）：\n" +
             lines.join("\n") + "\n" +
             (todayFused ? "当日摘要：合并维护今日已熔断（" + String((MAINT_RETRY && MAINT_RETRY.lastReason) || "?").slice(0, 20) + "×" + ((MAINT_RETRY && MAINT_RETRY.attempts) || "?") + "），未自动收敛；可手动精简（写入走 memory_dream_patch），或等日切后自动恢复。\n" : "") +
-            "处理建议：1. " + manualSuggest + "；\n2. 精简写入统一走交付工具 memory_dream_patch（replace 全文件/delete 删条目，插件校验+原子写+回读；禁止 write/edit 直写记忆库——直写会被通道闸拒绝）；\n3. 目标 = 字节 < 软阈值 且 字符 < 硬预算。";
+            "处理建议：1. " + manualSuggest + "；\n2. 精简写入统一走交付工具 memory_dream_patch（replace 全文件/delete 删条目，插件校验+原子写+回读；注意 write/edit 直写会**绕过**插件校验——指针闭合闸/预算闸/回读核对都不生效，后果自负）；\n3. 目标 = 字符 < 告警线（global 2700 / index 1800 / 摘要 1350 = 硬预算×0.9）；只压到硬预算以内不算收敛（近限态仍常亮）。";
           parts.push(text);
         }
       }
@@ -6192,7 +9447,7 @@ export default {
         parts.push(
           "【dsh-memory 过期复核提醒】以下知识文件超过 " + STALE_DAYS + " 天未更新（依据文件头「最后更新」日期），请人工复核内容是否仍有效：\n" +
           staleLines.join("\n") + "\n" +
-          "处理：仍有效 → 用 memory_dream_patch 更新文件头日期；已过时 → 用 memory_dream_patch 精简归档或 delete 删除（文件删除后索引自动失效，无需其他操作；禁止 write/edit 直写——直写会被通道闸拒绝）。"
+          "处理：仍有效 → 用 memory_dream_patch 更新文件头日期；已过时 → 用 memory_dream_patch 精简归档或 delete 删除（文件删除后索引自动失效，无需其他操作；注意 write/edit 直写会绕过插件校验，后果自负）。"
         );
       }
 
@@ -6202,19 +9457,27 @@ export default {
       try {
         // v1.6.0：installAt 界限 —— 插件启用前创建的会话不触发整合
         const staleSessions = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
-          .filter((s) => archivePendingEntry(s) && !sessionMentionedInMemory(s.id));   // v1.12.19→v2.4.3：归档过的续聊出新帧会重入（水位判定），提醒去重仍归 STALE_NOTIFIED
+          .filter((s) => shouldReArchive(s, reArchiveOpts()));   // v2.8.4（P13/P15）：单一谓词（含 incomplete 续跑 + 可选 counterVer 旁路）；旁路默认关
         if (ARCHIVE_WM_DIRTY) { saveStaleNotified(); ARCHIVE_WM_DIRTY = false; }   // v2.4.3: 懒置基线顺带落盘
         if (staleSessions.length > 0) {
           if (PLUGIN_CFG.staleAction === "silent" && ZSTD_OK) {   // v2.0.9(M3): 无 zstd 能力禁止 silent 自动消号，落入 remind 分支
             // v1.12.8：单主子代理编排（无感）：插件提取消息流 → 一个主子代理自主判断/总结/落盘
             // v2.4.7.1（回归修复③）：此处 await 只到「提取+发起完成」（秒级），子代理结算在 settle 链后台跑，
             //   维护提醒注入不再被拖到子代理结束（实证旧路径一晚上把会话启动顶住 6 分 14 秒）。
-            const r = await runStaleArchive(staleSessions);
-            if (r.ok) {
+            const r = await runStaleSilentTick(Date.now());
+            if (r && r.ok) {
               clog("[dsh-memory] 漏网归档已发起：" + r.count + " 会话 / " + r.started + " 批（后台结算，完成后另出一条报告）" + (r.startFailed ? "，另有 " + r.startFailed + " 批发起失败留待下轮" : ""));
               if (r.overflow > 0) clog("[dsh-memory] 剩余 " + r.overflow + " 个漏网会话将在下次检查时处理");
+            } else if (r) {
+              // v2.8.4（可读信号）：不再静默 —— 没发起必须说清为什么（冷却中/候选未变/白轮退避/记忆链忙/无候选）
+              clog("[dsh-memory] 自动归档未发起（" + (r.why || r.reason || "?") + "）");
             }   // 消号 v1.12.19.1 起在子代理完成回调内执行（处置完成才消号）
-            // 未发起成功不标记 → 下次再处理          } else {
+            // 未发起成功不标记 → 下次再处理
+          } else {
+            // ⚠️ v2.8.4（§9.6 修正，**上游遗留缺陷**）：原实现把 `} else {` 写进了上一行的**行注释**里
+            //   ⇒ 这个 else 从未存在，整块提醒代码落在 `if (silent)` 的**内部分支**里。后果（实测两种档位都反）：
+            //     ① silent 档：除自动归档外**还会多注入一段漏网提醒**（重复、白占 token）
+            //     ② remind/approval 档：**永不注入**（死代码）—— 与该 if 上方注释声明的分派完全相反
             const remindList = staleSessions.filter((s) => !STALE_NOTIFIED.has(s.id));   // v1.12.19: 提醒去重回归 NOTIFIED 账本（防同实例刷屏）
             staleSessions.forEach((s) => STALE_NOTIFIED.add(s.id));   // 本实例内不再重复进入提醒候选
             if (remindList.length > 0) {
@@ -6230,21 +9493,49 @@ export default {
                 "【dsh-memory 漏网会话提醒】检测到 " + remindList.length + " 个会话超过 " + PLUGIN_CFG.staleSessionDays + " 天无交互、且其内容未在记忆库 sessions/ 中落档（可能从未被总结）：\n" +
                 lines.join("\n") + "\n" +
                 actionTxt + "\n" +
-                "（原始日志：~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd；同实例内只提示一次）"
+                "（原始日志：~/.dsh/sessions/<工作目录>/<会话id>/session.jsonl.zstd 或 session.v3.jsonl.zstd；同实例内只提示一次）"
               );
             }
           }
           // v1.4.0：更新只读统计（设置界面显示"未整合记忆会话数"）
           try {
-            if (HOST_SETTINGS_SCOPE && typeof HOST_SETTINGS_SCOPE.update === "function") {
-              const total = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && archivePendingEntry(s)).length;   // v2.4.3 增量重档：新帧未档的计入 staleCount
-              HOST_SETTINGS_SCOPE.update({ staleCount: total }).catch(() => {});
+            // [2026-09-23] scope 通道退役：staleCount 改走 LIVE_STATS，随 stats.json 下发
+            {
+              // v2.6.5: 面板「未整合记忆会话数」改用与手动 /dream 同口径（30 分钟活跃下限）——旧口径按
+              //   settings 天数，v3 隐形期该值显示 0，与真实积压 63 个严重不符（误导）。仅影响显示值，
+              //   自动归档与自动提醒仍按 PLUGIN_CFG.staleSessionDays（不扩大自动动作范围）。
+              const total = findStaleSessions(MANUAL_STALE_MIN_IDLE_MS / 86400000, getEnabledAt()).filter((s) => !sessionMentionedInMemory(s.id) && archivePendingEntry(s)).length;   // v2.4.3 增量重档：新帧未档的计入 staleCount
+              LIVE_STATS.staleCount = total;
             }
           } catch (e) { /* 统计更新失败不影响主流程 */ }
         }
       } catch (e) {
         cwarn("[dsh-memory] 漏网会话检测失败:", e && e.message ? e.message : String(e));
       }
+
+      // v2.6.5（自检·防再次静默失效）：会话日志文件名漂移 → 漏网检测/归档提取对该类会话整链隐形，
+      //   且不报错。DSH 曾于 2026-09-10 改名 session.jsonl.zstd → session.v3.jsonl.zstd，造成 6 天
+      //   静默失效（积压 63 个未落档会话）。此处把「未识别日志名」主动反馈到对话，按文件名去重。
+      try {
+        if (!fmtNotifiedLoaded) {
+          fmtNotifiedLoaded = true;
+          try { const s0 = readIntegrateState() || {}; (s0.fmtNotified || []).forEach((n) => FMT_NOTIFIED.add(n)); } catch (e2) { /* 忽略 */ }
+        }
+        // 确保采集跑过一遍（findStaleSessions 内 TTL 缓存命中则零额外成本）
+        try { findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt()); } catch (e2) { /* 忽略 */ }
+        const freshFmt = Array.from(UNKNOWN_LOG_NAMES.entries()).filter((en) => !FMT_NOTIFIED.has(en[0]));
+        if (freshFmt.length > 0) {
+          const fmtLines = freshFmt.map((en) => "- " + en[0] + "（" + en[1].count + " 个会话目录，如 " + String(en[1].sample).split(/[\\/]/).slice(-1)[0] + "）");
+          parts.push(
+            "【dsh-memory 自检·会话日志格式漂移】检测到未识别的会话日志文件名（既非 " + SESSION_LOG_CANDIDATES.join(" 也非 ") + "）：\n" +
+            fmtLines.join("\n") + "\n" +
+            "影响：这些会话不会被漏网检测/归档提取看到（DSH 曾把 session.jsonl.zstd 改名 session.v3.jsonl.zstd，导致 6 天静默失效、积压 63 个未落档会话，且无任何报错）。\n" +
+            "处理：把新文件名加入 index.js 顶部 SESSION_LOG_CANDIDATES（数组首位=最高优先级）后重新部署即可恢复。（同类提示按文件名只出现一次）"
+          );
+          freshFmt.forEach((en) => FMT_NOTIFIED.add(en[0]));
+          clog("[dsh-memory] 自检：发现未识别会话日志名 " + freshFmt.map((en) => en[0]).join(", ") + "（已提示一次）");
+        }
+      } catch (e) { /* 自检失败不影响主流程 */ }
 
       if (parts.length === 0) return;
       agent.inject(makeMessage(
@@ -6253,6 +9544,9 @@ export default {
       clog("[dsh-memory] 已注入维护提醒（" + parts.length + " 项）[会话: " + SESSION_LABEL + "]");
       saveStaleNotified();
     }
+    // v2.8.4（§9.6）：把该函数暴露给门 —— 否则"remind 档到底会不会注入漏网提醒"只能靠读源码，
+    //   而这次的缺陷恰恰是**读源码也容易看漏**（`} else {` 藏在行注释里）。行为断言才是真护栏。
+    __maintenanceInjectReminder = injectMaintenanceReminder;
 
     // v1.4.0：会话标识（日志关联用）—— 工作目录最后一段 + session id 前 8 位
     function sessionLabelOf(agent) {
@@ -6266,10 +9560,17 @@ export default {
       } catch (e) { return "?"; }
     }
 
-    ctx.on("agent/session-start", (payload) => {
+    // v2.6.3（DSH 0.1.6 适配，2026-09-15）：会话开始事件由 agent/session-start 改名为**异步串行**的 agent/created。
+    //   - 0.1.6-alpha.1 安装树全量搜索已无 "agent/session-start" 字符串（只有 agent/created）→ 挂旧名回调永不触发，
+    //     表现为「记忆自动注入整链静默失效」（稳定层/项目记忆/压缩点/维护提醒/初始化引导全部不注入），且无任何报错。
+    //   - payload 仍为 { agent, source, signal }，source ∈ startup|resume|clear|compact；本回调只用 agent，语义不变：
+    //     非顶层会话继续由 isTopLevelSession 过滤；恢复会话仍走 injectSnapshot 三档（文件未变=静默，不破坏前缀缓存）。
+    //   - agent/created 是**串行 await** 的初始化事件（创建事务会等监听器返回）：本回调同步返回、异步链 fire-and-forget
+    //     且内部全 try/catch（见下方 IIFE），绝不向创建事务抛错（监听器抛错会导致 agent 创建回滚）。
+    ctx.on("agent/created", (payload) => {
       const agent = payload.agent;
       if (!agent || typeof agent.inject !== "function") {
-        cerr("[dsh-memory] session-start: agent.inject 不可用");
+        cerr("[dsh-memory] agent/created: agent.inject 不可用");
         return;
       }
       // v1.4.0：本会话标识（所有注入日志关联显示）
@@ -6294,11 +9595,23 @@ export default {
           const globalMd = stabilize(globalRaw);
           const indexMd = stabilize(indexRaw);
           // v7：超限预警（提醒该整理了）
-          if (globalRaw && utf8Bytes(globalRaw) > SIZE_WARN["global.md"]) {
-            sizeWarnThrottled("global.md", "global.md 超限 " + utf8Bytes(globalRaw) + "B（阈值 " + SIZE_WARN["global.md"] + "B），建议整理提升[会话: " + SESSION_LABEL + "]");
+          // v2.6.7（W1）：改**字符口径三态**（接近硬限 / 已超硬预算 / 字节兜底）——旧版纯字节条件对 ASCII 密集
+          //   文件整条不可达（index 实测 1.857 B/字符，需 >2.304 才可能先响）；文案亦修正旧模板「超限 3645B（阈值 4608B）」的自相矛盾。
+          const sizeWarnMsg = (rel, st) => {
+            const state = st.overHard
+              ? "已超硬预算（注入已被截断）"
+              : (st.nearHard ? "接近硬限（剩 " + Math.max(0, st.charLimit - st.chars) + " 字符）" : "字节超兜底线");
+            return rel + " " + state + "：字符 " + st.chars + "/" + st.charLimit + "（告警线 " + st.warnChars + "）· 字节 " +
+              st.bytes + "B（兜底线 " + st.byteWarn + "B），" + (rel === "global.md" ? "建议整理提升" : "建议精简") +
+              "[会话: " + SESSION_LABEL + "]";
+          };
+          if (globalRaw) {
+            const stG = sizeStateOf("global.md", globalRaw);
+            if (stG.overHard || stG.nearHard || stG.overSoft) sizeWarnThrottled("global.md", sizeWarnMsg("global.md", stG));
           }
-          if (indexRaw && utf8Bytes(indexRaw) > SIZE_WARN["index.md"]) {
-            sizeWarnThrottled("index.md", "index.md 超限 " + utf8Bytes(indexRaw) + "B（阈值 " + SIZE_WARN["index.md"] + "B），建议精简[会话: " + SESSION_LABEL + "]");
+          if (indexRaw) {
+            const stI = sizeStateOf("index.md", indexRaw);
+            if (stI.overHard || stI.nearHard || stI.overSoft) sizeWarnThrottled("index.md", sizeWarnMsg("index.md", stI));
           }
           const stableParts = [];
           let gCut = "";   // v2.4.6：画像切片文本提升——画像重发必须与新会话逐字同款（前缀确定性）
@@ -6313,6 +9626,8 @@ export default {
             const i = sectionAwareSlice(indexMd, CHAR_LIMIT["index.md"], "index");
             stableParts.push("【记忆索引】\n" + i.text);
           }
+          // v2.7.0（拆 fixed）：原「耐久层 = 独立注入块（【固定要点】，记忆索引之后）」已删除。
+          //   fixed.md 层不再存在 → 稳定层注入只剩 global.md（画像）与 index.md（索引）两块。
           // ═══ v2.4.6（用户批准）恢复会话三档处理——处置按文件焊死、与变化幅度无关：═══
           //   三文件均未变 → 静默（不 append 任何字）；仅 index/摘要变 → 轻量更新通知；
           //   global.md 变 → 重发【用户画像】一份（与新会话逐字同款组装）+ 其余只通知；新会话（无快照）→ 照常全量。
@@ -6323,8 +9638,29 @@ export default {
           const hG = createHash("sha256").update(globalMd || "").digest("hex");
           const hI = createHash("sha256").update(indexMd || "").digest("hex");
           const hS = createHash("sha256").update((latest && latest.text) || "").digest("hex");
+          // v2.7.0（拆 fixed）：原 `hF`（耐久层 hash，供注入块 + mF 判定 + 快照共用）已随该层删除。
+          //   ⚠ 历史教训保留：v2.6.8 曾漏声明该 const → `注入异常: hF is not defined` 被注入链 catch 吞掉，
+          //   结构门 35/0 全绿也没抓到，只有行为门复现——凡动这一段务必跑 _test-fmt-selftest.mjs。
           // v2.4.17（项目记忆 P1-3）：项目块 hash（命中项目才计算；未命中 = ""，不参与判定）
           let hP = ""; let hPname = "";
+          // v2.6.2（工作空间自动建档，用户 2026-09-14 拍板）：放在 injectMode 分支**之前**——三档（full/notice/silent/global）
+          //   速率全都要建档（v2.6.2 首部署实证：续会话 injectMode=notice 时 old 位置整分支跳过致建档不触发）；
+          //   且先建档再算 hP → 首建会话 hP 即非空，快照 p 直接存骨架 hash，下轮不发假的「项目有更新」通知。
+          //   （骨架文档 + _index.json 登记 cwd + 种标记），随后本轮摘要分格/项目切片注入即按新项目生效。
+          if (TOPSESSION) {
+            try {
+              const _cwdB = (agent.session && ((agent.session.header && agent.session.header.cwd) || agent.session.cwd)) || "";
+              const boot = ensureProjectForCwd(_cwdB);
+              if (boot && boot.acted) {
+                const _bits = [];
+                if (boot.created) _bits.push("新建 projects/" + boot.file);
+                if (boot.registered) _bits.push("登记工作目录到项目索引");
+                if (boot.seeded) _bits.push("种 ~dsh/project.json 标记");
+                agent.inject(makeMessage("<system-reminder>\n【dsh-memory】本工作空间此前未命中项目记忆，已自动建档：" + _bits.join("；") + "。本会话起项目记忆照常注入；若目录名不适合作项目名，重命名 projects/" + boot.file + " 后同步 _index.json（file/workdirs）即可。\n</system-reminder>"));
+                injectedParts.push("项目建档(" + boot.file + ")");
+              }
+            } catch (eBoot) { cwarn("[dsh-memory] 工作空间自动建档失败:", eBoot && eBoot.message ? eBoot.message : String(eBoot)); }
+          }
           try {
             const _cw2 = (agent.session && ((agent.session.header && agent.session.header.cwd) || agent.session.cwd)) || "";
             const _mp2 = matchProjectByCwd(_cw2);
@@ -6378,8 +9714,13 @@ export default {
               cwarn("[dsh-memory] 稳定层为空（global/index 读取失败）");
             }   // v2.4.3.1：稳定层非空但 TOPSESSION=false（子代理故意零注入）→ 不再误报「读取失败」
             if (latest && latest.text && TOPSESSION) {   // v2.3.8 F1: 【最近一次会话压缩点】进子代理曾直接诱发 ghost 轮重写（756123d9 事故）
-              if (utf8Bytes(latest.text) > SIZE_WARN.summary) {
-                sizeWarnThrottled(latest.file, "摘要 " + latest.file + " 超限 " + utf8Bytes(latest.text) + "B（阈值 " + SIZE_WARN.summary + "B），建议精简[会话: " + SESSION_LABEL + "]");
+              // v2.6.7（W1）：摘要只报**字节**（被测量沿用「全文剥 dump」）——不在此打印字符，避免与
+              //   checkSizeOverflow 的「剥 intent 面」字符数形成「同一文件两个字符数」的新漂移；
+              //   近限/超限的字符口径判定改由 checkSizeOverflow 单一出口负责；计数口径本版不动（跨子系统，见 CHANGELOG）。
+              const stSum = sizeStateOf("summary", latest.text);
+              if (stSum.overSoft || stSum.overHard || stSum.nearHard) {
+                sizeWarnThrottled(latest.file, "摘要 " + latest.file + " 超字节兜底线 " + stSum.bytes + "B（兜底线 " +
+                  stSum.byteWarn + "B）" + (stSum.nearHard ? "，且已进入近限带" : "") + "，建议精简[会话: " + SESSION_LABEL + "]");
               }
               // v2.4.17（降噪 N1-3/三档一致）：当日文件才注入正文（三节优先）；非当日只发一行稳定通知（防跨天错配，不重发正文）
               if (latest.isToday) {
@@ -6461,7 +9802,7 @@ export default {
                   for (const pr of cands) {
                     let ptxt = null;
                     try { ptxt = fs.readFileSync(portable(MEMORY_ROOT + "/projects/" + pr.file), "utf8"); } catch (eR) { continue; }
-                    const psliced = sectionAwareSlice(ptxt, 2000, "projects/" + pr.file, { priority: ["Rules", "Architecture decisions", "Gotchas", "当前状态与下一步"] });
+                    const psliced = sectionAwareSlice(ptxt, 2000, "projects/" + pr.file, { priority: ["Rules", "Architecture decisions", "Gotchas", "当前状态与下一步", "Discovered durable knowledge"] });   // v2.6.8（P3）：耐久节进 priority，**追加末位**（红队实测：插 Rules 之后会把长沙「当前状态与下一步」612→207 字、发改委 Gotchas 557→73 字；末位为纯增益零回退。切片仍 2000 不上调）
                     const extra = mp.hits.length > 1 ? "（另有 " + (mp.hits.length - 1) + " 个项目目录可能相关）" : "";
                     agent.inject(makeMessage("<system-reminder>\n【项目记忆】" + pr.display + extra + "\n" + psliced.text + "\n</system-reminder>"));
                     injectedParts.push("项目(" + String(pr.display).slice(0, 20) + ")");
@@ -6549,7 +9890,7 @@ export default {
           WB.lastUserAt = Date.now();
           WB.stepsSinceUser = 0;
           // v2.6.0（D 级熔断）：用户新消息到达 → 熔断态全量复位（suspect 键清空、deny 计数归零、fullStop/连续计数清）——用户穿插视为在环，终止打转判定
-          if (WB.brk) { WB.brk.suspectKeys = new Set(); WB.brk.denyN = 0; WB.brk.fullStop = false; WB.brk.seq = 0; WB.brk.seqKey = ""; }
+          if (WB.brk) { WB.brk.suspectKeys = new Set(); WB.brk.denyN = 0; WB.brk.fullStop = false; WB.brk.seq = 0; WB.brk.seqKey = ""; WB.brk.lastRFp = ""; }
         } catch (e) {}
         // v1.12.10：检查/提醒解耦 —— 每条输入都跑关键词检查（免费）；提醒受两道闸：
         //   ① 冷却：距上次提醒至少隔 1 条用户输入（用户定：第 1 条提醒了，最早第 3 条再提醒）
@@ -6558,6 +9899,53 @@ export default {
         MEMORY_HINT_THROTTLE.set(sid, seq);
         const lastSeq = MEMORY_HINT_LAST_SEQ.get(sid) || -999;
         const inCooldown = (seq - lastSeq) < 2;
+        // ═══ v2.6.7（W2）：近限「按变化报」——补 W1 治不了的洞 ═══
+        // 为什么必须补：注入面超限提醒受 maintenanceInjected 闸（见 L6850）→ **每插件实例仅 1 次、且只在首个
+        //   顶层会话**；而实证事故是**会话中途**把 index.md 写到 2102 字符，那时闸早已消费完 → 只把告警线降到
+        //   1800 依然零信号（这正是 R1 方案的原错）。故此处改按「**变化**」报：
+        //   · 与上次水位比**长了 ≥30 字符**且已 ≥ 告警线 → 报一次（含"剩多少字符"）
+        //   · **不增长则静默**（不按状态常亮，避免 index 常年 1900+ 时变成墙上噪音）
+        //   · 已超硬限（注入正被按节截断）→ 首次越限即报，之后仅在水位继续增长时报
+        //   · 降到清除线下 → 复位水位（下次再长可再报）
+        //   水位持久化在 .integrate.json 的 nearHard 字段（跨重启/跨会话累计），内存另有 10 分钟/文件冷却。
+        let nearHardNote = "";
+        try {
+          const NH_GROWTH_MIN = 30;
+          const st0 = readIntegrateState() || {};
+          const ledger = (st0.nearHard && typeof st0.nearHard === "object") ? st0.nearHard : {};
+          const told = [];
+          let dirty = false;
+          // v2.6.9（P0·v2.6.8 缺陷修复，历史保留）：本处曾漏收敛（当年 `fixed.md` 收在两个内联数组里 → 不进水位数账本）。
+          //   v2.7.0 起 ROOT_FILES 只剩 global/index，统一由该常量驱动；顺序变化只影响提醒文案顺序，语义无关。
+          for (const rel of ROOT_FILES) {
+            let st = null;
+            try { st = sizeStateOf(rel, fs.readFileSync(portable(MEMORY_ROOT + "/" + rel), "utf8")); } catch (eR) { continue; }
+            const prev = (ledger[rel] && Number.isFinite(Number(ledger[rel].chars)))
+              ? { chars: Number(ledger[rel].chars), over: !!ledger[rel].over } : null;
+            if (st.chars < st.clearChars) {                 // 已精简到清除线下 → 复位，允许下次再长时再报
+              if (prev) { delete ledger[rel]; dirty = true; }
+              continue;
+            }
+            const grew = !!prev && (st.chars - prev.chars) >= NH_GROWTH_MIN;
+            const firstOver = st.overHard && !(prev && prev.over);
+            if ((firstOver || grew) && Date.now() - (NEAR_HARD_TOLD.get(rel) || 0) >= 600000) {
+              NEAR_HARD_TOLD.set(rel, Date.now());
+              told.push(st.overHard
+                ? "- " + rel + " **已超硬限**：" + st.chars + "/" + st.charLimit + " 字符，注入**已被按节截断**（每节均分切掉一部分）→ 建议立刻精简到 " + st.warnChars + " 字符以下"
+                : "- " + rel + " 接近硬限：" + st.chars + "/" + st.charLimit + "（告警线 " + st.warnChars + "，仅剩 " + (st.charLimit - st.chars) + " 字符）——较上次水位增加 " + (st.chars - (prev ? prev.chars : st.chars)) + " 字符");
+            }
+            const rec = { chars: st.chars, over: st.overHard };
+            if (!prev || prev.chars !== rec.chars || prev.over !== rec.over) { ledger[rel] = rec; dirty = true; }
+          }
+          if (dirty) { st0.nearHard = ledger; st0.updatedAt = Date.now(); writeIntegrateState(st0); }
+          if (told.length) {
+            nearHardNote = "<system-reminder>\n【dsh-memory 稳定层容量】\n" + told.join("\n") +
+              "\n（global/index 是每会话固定注入开销：超硬限不是丢尾行，而是每节被均分截断。精简流程：memory_size_preview 量准 → memory_dream_patch 落盘。）\n</system-reminder>";
+          }
+        } catch (eNH) { /* 容量检查失败不影响本轮提醒逻辑 */ }
+        if (nearHardNote && decision.kind === "enter") {
+          return { ...decision, messages: [...(decision.messages || []), makeMessage(nearHardNote)] };
+        }
         const userText = hintTextOf(messages);
         if (!userText) return decision;
         const hitsAll = matchMemoryHints(userText);
@@ -6580,7 +9968,8 @@ export default {
         } catch (e) { /* skills 服务不可用则只给记忆提示 */ }
 
         // v2.4.26（用户拍板）：skill 优先——命中技能时先加载技能按其流程；记忆仅背景参考。文案简要。
-        const memLines = memHits.map(h => "- 记忆: memory_search " + JSON.stringify(h.name) + "（" + h.file + "，踩坑/现成脚本/约定" + (h.parts && h.parts.length ? "；触发词: " + h.parts.join("、") : "") + "）").join("\n");
+        // v2.8.5：条目携「何时读」触发语时直接展示（模型据此判断该不该真去读，替代盲指针）。
+        const memLines = memHits.map(h => "- 记忆: memory_search " + JSON.stringify(h.name) + "（" + h.file + "，踩坑/现成脚本/约定" + (h.parts && h.parts.length ? "；触发词: " + h.parts.join("、") : "") + (h.trigger ? "；何时读: " + h.trigger : "") + "）").join("\n");
         const skillLine = skillHits.length > 0 ? "技能命中：" + skillHits.slice(0, 2).map((s) => "「" + s + "」先加载 SKILL.md 按其流程").join("；") + "。" : "";
         const hintText = "<system-reminder>\n【dsh-memory 提示】" +
           (skillLine || ("此任务可能涉及已知领域，先查再动手：\n" + memLines)) +
@@ -6618,10 +10007,17 @@ export default {
         const sid = (agent.session && agent.session.id) || "?";
         if (!sid || sid === "?") return decision;
         const pending = peekRegressionReminder(sid);
-        if (isPluginSubagent(sid) && !(pending && String(pending.sig).startsWith("PL:"))) return decision;    // v2.4.27：插件子代理默认不消费（隔离）；v2.4.32：PL: 前缀（预算打转 MILD/STRONG）放行——dream/归档子代理无用户回合，仅此通道可达
+        if (isPluginSubagent(sid) && !(pending && String(pending.sig).startsWith("PL:"))) {
+          // v3.2.0（Wave 0）：被 kind 闸拦下的提醒也要留痕——否则"放行但未注入"与"被 batch/cooldown 拦"永久分不开
+          //   （红队 03 阶段2 明列的残余类别）。cls 取 sig 前缀（D:loop / E:loop / W:noop / PL:…）。
+          if (pending) recordGate(String(pending.sig || "?").split(":")[0] || "?", "kind", sid);
+          return decision;
+        }
         if (!pending) return decision;
         if (decision.kind !== "enter") return decision;    // reject 决策无 messages，透传不注入
         dequeueRegressionReminder(sid);
+        // v3.2.0（Wave 0）：消费留痕——ok 只代表"闸门放行"，consumed 才代表"真注入当轮请求"。
+        recordGate(String(pending.sig || "?").split(":")[0] || "?", "consumed", sid);
         const hintMsg = makeMessage(pending.text);
         return { ...decision, messages: [...(decision.messages || []), hintMsg] };
       } catch (e) {
@@ -6661,7 +10057,7 @@ ctx.on("tools/result", (exec, result) => {
       // v1.12.0：监控记录 + 判断 B/C
       try {
         if (!exec || !result) return;
-        const toolName = exec.tool || exec.name || "other";
+        const toolName = exec.name || exec.tool || "other";   // [2026-09-23] ToolExecution 无 tool 字段（宿主 dsh-tools/types 实证）→ 原表达式恒落 "other"，key 退化为纯 args 指纹
         const agentSess = exec.agent && exec.agent.session;
         const spSid = (agentSess && agentSess.id) || "?";
         // 1) 监控：记录工具调用；memory_search/skill 触发查询统计与跟随判定
@@ -6748,77 +10144,116 @@ ctx.on("tools/result", (exec, result) => {
           const cw = agentSess && ((agentSess.header && agentSess.header.cwd) || agentSess.cwd);
           if (cw) spiralBucket(spSid).ws = String(cw).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "?";   // v1.12.16.1 诊断属性；v2.0.1 写入会话桶
           // v2.4.30（E 类）：spiralObserve 返回 {d,e}——D/E 各自周期首命，调用点单 gate（D>E 优先级，架构 P0）
-          const hit = spiralObserve(toolName, exec.arguments, result, !!result.isError, spSid);
+          // v3.2.0（Wave 0/1）：返回值扩为 {d,e,rep,neg,win,eN}（闸门埋点记**真值**，不重算）；第 6 参 exec.callId
+          //   用于折叠「一次 run_code = 内层 ptc + 外壳」的双计（宿主约定：subCallId = `${rootCallId}:ptc:${n}`）。
+          const hit = spiralObserve(toolName, exec.arguments, result, !!result.isError, spSid, exec && exec.callId);
           // W 看门狗（v2.4.30）：无用户介入计数递增（pre-step step1 复位）
           const Bw = spiralBucket(spSid);
           Bw.stepsSinceUser = (Bw.stepsSinceUser || 0) + 1;
           const wET = effectiveSpiralThresh();
           // v2.0.6: D 类提醒智能闸门——周期首次命中 × 开关 × 指数退避冷却（跟进复位/2h归零）× 批量进展豁免
-          if (hit && hit.d && PLUGIN_CFG.spiralRemind) {
-            const nowMs = Date.now();
-            const stR = SPIRAL_REMIND_AT.get(spSid) || { ts: 0, streak: 0 };
-            const B2 = spiralBucket(spSid);
-            const uniq = new Set(B2.win.map((w) => w.resKey)).size;
-            const okN = B2.win.filter((w) => !w.neg).length;
-            // 批量进展豁免：窗内结果多样且成功过半 → 批量循环而非空转，只记录不扰
-            const batchLike = B2.win.length > 0 && uniq >= Math.ceil(B2.win.length / 2) && okN * 2 >= B2.win.length;
-            // v0.5（P0a-5）：退避判定抽为 backoffAllowed 共用（行为等价；streak 归零/指数封顶/批量豁免语义不变）
-            const gate = backoffAllowed(stR, wET.cooldownMin * 60000, nowMs, batchLike);
-            if (gate.allowed) {
-              SPIRAL_REMIND_AT.set(spSid, { ts: nowMs, streak: gate.streak + 1 });
-              monitorHintD();
-              // v2.4.27（子代理提醒放开）：D 类改 pre-step messages 直入不留痕（同 B/C/A 机制——不进 inbox/会话历史、
-              //   不破坏前缀缓存、无 ghost 轮），并从顶层闸放开到普通子代理（normal）——实证 04ee9d05 普通任务子代理
-              //   打转 47 分钟无止损；插件子代理（plugin）仍只计 monitor 不注入（隔离，D 会误报其设计内合法重试）。
-              const kind2 = hintKindOf(exec.agent, spSid);
-              if (kind2 !== 'plugin') {
-                const hintD = "<system-reminder>\n【dsh-memory 提示·LLM循环试错】检测到同类调用反复且负面结果占比高——大概率方向不对。建议暂停硬试：memory_search 搜当前任务关键词 + 查技能目录有无对应 skill，或换个思路/向用户确认。\n</system-reminder>";
-                enqueueRegressionReminder(spSid, 'D:loop', hintD);
+          // v3.2.0（Wave 0）：改为「无论放行与否都留一条 gateEvents」——命中 ⇒ 必产出 ok 或 batch/cooldown/off 之一，
+          //   这是 V4 守恒式（spiralEvents(D) == hints.D 增量 + Σ gateEvents(D).n）成立的前提。
+          if (hit && hit.d) {
+            const gx = { rep: hit.rep, neg: hit.neg, winLen: hit.win };
+            if (!PLUGIN_CFG.spiralRemind) {
+              recordGate("D", "off", spSid, gx);
+            } else {
+              const nowMs = Date.now();
+              const stR = SPIRAL_REMIND_AT.get(spSid) || { ts: 0, streak: 0 };
+              const B2 = spiralBucket(spSid);
+              const uniq = new Set(B2.win.map((w) => w.resKey)).size;
+              // v3.2.0（Wave 2）：**归一化指纹去重数**一并落盘——候选 A/B 的效果判定依赖它（原文 uniq 会被
+              //   时间戳/随机数等虚高；18:49:48 那条真实埋点 uniq=5 即可能因此虚高）。
+              const uniqFp = new Set(B2.win.map((w) => w.resKeyFp || "")).size;
+              const okN = B2.win.filter((w) => !w.neg).length;
+              // 批量样态判据（旧注释名"批量进展豁免"）：窗内结果多样且成功过半 → 疑似批量推进而非空转
+              const batchLike = B2.win.length > 0 && uniq >= Math.ceil(B2.win.length / 2) && okN * 2 >= B2.win.length;
+              // v3.2.0（Wave 2 候选 C）：决策抽为纯函数 decideDGate —— **冷却先判**；批量样态改「降级投递 + 冷却加倍」。
+              const dec = decideDGate(batchLike, stR, wET.cooldownMin * 60000, nowMs, PLUGIN_CFG.batchSoftDeliver);
+              recordGate("D", dec.reason, spSid, Object.assign({ uniq: uniq, uniqFp: uniqFp, okN: okN, mode: dec.mode, streak: dec.gate.streak, cdMs: dec.gate.cdMs }, gx));
+              if (dec.mode !== "blocked") {
+                SPIRAL_REMIND_AT.set(spSid, { ts: nowMs, streak: dec.streakNext });
+                monitorHintD();
+                // v2.4.27（子代理提醒放开）：D 类改 pre-step messages 直入不留痕（同 B/C/A 机制——不进 inbox/会话历史、
+                //   不破坏前缀缓存、无 ghost 轮），并从顶层闸放开到普通子代理（normal）——实证 04ee9d05 普通任务子代理
+                //   打转 47 分钟无止损；插件子代理（plugin）仍只计 monitor 不注入（隔离，D 会误报其设计内合法重试）。
+                const kind2 = hintKindOf(exec.agent, spSid);
+                if (kind2 !== 'plugin') {
+                  // v3.2.0（Wave 2 候选 C）：批量样态走**降级文案**——明说"可能只是批量推进、可忽略"，降低打扰；
+                  //   正常样态沿用原文案。文案分流只改文字，不改通道（同 REGRESSION_QUEUE + 不留痕注入）。
+                  const hintD = dec.mode === "soft"
+                    ? "<system-reminder>\n【dsh-memory 提示·批量推进复核】检测到同类调用反复，但窗内产出多样、成功过半——更像批量推进而非原地打转。若确在批量处理，可忽略本条；若其实在空转，建议暂停并 memory_search 当前任务关键词。\n</system-reminder>"
+                    : "<system-reminder>\n【dsh-memory 提示·LLM循环试错】检测到同类调用反复且负面结果占比高——大概率方向不对。建议暂停硬试：memory_search 搜当前任务关键词 + 查技能目录有无对应 skill，或换个思路/向用户确认。\n</system-reminder>";
+                  enqueueRegressionReminder(spSid, 'D:loop', hintD);
+                } else {
+                  recordGate("D", "kind", spSid);   // v3.2.0：插件子代理按设计不注入 ⇒ 单独记一类，勿与被拦混淆
+                }
               }
             }
-          } else if (hit && hit.e && PLUGIN_CFG.spiralRemind) {
-            // v2.4.30（E 类）：成功同质循环——同一 SPIRAL_REMIND_AT 冷却桶（防 D/E 交替轰炸；无 batchLike 豁免——
-            //   E 簇内同质判定天然是反向批量防线，见设计文档 §2.2）
-            const nowMs = Date.now();
-            const stR = SPIRAL_REMIND_AT.get(spSid) || { ts: 0, streak: 0 };
-            const gate = backoffAllowed(stR, wET.cooldownMin * 60000, nowMs, false);
-            if (gate.allowed) {
-              SPIRAL_REMIND_AT.set(spSid, { ts: nowMs, streak: gate.streak + 1 });
-              monitorHintE();
-              const kind2 = hintKindOf(exec.agent, spSid);
-              if (kind2 !== 'plugin') {
-                // N=簇大小；从样本带出或近似为窗内计数（E 样本已落 clusterN）
-                const Ewin = spiralBucket(spSid).win;
-                const eN = Ewin.length ? Ewin.length : 0;
-                const hintE = "<system-reminder>\n【dsh-memory 提示·成功同质循环】同一命令/调用已成功重复 " + eN + " 次、输出几乎没变——成功重复 ≠ 有进展。若任务已完成或卡在重复执行，建议暂停：确认产物是否到位，或换个思路/向用户核对。\n</system-reminder>";
-                enqueueRegressionReminder(spSid, 'E:loop', hintE);
+          } else if (hit && hit.e) {
+            // v2.4.30（E 类）：成功同质循环——无 batchLike 豁免（E 簇内同质判定天然是反向批量防线，见设计文档 §2.2）
+            // v3.2.0（Wave 1）：**独立冷却桶**（旧实现与 D 共用 SPIRAL_REMIND_AT ⇒ 互相吃掉冷却窗）；并补闸门埋点。
+            const gx = { rep: hit.rep, neg: hit.neg, winLen: hit.win, eN: hit.eN };
+            if (!PLUGIN_CFG.spiralRemind) {
+              recordGate("E", "off", spSid, gx);
+            } else {
+              const nowMs = Date.now();
+              const stR = SPIRAL_REMIND_E_AT.get(spSid) || { ts: 0, streak: 0 };
+              const gate = backoffAllowed(stR, wET.cooldownMin * 60000, nowMs, false);
+              recordGate("E", gate.allowed ? "ok" : gate.reason, spSid, Object.assign({ streak: gate.streak, cdMs: gate.cdMs }, gx));
+              if (gate.allowed) {
+                SPIRAL_REMIND_E_AT.set(spSid, { ts: nowMs, streak: gate.streak + 1 });
+                monitorHintE();
+                const kind2 = hintKindOf(exec.agent, spSid);
+                if (kind2 !== 'plugin') {
+                  // v3.2.0 修 bug：N 必须是**簇长**（clusterN），旧实现取窗长 ⇒ 文案数字偏大（09-29 12:36 那次写 8、实为 4）。
+                  const eN = hit.eN || 0;
+                  const hintE = "<system-reminder>\n【dsh-memory 提示·成功同质循环】同一命令/调用已成功重复 " + eN + " 次、输出几乎没变——成功重复 ≠ 有进展。若任务已完成或卡在重复执行，建议暂停：确认产物是否到位，或换个思路/向用户核对。\n</system-reminder>";
+                  enqueueRegressionReminder(spSid, 'E:loop', hintE);
+                } else {
+                  recordGate("E", "kind", spSid);   // v3.2.0：插件子代理不注入 ⇒ 单独记类
+                }
               }
             }
           }
           // v2.4.30（W 类看门狗）：无用户介入长空转——不依赖同质/重复，只看用户回合后步数+墙钟。
           // 触发优先级最低（D/E 命中当轮不叠加）；plugin 子代理隔离（其长任务是设计内行为，另有 guard 看护）。
-          if (!(hit && hit.d) && !(hit && hit.e) && PLUGIN_CFG.spiralRemind) {
+          if (!(hit && hit.d) && !(hit && hit.e)) {
             const nowMs = Date.now();
             const lastUser = Bw.lastUserAt || 0;
-            const stW = WATCH_REMIND_AT.get(spSid) || { ts: 0 };
             const sinceUserSteps = Bw.stepsSinceUser || 0;
             const sinceUserMs = lastUser > 0 ? nowMs - lastUser : 0;
-            const coolMs = wET.watchCooldownMin * 60000;
-            if (sinceUserSteps >= wET.watchSteps && sinceUserMs >= wET.watchSecs * 1000 && (nowMs - (stW.ts || 0)) >= coolMs) {
-              WATCH_REMIND_AT.set(spSid, { ts: nowMs });
-              monitorHintW();   // 计数+开窗（plugin 与非 plugin 都计，语义同 D 的 monitorHintD 先行）
-              // 样本落盘（watchEvents 独立数组，不混入 spiralEvents——无同质/重复语义，防污染 D/E 校准）
-              try {
-                const wd = readMonitorData();
-                if (!Array.isArray(wd.watchEvents)) wd.watchEvents = [];
-                wd.watchEvents.push({ t: nowMs, ws: Bw.ws, steps: sinceUserSteps, wallSecs: Math.round(sinceUserMs / 1000), topTool: toolName });
-                if (wd.watchEvents.length > 100) wd.watchEvents = wd.watchEvents.slice(-100);
-                scheduleMonitorSave();
-              } catch (e2) {}
-              const kind2 = hintKindOf(exec.agent, spSid);
-              if (kind2 !== 'plugin') {
-                const hintW = "<system-reminder>\n【dsh-memory 提示·无介入长空转】距你上次输入已 " + Math.round(sinceUserMs / 60000) + " 分钟、无介入持续 " + sinceUserSteps + " 步——若任务需你决策请暂停确认；若在预期长任务中，忽略此条即可（本任务不再重复提醒）。\n</system-reminder>";
-                enqueueRegressionReminder(spSid, 'W:noop', hintW);
+            // v3.2.0（Wave 0）：先判「步数+墙钟」是否达标，再分三态留痕（ok / cooldown / off）。
+            //   只在达标时才记 ⇒ 不会每步都写（W 的闸门每步都评估，逐条落盘会把 gateEvents 顶穿）。
+            const wQualified = sinceUserSteps >= wET.watchSteps && sinceUserMs >= wET.watchSecs * 1000;
+            const wExtra = { steps: sinceUserSteps, wallSecs: Math.round(sinceUserMs / 1000) };
+            if (wQualified && !PLUGIN_CFG.spiralRemind) {
+              recordGate("W", "off", spSid, wExtra);
+            } else if (PLUGIN_CFG.spiralRemind) {
+              const stW = WATCH_REMIND_AT.get(spSid) || { ts: 0 };
+              const coolMs = wET.watchCooldownMin * 60000;
+              if (wQualified && (nowMs - (stW.ts || 0)) >= coolMs) {
+                WATCH_REMIND_AT.set(spSid, { ts: nowMs });
+                monitorHintW();   // 计数+开窗（plugin 与非 plugin 都计，语义同 D 的 monitorHintD 先行）
+                recordGate("W", "ok", spSid, wExtra);
+                // 样本落盘（watchEvents 独立数组，不混入 spiralEvents——无同质/重复语义，防污染 D/E 校准）
+                try {
+                  const wd = readMonitorData();
+                  if (!Array.isArray(wd.watchEvents)) wd.watchEvents = [];
+                  wd.watchEvents.push({ t: nowMs, ws: Bw.ws, steps: sinceUserSteps, wallSecs: Math.round(sinceUserMs / 1000), topTool: toolName });
+                  if (wd.watchEvents.length > 100) wd.watchEvents = wd.watchEvents.slice(-100);
+                  scheduleMonitorSave();
+                } catch (e2) {}
+                const kind2 = hintKindOf(exec.agent, spSid);
+                if (kind2 !== 'plugin') {
+                  const hintW = "<system-reminder>\n【dsh-memory 提示·无介入长空转】距你上次输入已 " + Math.round(sinceUserMs / 60000) + " 分钟、无介入持续 " + sinceUserSteps + " 步——若任务需你决策请暂停确认；若在预期长任务中，忽略此条即可（本任务不再重复提醒）。\n</system-reminder>";
+                  enqueueRegressionReminder(spSid, 'W:noop', hintW);
+                } else {
+                  recordGate("W", "kind", spSid);   // v3.2.0：插件子代理不注入 ⇒ 单独记类
+                }
+              } else if (wQualified) {
+                recordGate("W", "cooldown", spSid, Object.assign({ cdMs: coolMs }, wExtra));
               }
             }
           }
@@ -6946,20 +10381,50 @@ ctx.on("tools/result", (exec, result) => {
       } catch (e) { /* 监控/统计失败不影响会话 */ }
     });
 
+// ═══ v2.7.0：memory_dream_patch **调用方闸**（反转 v2.6.9 的 fixed 白名单，不是删除）═══
+//   ①历史：v2.6.9（P3）原闸＝"主代理只允许写 fixed.md"（名单即 fixed.md）。fixed 层拆除后，主代理对该工具
+//     **已无任何正当用途**（它的记忆写入路径是 edit/write，AGENTS.md §2 明写），故把判据**反转**为"主代理一律拒"。
+//     ⚠ 我第一版拆除时把它整条删了——那是**判断错误**：名单拆空后闸的行为＝"主代理一律拒绝"，是**有意义的行为**
+//     而非死代码；删掉等于退回"描述即权限"，而那正是 v2.6.9 加这道闸要解决的问题（其注释原文）。
+//   ②动机不变：全文件无调用方权限检查；描述层约束已被证明不生效。
+//   ③为什么不能开给主代理：本工具 execute 内有 `if (r.ok && r.wrote > 0) LAST_DREAM_WROTE_AT = Date.now();`
+//     —— 该时间戳参与 dream settle 的 `doneOk` 判定；主代理随手写入会**伪造"本轮已落盘"**，`dreamed` 账本同理。
+//   ④必须独立注册：D2 熔断处理器首行 `brkLevel < 2` 早退会短路，塞进去=静默失效（v2.6.8 工程席必改②）。
+//   ⑤签名 (exec, next)：首参**就是** exec（`ToolExecution{name, arguments, agent, signal}`）；写成 `{agent, exec}` 会双 undefined。
+ctx.on("tools/pre-execute", async (exec, next) => {
+  try {
+    const toolName = String((exec && exec.name) || "");
+    if (toolName !== "memory_dream_patch") return next();
+    const ag = exec && exec.agent;
+    const sid = (ag && ag.session && ag.session.id) || "?";
+    if (typeof hintKindOf === "function" && hintKindOf(ag, sid) === "plugin") return next();   // dream / 归档子代理放行
+    try { if (typeof monitorEvent === "function") monitorEvent("memory", "main-agent-dream-patch-denied"); } catch (eM) {}
+    return { kind: "deny", reason: "memory_dream_patch 仅供 dream 整合子代理与归档通道使用；主代理请用记忆库既有的编辑方式（edit/write）或走 /dream 流程。" };
+  } catch (e) { return next(); }
+});
+
+// ═══ v2.7.0（拆 fixed）：另一条 fixed 专用直写闸（v2.6.8 P5.1-14，判据 `/(^|\/)fixed\.md$/i`）确实随层删除 ═══
+//   它是**按文件路径**判据，层不存在即永不命中 → 这条才是真正的死代码；与上面的调用方闸不同，勿混为一谈。
+//   ⚠ 保留下面 D2/D3 熔断处理器（与本层无关）。
+
 // v2.6.0（D 级打转熔断）：D2 拒调 —— tools/pre-execute 拦截重复 suspect 调用，直接 deny（短路 veto）
-ctx.on("tools/pre-execute", async ({ agent, exec }, next) => {
+// ⚠ v2.6.9 实测修正：本钩子签名是 **(exec, next)** —— 首参**就是** exec（`ToolExecution{name, arguments, agent, signal}`，
+//   见 `dsh-tools/lib/types/index.d.ts` L39/L198-224）；`{agent, exec}` 是 `agent/pre-step` 的形状，套到本钩子上会让
+//   两个变量都 undefined → 处理器**永远静默放行**。⇒ **v2.6.0 起 D2 一直是装饰品**（同一 bug 也吃了 v2.6.8 的直写闸）。
+ctx.on("tools/pre-execute", async (exec, next) => {
   try {
     if (!PLUGIN_CFG.spiralBreak || PLUGIN_CFG.brkLevel < 2) return next();
-    const spSid = (exec && exec.agent && exec.agent.session && exec.agent.session.id) || "?";
+    const ag2 = exec && exec.agent;
+    const spSid = (ag2 && ag2.session && ag2.session.id) || "?";
     // 终检③：plugin 子代理先放行，绝不执法
-    if (hintKindOf(exec.agent, spSid) === "plugin") return next();
+    if (hintKindOf(ag2, spSid) === "plugin") return next();
     const brk = breakState(spSid);
     if (!brk || !brk.suspectKeys) return next();
     // 计算当前调用的指纹键
     let aTxt = "";
     try { aTxt = String(typeof exec.arguments === "string" ? exec.arguments : JSON.stringify(exec.arguments) || ""); } catch (e) {}
     aTxt = aTxt.replace(/\s+/g, " ").slice(0, 600);
-    const toolName = exec.tool || exec.name || "other";
+    const toolName = exec.name || exec.tool || "other";   // [2026-09-23] 与 armBreakSuspect 侧**成对**修正（ToolExecution 无 tool 字段）——只改一侧会造成真口径不一致，反而让熔断彻底失效
     const argsFp = createHash("sha256").update(aTxt).digest("hex").slice(0, 16);
     const key = toolName + ":" + argsFp;
     if (!brk.suspectKeys.has(key)) return next();
@@ -6997,6 +10462,9 @@ ctx.on("agent/pre-step", async ({ agent, messages, signal }, next) => {
     brk.fullStop = false;
     brk.denyN = 0;
     brk.suspectKeys = new Set();
+    brk.seq = 0;
+    brk.seqKey = "";
+    brk.lastRFp = "";
     return { kind: "reject" };
   } catch (e) { return next(); }
 });
@@ -7074,7 +10542,7 @@ ctx.on("session/event", (session, event) => {
       try {
         toolSvc.register({
           name: "memory_archive_checkpoint",
-          description: "提交漏网会话记忆归档检查点（仅 dsh-memory 归档子代理使用）：参数 { blocks: [ { file, sessionId, title, points[], skip?, reason? } ] }。file=记忆库相对路径（sessions/|projects/ 前缀）；sessionId=短 id 清单中的 id 逐字取用；有价值会话填 title+points（3-6 条要点，精确字面量逐字保留）；无价值会话填 skip=true+reason。插件现场校验完整性与落盘：缺声明会话、越界路径、缺 points 会返回错误清单，请修正后再次调用（可多次调用累计覆盖全部会话）。",
+          description: "提交漏网会话记忆归档检查点（仅 dsh-memory 归档子代理使用）：参数 { blocks: [ { file, sessionId, title, points[], literals[], skip?, reason? } ] }。file=记忆库相对路径（sessions/|projects/ 前缀）；sessionId=短 id 清单中的 id 逐字取用；有价值会话填 title+points（3-6 条要点，精确字面量逐字保留）；**literals[]=精确字面量单独一条通道**（GUID/URL/路径/命令/文号/报错串，逐条原样，去重后进 `knowledge/字面量.md`，不进注入层、可被 memory_search 检索）；无价值会话填 skip=true+reason（**要求**：reason 必须是**实质理由 ≥8 字**——空话/空白会被整批拒写。★ 注意：插件**不再**按理由措辞决定放行，也不会因为「该会话没有抽取单元」而拒你；它会记录这次跳过有没有可恢复的副本。**有内容可写就请写 points**，跳过是最后手段）。插件现场校验完整性与落盘：缺声明会话、越界路径、缺 points、理由不足 8 字会返回错误清单，请修正后再次调用（可多次调用累计覆盖全部会话）。",
           parameters: {
             type: "object",
             properties: {
@@ -7087,6 +10555,7 @@ ctx.on("session/event", (session, event) => {
                     sessionId: { type: "string", description: "短 id 清单中的 id（逐字取用）" },
                     title: { type: "string", description: "一句话主题" },
                     points: { type: "array", items: { type: "string" }, description: "3-6 条要点" },
+                    literals: { type: "array", items: { type: "string" }, description: "§9.12③ 精确字面量（GUID/URL/路径/命令/文号/报错串/数值）逐条原样；去重后进记忆库 `knowledge/字面量.md`（非注入层、memory_search 可检索）" },
                     skip: { type: "boolean", description: "true=该会话跳过归档，需提供 reason" },
                     reason: { type: "string", description: "跳过理由或归档理由" }
                   },
@@ -7097,7 +10566,7 @@ ctx.on("session/event", (session, event) => {
             required: ["blocks"]
           },
           output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
-          async execute(args) {
+          async execute(args, exec) {
             let blocks = null;
             try {
               if (Array.isArray(args)) blocks = args;
@@ -7105,11 +10574,345 @@ ctx.on("session/event", (session, event) => {
               else if (args && typeof args === "object") { const v = Object.values(args).find((x) => Array.isArray(x)); if (v) blocks = v; }
             } catch (e) {}
             if (!Array.isArray(blocks)) return JSON.stringify({ ok: false, mode: "bad-schema", wrote: 0, errors: ["参数必须是 { blocks: [...] } 数组"] });
-            return JSON.stringify(applyArchiveBlocks(blocks));
+            // ★ 2026-09-25：按**发起该批的子代理**取本批短 id 清单（A5 只校验本批，见 applyArchiveBlocks 注释）
+            return JSON.stringify(applyArchiveBlocks(blocks, archiveBatchIdsFor(exec)));
           }
         });
         clog("[dsh-memory] memory_archive_checkpoint 交付工具已注册（漏网归档专用）");
       } catch (e) { cwarn("[dsh-memory] memory_archive_checkpoint 注册失败:", e && e.message ? e.message : String(e)); }
+    }
+    // ═══════════ v2.8.4（P26）：`session_search` —— 会话**原文**检索（用户诉求的落地点）═══════════
+    // 用户原话：「其实我要的功能需求很简单，就是有些内容在记忆中可能不准确或者没计入，那么就可以通过
+    //   这个功能直接就检索到来源之类的」；并给了真实失败案例：「要找知识库的在线地址，记忆中就没有，
+    //   还是 llm 在其他地方找到的」。
+    // 分工（本仓的最终形状）：
+    //   · `memory_search`  = 查**记忆库**（已沉淀的结论）
+    //   · `session_search` = 查**原始会话日志**（记忆里没有/不准时，回原文捞精确字面量与出处）
+    // 实现方式（**不重复实现**，工程上刻意的）：本工具是 `~/.dsh/tools/session-search/session-search.mjs`
+    //   的**第二个前端** —— 那份 CLI 是零依赖（node:fs/zlib + 外部 rg）、缓存为磁盘纯文本、检索在进程外
+    //   （绝不把 124–149 M 字符语料读进 JS 堆），是这条能力的**单一实现**。此处在子进程里调它，只做
+    //   参数整形与输出裁剪；任何检索语义的改动都只改一处。
+    // 为什么不在插件内 import 它：它的配置（CACHE_DIR/SESSIONS_ROOT）在**模块加载期**由 `process.argv`
+    //   求值 ⇒ 被 import 时会读到**宿主 DSH 的 argv**，静默指错目录。子进程边界正是隔离这层语义的正当手段。
+    const SESSION_SEARCH_CLI = (() => {
+      const cands = [
+        portable(DSH_HOME) + "/tools/session-search/session-search.mjs",
+        portable(MEMORY_ROOT) + "/tools/session-search/session-search.mjs",
+      ];
+      for (const p of cands) { try { if (fs.statSync(p).isFile()) return p; } catch (e) {} }
+      return cands[0];                     // 都不在 ⇒ 返回首选路径，报错时能让用户看见"该放哪"
+    })();
+    function runSessionSearchCli(args, timeoutMs) {
+      try {
+        const out = execFileSync(process.execPath, [SESSION_SEARCH_CLI].concat(args),
+          { encoding: "utf8", timeout: timeoutMs || 60000, maxBuffer: 64 * 1024 * 1024 });
+        return { ok: true, code: 0, out: String(out || ""), err: "" };
+      } catch (e) {
+        return {
+          ok: false,
+          code: (e && typeof e.status === "number") ? e.status : -1,
+          out: (e && e.stdout) ? String(e.stdout) : "",
+          err: (e && e.stderr) ? String(e.stderr) : String((e && e.message) || e),
+        };
+      }
+    }
+    // ═══════════ v3.1.0：索引自动刷新（主挂点 = 每小时 tick；次挂点 = dream 结算后） ═══════════
+    // 为什么要有：本仓宿主侧原先**零自动建索引钩子**（三席评审 2026-09-20 复核确认）⇒ 检索面只在人手跑
+    //   `--build` 时前进，用户不知道要补，新会话就搜不到。
+    // 硬约束（评审结论）：① 只用异步 execFile（同步 execFileSync 会冻住宿主）；② 调用方**不 await**；
+    //   ③ 进程内单飞 + 跨进程由 CLI 自抢 `.build.lock`（CLI 侧 exit 6 ⇒ 这里按「跳过」记，不是失败）；
+    //   ④ 冷却落**磁盘账本**（内存标志重启即失效、多会话各算一份 ⇒ 闸门形同不存在）；
+    //   ⑤ 只写 session-text 缓存与自有账本，**不碰记忆库正文**（.integrate.json 一字不动）。
+    let IDX_REFRESH_RUNNING = false;
+    function readIndexLedger() {
+      try { const o = JSON.parse(fs.readFileSync(IDX_REFRESH_LEDGER, "utf8")); return (o && typeof o === "object") ? o : {}; }
+      catch (e) { return {}; }
+    }
+    function writeIndexLedger(o) { try { writeFileAtomic(IDX_REFRESH_LEDGER, JSON.stringify(o)); } catch (e) {} }
+    function runSearchCliAsync(args, timeoutMs) {
+      return new Promise((resolve) => {
+        try {
+          execFile(process.execPath, [SESSION_SEARCH_CLI].concat(args),
+            { encoding: "utf8", timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, killSignal: "SIGKILL" },
+            (err, stdout, stderr) => resolve({
+              ok: !err,
+              code: err ? (typeof err.code === "number" ? err.code : -1) : 0,
+              killed: !!(err && (err.killed || err.signal)),
+              out: String(stdout || ""),
+              err: String(stderr || (err && err.message) || ""),
+            }));
+        } catch (e) { resolve({ ok: false, code: -1, killed: false, out: "", err: String((e && e.message) || e) }); }
+      });
+    }
+    // 刷新入口（幂等、绝不 reject）：ran=false 时 why ∈ inactive / busy / cooling / throw
+    function refreshSearchIndex(opts) {
+      const o = opts || {};
+      return new Promise((resolve) => {
+        try {
+          if (PLUGIN_CFG.active === false) return resolve({ ran: false, why: "inactive" });
+          if (IDX_REFRESH_RUNNING) return resolve({ ran: false, why: "busy" });
+          const led = readIndexLedger();
+          const now = Date.now();
+          // 冷却分两档（本仓自审修掉的两处缺陷）：
+          //   ① 未连败：基准 = **上次成功**（或人手/工具刚 build 过）—— 失败**不**续冷却，
+          //      否则连续失败永远攒不到 3 次、24h 退避形同不存在；
+          //   ② 已连败 ≥3：基准另取**上次尝试时刻**（否则「从未成功过」时基准恒 0 ⇒ 退避永不生效）。
+          const failN = Number(led.failStreak) || 0;
+          const touchOk = Math.max(Number(led.lastOkAt) || 0, Number(led.lastToolBuildAt) || 0);
+          const basis = failN >= 3 ? Math.max(touchOk, Number(led.lastAt) || 0) : touchOk;
+          const gap = failN >= 3 ? IDX_REFRESH_BACKOFF_MS : IDX_REFRESH_MIN_GAP_MS;
+          if (basis && now - basis < gap) return resolve({ ran: false, why: "cooling", leftMs: gap - (now - basis) });
+          IDX_REFRESH_RUNNING = true;
+          writeIndexLedger(Object.assign({}, led, { lastTryAt: now, lastReason: String(o.reason || "tick") }));
+          runSearchCliAsync(["--build"], idxRefreshTimeoutMs()).then((r) => {
+            IDX_REFRESH_RUNNING = false;
+            const m = /建 (\d+)，跳过 (\d+)，错 (\d+)/.exec(r.out || "");
+            const built = m ? Number(m[1]) : null, skipped = m ? Number(m[2]) : null, errors = m ? Number(m[3]) : null;
+            const locked = r.code === 6;                        // CLI 侧并发保护：不是错误，下轮自然重试
+            const hard = !locked && (!r.ok || built === null);   // 无 stats 行 ⇒ 硬失败（超时/kill/CLI 缺失）
+            const led2 = readIndexLedger();
+            const next = Object.assign({}, led2, { lastAt: Date.now(), lastCode: r.code, lastOut: String(r.out || "").slice(0, 200) });
+            if (locked) { delete next.lastTryAt; next.lastKind = "locked"; }
+            else if (hard) { next.lastKind = "hard-fail"; next.failStreak = (Number(led2.failStreak) || 0) + 1; next.lastErr = String(r.err || "").slice(0, 300); }
+            else { next.lastKind = "ok"; next.lastOkAt = Date.now(); next.failStreak = 0; next.built = built; next.skipped = skipped; next.errors = errors; delete next.lastErr; }
+            writeIndexLedger(next);
+            try { monitorEvent("search-index", [next.lastKind, "reason=" + String(o.reason || "tick"), "code=" + r.code, "built=" + built, "skipped=" + skipped, "ms=" + (Date.now() - now)].join(" ")); } catch (e) {}
+            // 可见性：自动/定期轮恒静默；只有点名带 listener（dream 结算）且「真建了」或「硬失败」才落一行
+            if (o.listener && !locked && (hard || (built !== null && built > 0))) {
+              const body = hard
+                ? ("自动补建失败（code " + r.code + "）：" + String(r.err || "").slice(0, 120))
+                : ("增量补建完成：建 " + built + " / 跳过 " + skipped);
+              try {
+                const raw = "<system-reminder>\n【dsh-memory · 索引】" + body + "\n</system-reminder>";
+                const smsg = makeNoticeMessage(raw, ("索引：" + body).slice(0, 140));
+                setTimeout(() => {
+                  try {
+                    if (canSurfaceAppend(o.listener) && o.listener.session && typeof o.listener.session.append === "function") o.listener.session.append("user/message", smsg, { surfaceOp: "append" });
+                    else if (typeof o.listener.inject === "function") o.listener.inject(makeMessage(raw));   // [400guard 20260927]：中途落表会打断 tool_calls/tool 配对 ⇒ 降级 inject 排队
+                  } catch (e) {}
+                }, 0);
+              } catch (e) {}
+            }
+            resolve({ ran: true, code: r.code, built: built, skipped: skipped, hard: hard, locked: locked });
+          });
+        } catch (e) { IDX_REFRESH_RUNNING = false; resolve({ ran: false, why: "throw" }); }
+      });
+    }
+    __indexRefreshTick = refreshSearchIndex;
+    if (toolSvc !== undefined && typeof toolSvc.register === "function") {
+      try {
+        toolSvc.register({
+          name: "session_search",
+          description: "在**原始会话日志**里检索精确字面量并给出出处（dsh-memory v2.8.4）。"
+            + "用途：当记忆库（memory_search）里**没有、或记不准**某个字面量时，回原始会话原文把它捞出来 —— "
+            + "适用于 ID/GUID、URL、文件路径、命令、参数、文号、报错串、数值这类**精确串**。"
+            + "分工：memory_search 查已沉淀的**结论**；session_search 查**原始对话**。"
+            + "参数：query=精确字面量（**优先用最稀有的一段**，如完整 GUID；不要用描述性长句，分词会把长句拆散）；"
+            + "since/until=YYYY-MM-DD 限定日期（闭区间）；sid=会话 id 前缀；limit=列出条数（默认 20）；"
+            + "show={sid,frame,file?,line?}=按命中坐标**回看原文**；status=true 只看索引状态；"
+            + "source=logs（默认，原始会话日志）/ units（归档时**抽取好的会话正文**，日志被轮转或缺失时用它）/ all（两者并查）；"
+            + "build=true 仅在确需重建索引时使用（**慢，全库实测约 6 分钟**，默认禁止）。"
+            + "返回：命中总数 + 每条 {会话短id, 事件类型, 源文件#帧号, 缓存段:行, 片段}；0 命中时返回升级路径（换更稀有的词 → 放宽范围 → build）。"
+            + "多词空格精确 0 命中时会自动分词回退（交集优先并注明），但仍建议单给最稀有的一段。",
+          parameters: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "要检索的**精确字面量**（完整 GUID/URL/路径/命令/报错串；别用长句）" },
+              since: { type: "string", description: "起始日期 YYYY-MM-DD（含当天）" },
+              until: { type: "string", description: "结束日期 YYYY-MM-DD（含当天）" },
+              sid: { type: "string", description: "会话 id 前缀（如 62c8532e）" },
+              source: { type: "string", description: "检索源：logs（默认）=原始会话日志；units=归档时**抽取好的会话正文**（`~/.dsh/memory/.archive-units/`，日志被轮转/劈开时只剩它）；all=两者并查" },
+              limit: { type: "number", description: "最多列出多少条（默认 20；总数另计，截断不冒充命中数）" },
+              show: {
+                type: "object",
+                description: "按命中坐标回看原文（与 query 二选一）",
+                properties: {
+                  sid: { type: "string", description: "会话 id 前缀" },
+                  frame: { type: "number", description: "帧号（命中行给出的 #fN）" },
+                  file: { type: "string", description: "源文件名（可选，用于同名双日志消歧）" },
+                  line: { type: "string", description: "缓存段内行号（可选）" },
+                },
+                required: ["sid", "frame"],
+              },
+              status: { type: "boolean", description: "只看索引状态（天数/会话数/字节数）" },
+              build: { type: "boolean", description: "**慢**（全库约 6 分钟）：重建/增量更新索引。默认禁止" },
+            },
+          },
+          output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }] } },
+          async execute(args) {
+            const a = (args && typeof args === "object") ? args : {};
+            const cli = ["--ds-home", portable(DSH_HOME)];
+            try { if (!fs.statSync(SESSION_SEARCH_CLI).isFile()) {
+              return "❌ 未找到检索 CLI：" + SESSION_SEARCH_CLI + "\n   请把 `session-search.mjs` 放到该路径（它是本能力的单一实现）。";
+            } } catch (e) {
+              return "❌ 未找到检索 CLI：" + SESSION_SEARCH_CLI + "\n   请把 `session-search.mjs` 放到该路径（它是本能力的单一实现）。";
+            }
+            // ── 模式 1：索引状态 ──
+            if (a.status === true) {
+              const r = runSessionSearchCli(cli.concat(["--status"]), 30000);
+              return r.ok ? ("索引状态：\n" + r.out) : ("状态查询失败（exit=" + r.code + "）：\n" + (r.err || r.out));
+            }
+            // ── 模式 2：按坐标回看原文 ──
+            if (a.show && typeof a.show === "object" && a.show.sid) {
+              const sv = a.show;
+              const sArgs = cli.concat(["--show", String(sv.sid), "--frame", String(sv.frame), "--json"]);
+              if (sv.file) sArgs.push("--file", String(sv.file));
+              if (sv.line) sArgs.push("--line", String(sv.line));
+              const r = runSessionSearchCli(sArgs, 60000);
+              if (!r.ok) {
+                if (r.code === 5) return "该坐标在缓存中不存在 —— 缓存可能已按新口径重建（坐标会整体漂移）。请改用 query 关键词重搜。";
+                return "回看失败（exit=" + r.code + "）：" + (r.err || r.out).slice(0, 400);
+              }
+              let j = null; try { j = JSON.parse(r.out); } catch (e) {}
+              if (!j || !Array.isArray(j.hits) || !j.hits.length) return "无可返回的命中（解析失败或空结果）。";
+              return j.hits.map((h) => {
+                const full = String(h.text || "").replace(/\s+/g, " ");
+                return "【原文】" + full + "\n  出处：" + (h.file || "?") + "#f" + h.frame + "  会话 " + h.sid + "  事件 " + (h.kind || "?") + "  缓存 " + h.seg + ":" + h.ln;
+              }).join("\n\n");
+            }
+            // ── 模式 3：可选重建（默认禁止）──
+            if (a.build === true) {
+              const bArgs = cli.concat(["--build"]);
+              if (a.sid) bArgs.push("--sid", String(a.sid));
+              const r = runSessionSearchCli(bArgs, 900000);      // v3.1.0 实测：稳态 2.98s / 吸收积压 8.92s / 冷建最坏 115.2s ⇒ 15 分钟上限仍留大余量
+              // v3.1.0：人手/工具刚 build 过 ⇒ 记进账本（自动刷新据此 IDX_TOOL_BUILD_QUIET_MS 内不贴脸重跑）
+              try { writeIndexLedger(Object.assign({}, readIndexLedger(), { lastToolBuildAt: Date.now(), lastToolCode: r.code })); } catch (e) {}
+              return "[build] " + (r.ok ? "完成" : ("失败 exit=" + r.code)) + "：\n" + (r.out || r.err).slice(0, 2000);
+            }
+            // ── 模式 4：检索（默认）──
+            const kw = (a.query === undefined || a.query === null) ? "" : String(a.query);
+            if (!kw.trim()) return "请提供 query（要检索的精确字面量）；或用 show={sid,frame} 回看原文；或用 status=true 看索引状态。";
+            const sArgs = cli.concat([kw, "--json"]);
+            if (a.since) sArgs.push("--since", String(a.since));
+            if (a.until) sArgs.push("--until", String(a.until));
+            if (a.sid) sArgs.push("--sid", String(a.sid));
+            // §9.12①：检索源（logs 默认｜units 归档单元｜all）—— CLI 侧对 units 会**按需增量重建**单元缓存
+            if (a.source === "units" || a.source === "logs" || a.source === "all") sArgs.push("--source", String(a.source));
+            sArgs.push("--limit", String(Number.isFinite(Number(a.limit)) && Number(a.limit) > 0 ? Math.min(Number(a.limit), 200) : 20));
+            const r = runSessionSearchCli(sArgs, 120000);
+            let j = null; try { j = JSON.parse(r.out); } catch (e) {}
+            if (!j) {
+              // JSON 都没拿到 ⇒ 缓存可能不存在（CLI 在缓存为空时返回 note）或 rg 缺失
+              return "检索未返回结果（exit=" + r.code + "）。可能原因：① 缓存未建（首次需 `build:true`，全库约 6 分钟）"
+                + " ② 未找到 ripgrep。\nCLI 输出：" + (r.err || r.out).slice(0, 400);
+            }
+            if (!j.total) {
+              // v3.1.0（A2）：logs 0 命中 ⇒ **自动回退 units 源**再查一次（归档抽取正文；CLI 侧对 units 会按需
+              //   增量重建，实测 ≈0.4s）。只治「日志被轮转/劈开、正文只剩在单元里」这一形态——它**不治**
+              //   「最近会话未入 logs 索引」（那靠主挂点的自动刷新）。用户显式指定 source 时不越权改源。
+              const explicitSrc = (a.source === "units" || a.source === "all");
+              if (!explicitSrc) {
+                const sArgs2 = sArgs.slice();
+                const si = sArgs2.indexOf("--source");
+                if (si >= 0 && si + 1 < sArgs2.length) sArgs2[si + 1] = "units";
+                else sArgs2.splice(Math.max(0, sArgs2.length - 2), 0, "--source", "units");
+                const r2 = runSessionSearchCli(sArgs2, 120000);
+                let j2 = null; try { j2 = JSON.parse(r2.out); } catch (e) {}
+                if (j2 && j2.total) {
+                  const head2 = "命中 " + j2.total + " 处（logs 源 0 命中；以下来自**归档单元源**）" + (j2.total > j2.listed ? ("（列出前 " + j2.listed + " 条，可调大 limit）") : "");
+                  const body2 = (j2.rows || []).map((x) => {
+                    const full = String(x.x || "").replace(/\s+/g, " ");
+                    const at = full.indexOf(kw);
+                    const from = at < 0 ? 0 : Math.max(0, at - 90);
+                    const snip = (from > 0 ? "…" : "") + full.slice(from, from + 260) + (full.length > from + 260 ? "…" : "");
+                    return "[" + x.sid + "] " + (x.k || "?") + "  src:" + (x.src || "?") + "#f" + (x.fr === undefined ? "?" : x.fr) + "  cache:" + x.seg + ":" + x.line + "\n    " + snip;
+                  }).join("\n");
+                  const first2 = (j2.rows || [])[0];
+                  const tail2 = first2 ? ("\n\n回看原文：session_search({ show: { sid: \"" + first2.sid + "\", frame: " + first2.fr + " } })") : "";
+                  return head2 + "\n\n" + body2 + tail2;
+                }
+              }
+              // 多词回退（2026-09-22）：精确连写 0 命中且 query 含空格 ⇒ 按空白分词逐个重查，帧分组交集优先。
+              // 为什么放插件侧而不改 CLI：CLI 是单一实现（单 pattern，空格逐字命中；R-5~R-10 钉死
+              // “给了东西必须照做”，静默改写空格语义会重蹈“带空格路径被拆散”的覆辙）。此处是显式编排
+              // （与上面的 units 自动回退同构）：精确优先，0 命中才回退，且回退结果如实注明、各词总数照实报。
+              const toks = kw.split(/\s+/).map((t) => t.trim()).filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i).slice(0, 5);
+              if (toks.length > 1) {
+                const reqLim = (Number.isFinite(Number(a.limit)) && Number(a.limit) > 0 ? Math.min(Number(a.limit), 200) : 20);
+                const perSrc = (a.source === "units" || a.source === "logs" || a.source === "all") ? String(a.source) : null;
+                const tokRes = [];
+                for (const t of toks) {
+                  const tArgs = cli.concat([t, "--json"]);
+                  if (a.since) tArgs.push("--since", String(a.since));
+                  if (a.until) tArgs.push("--until", String(a.until));
+                  if (a.sid) tArgs.push("--sid", String(a.sid));
+                  if (perSrc) tArgs.push("--source", perSrc);
+                  tArgs.push("--limit", String(Math.min(reqLim, 20)));
+                  let tj = null;
+                  try {
+                    const tr = runSessionSearchCli(tArgs, 120000);
+                    try { tj = JSON.parse(tr.out); } catch (e) { tj = null; }
+                  } catch (e) { tj = null; }
+                  tokRes.push({ tok: t, total: (tj && typeof tj.total === "number") ? tj.total : 0, rows: (tj && Array.isArray(tj.rows)) ? tj.rows : [] });
+                }
+                const hitRes = tokRes.filter((z) => z.total > 0);
+                if (hitRes.length) {
+                  // 帧分组：同（会话，帧，源文件）归一组，命中词数多的优先
+                  const groups = new Map();
+                  for (const z of hitRes) {
+                    for (const x of z.rows) {
+                      const gk = String(x.sid) + "|" + String(x.fr) + "|" + String(x.src || "");
+                      let g = groups.get(gk);
+                      if (!g) { g = { keys: new Set(), rows: [], best: null, score: 0 }; groups.set(gk, g); }
+                      g.keys.add(z.tok); g.rows.push({ row: x, tok: z.tok });
+                      if (!g.best) g.best = x;
+                    }
+                  }
+                  // 同组内优先用“命中词全包含”的行做代表（否则取首行）
+                  for (const g of groups.values()) {
+                    const need = Array.from(g.keys);
+                    const both = g.rows.find((e) => need.every((t) => String((e.row && e.row.x) || "").indexOf(t) >= 0));
+                    if (both) g.best = both.row;
+                    g.score = g.keys.size;
+                  }
+                  const ordered = Array.from(groups.values()).sort((p, q) => (q.score - p.score) || (q.rows.length - p.rows.length)).slice(0, reqLim);
+                  if (ordered.length) {
+                    const totals = tokRes.map((z) => z.tok + "=" + z.total).join("、");
+                    const rareFirst = hitRes.slice().sort((p, q) => p.total - q.total)[0].tok;
+                    const headF = "精确 0 命中，已按空格分词回退（" + toks.length + " 词 OR、命中词多优先；各词命中 " + totals + "，共 " + groups.size + " 组，列出前 " + ordered.length + " 组）";
+                    const bodyF = ordered.map((g) => {
+                      const x = g.best || {};
+                      const full = String(x.x || "").replace(/\s+/g, " ");
+                      let at = -1;
+                      for (const t of toks) { const p = full.indexOf(t); if (p >= 0 && (at < 0 || p < at)) at = p; }
+                      const from = at < 0 ? 0 : Math.max(0, at - 90);
+                      const snip = (from > 0 ? "…" : "") + full.slice(from, from + 260) + (full.length > from + 260 ? "…" : "");
+                      const tag = g.score > 1 ? ("（同帧命中 " + g.score + "/" + toks.length + " 词：" + Array.from(g.keys).join("、") + "）") : "";
+                      return "[" + x.sid + "] " + (x.k || "?") + "  src:" + (x.src || "?") + "#f" + (x.fr === undefined ? "?" : x.fr) + "  cache:" + x.seg + ":" + x.line + tag + "\n    " + snip;
+                    }).join("\n");
+                    const f0 = ordered[0] && ordered[0].best;
+                    const tailF = f0 ? ("\n\n回看原文：session_search({ show: { sid: \"" + f0.sid + "\", frame: " + f0.fr + " } })"
+                      + "\n提示：下次直接查最稀有的一个词（如 \"" + rareFirst + "\"），不用拼长句。") : "";
+                    return headF + "\n\n" + bodyF + tailF;
+                  }
+                }
+              }
+              const ledI = readIndexLedger();
+              const fresh = ledI.lastOkAt ? ("最近一次自动补建成功 " + new Date(ledI.lastOkAt).toLocaleString()) : "尚无成功记录";
+              return "命中 0 处" + (j.note ? ("（" + j.note + "）") : "") + "。\n"
+                + "⚠ 0 结果 ≠ 没记录。按顺序升级：\n"
+                + "  1. 换**更稀有**的词 —— 完整 GUID/URL/路径/报错串 远优于描述性长句（分词会把长句拆散）\n"
+                + "  2. 放宽范围 —— 去掉 since/until，或去掉 sid\n"
+                + "  3. 缓存可能滞后 —— 用 build:true 增量重建（活跃会话最后几秒可能不在）\n"
+                + (a.source === "units" || a.source === "all" ? "" : "  4. 若该内容**曾被归档过**，再试 source:\"units\"（归档时抽取的会话正文；日志被轮转/劈开时只剩它）\n")
+                + "  · 索引自动刷新（v3.1.0）：" + fresh + "（每小时 tick 与 dream 结算后各刷一次，通常无需手动 build）\n";
+            }
+            const head = "命中 " + j.total + " 处" + (j.total > j.listed ? ("（列出前 " + j.listed + " 条，可调大 limit）") : "") + "";
+            const body = (j.rows || []).map((x) => {
+              const full = String(x.x || "").replace(/\s+/g, " ");
+              const at = full.indexOf(kw);
+              const from = at < 0 ? 0 : Math.max(0, at - 90);
+              const snip = (from > 0 ? "…" : "") + full.slice(from, from + 260) + (full.length > from + 260 ? "…" : "");
+              return "[" + x.sid + "] " + (x.k || "?") + "  src:" + (x.src || "?") + "#f" + (x.fr === undefined ? "?" : x.fr)
+                + "  cache:" + x.seg + ":" + x.line + "\n    " + snip;
+            }).join("\n");
+            const first = (j.rows || [])[0];
+            const tail = first ? ("\n\n回看原文：session_search({ show: { sid: \"" + first.sid + "\", frame: " + first.fr + " } })") : "";
+            return head + "\n\n" + body + tail;
+          }
+        });
+        clog("[dsh-memory] session_search 会话原文检索工具已注册（记忆缺失时回原文捞精确字面量）");
+      } catch (e) { cwarn("[dsh-memory] session_search 注册失败:", e && e.message ? e.message : String(e)); }
     }
    // v2.3.2(dream-tool)：声明提前（TDZ），memory_dream_patch 与 memory_search 共用
     // 注册 memory_dream_patch（dream 整合交付工具）
@@ -7117,7 +10920,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       try {
         toolSvc.register({
           name: "memory_dream_patch",
-          description: "提交记忆整合检查点（仅 dream 整合子代理使用）：把要写入记忆库的补丁装进 patches 参数。插件当场校验并落盘：成功返回 wrote 清单；失败返回错误清单（哪一条/哪个字段/为什么），请按清单修正后再次调用（可多次调用，直到全部通过）。file 必须是 ~/.dsh/memory/ 下相对路径（sessions|projects|knowledge|tools/ 或 global.md|index.md）；action ∈ edit|replace|append|delete；edit=局部精确替换（首选），content ≤128KB（edit 免 content、用 old_string/new_string）。",
+          description: "提交记忆库写入检查点（dream 整合子代理与主代理均可调用）：把要写入记忆库的补丁装进 patches 参数。插件当场校验并落盘：成功返回 wrote 清单；失败返回错误清单（哪一条/哪个字段/为什么），请按清单修正后再次调用（可多次调用，直到全部通过）。file 必须是 ~/.dsh/memory/ 下相对路径（sessions|projects|knowledge|tools/ 或 global.md|index.md）；action ∈ edit|replace|append|delete；edit=局部精确替换（首选），content ≤128KB（edit 免 content、用 old_string/new_string）。本工具供 **dream 整合子代理与归档通道**使用；主代理请用记忆库既有的编辑方式（edit/write）或走 /dream 流程。",
           parameters: {
             type: "object",
             properties: {
@@ -7137,7 +10940,8 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
                   },
                   required: ["file", "action"]
                 }
-              }
+              },
+              allowDangling: { type: "boolean", description: "（v2.6.4）显式放行「指向未落盘文件」的库内指针：仅用于复述/描述既有指针（如事故记录里逐字引用一个未落盘文件名），正常写入路径不要用。缺省时本批新增的悬空指针会被拒写。" }
             },
             required: ["patches"]
           },
@@ -7153,7 +10957,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
               else if (args && typeof args === "object") { const v = Object.values(args).find((x) => Array.isArray(x)); if (v) patches = v; }
             } catch (e) {}
             if (!Array.isArray(patches)) return JSON.stringify({ ok: false, mode: "bad-schema", wrote: 0, errors: ["参数必须是 { patches: [...] } 数组"] });
-            const r = applyPatches(patches);
+            const r = applyPatches(patches, { allowDangling: !!(args && typeof args === "object" && !Array.isArray(args) && args.allowDangling === true) });   // v2.6.4：指针闭合校验的显式逃生口
             if (r.ok && r.wrote > 0) LAST_DREAM_WROTE_AT = Date.now();
             return JSON.stringify(r);
           }
@@ -7168,7 +10972,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       try {
         toolSvc.register({
           name: "memory_search",
-          description: "搜索全局记忆库（~/.dsh/memory/）以召回此前沉淀的持久知识。应当先于「凭记忆猜/直接问用户」使用——跨会话踩坑、项目事实、精确配置（路径/ID/命令/数字）、用户偏好大概率已记录。参数 query：主题关键词（1-3 个最具体词，如 OA日志、智检API、前缀缓存）或记忆文件相对路径（global、index、长沙交易场地…）。检索语义：OR 分词 + 相关度排序——任一单词命中即返回候选，稀有词比泛词更准（避免「配置 参数 数据库」堆泛词）。命中即信：一次查询未中不代表未记录，换更稀有词重试；0 结果时按返回文案的升级路径处理（换词 → read 直读 ~/.dsh/memory/ 下文件 → 查最近会话摘要）。注意：本工具仅可在 run_code 程序内调用（await tools.memory_search({ query })），不可直接发起工具调用。",
+          description: "搜索全局记忆库（~/.dsh/memory/）以召回此前沉淀的持久知识。应当先于「凭记忆猜/直接问用户」使用——跨会话踩坑、项目事实、精确配置（路径/ID/命令/数字）、用户偏好大概率已记录。参数 query：主题关键词（1-3 个最具体词，如 OA日志、智检API、前缀缓存）或记忆文件相对路径（global、index、fixed、长沙交易场地…）。检索语义：OR 分词 + 相关度排序——任一单词命中即返回候选，稀有词比泛词更准（避免「配置 参数 数据库」堆泛词）。命中即信：一次查询未中不代表未记录，换更稀有词重试；0 结果时按返回文案的升级路径处理（换词 → read 直读 ~/.dsh/memory/ 下文件 → 查最近会话摘要）。可直接作为工具调用；run_code 程序内亦可经 await tools.memory_search({ query }) 调用。",
           parameters: {
             type: "object",
             properties: {
@@ -7250,15 +11054,24 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
               return "未提取到有效关键词（query 需含至少一个字母/数字/中文）。";
             }
             // v12：逐文件 TF 加权评分，收集全部命中（不再"命中1个就 return"）
+            // v2.8.6（B 档）：评分后叠加 衰减 × 重要度 × 时间窗 乘子（仅重排，不改 scoreTarget 本体）。
+            const recencyQ = isRecencyQuery(q);
             const results = [];
             for (const t of targets) {
               const text = await readText(t.rel);
               if (!text) continue;
               const { score, hitLines } = scoreTarget(t, text, tokens);
-              if (score > 0) results.push({ t, score, hitLines });
+              if (score <= 0) continue;
+              let mt = NaN;
+              try { mt = fs.statSync(portable(t.rel)).mtimeMs; } catch (eM) {}
+              const fm = parseFrontmatter(text);
+              const dy = decayFactor(fm, mt);
+              const im = importanceFactor(fm);
+              const rc = recentnessFactor(fm, mt, recencyQ);
+              results.push({ t, score, hitLines, rawScore: score, decay: dy, importance: im, recency: rc, score2: score * dy * im * rc });
             }
-            // v12：分数降序（同分按 label）
-            results.sort((a, b) => b.score - a.score || a.t.label.localeCompare(b.t.label));
+            // v12：分数降序（同分按 label）；v2.8.6：按复合分排序
+            results.sort((a, b) => b.score2 - a.score2 || a.t.label.localeCompare(b.t.label));
             if (results.length === 0) {
               // v12：0 结果引导——参考 mimocode memory.txt 升级策略，避免模型误判"没记录过"
               // v2.2.6：零结果是检索断链的高发症状——自检未通过时在此自动携带诊断（模型可见，不依赖人看控制台）
@@ -7275,17 +11088,23 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
             //   （0.1~0.5），相对下限算出来太宽（top*0.15）导致完全无关的查询也返回一堆低分文件；
             //   低于绝对下限的结果视为"无意义命中"丢弃（除非它是唯一命中，保留作为弱相关提示）。
             const ABS_MIN_SCORE = 0.6;
-            const topScore = results[0].score;
+            const topScore = results[0].score2;
             const cutoff = topScore * 0.15;
             const kept = results
-              .filter((r, i) => i === 0 || (r.score >= cutoff && (r.score >= ABS_MIN_SCORE || results.length === 1)))
+              .filter((r, i) => i === 0 || (r.score2 >= cutoff && (r.score2 >= ABS_MIN_SCORE || results.length === 1)))
               .slice(0, 8);
             const exactSingle = kept.length === 1 && kept[0].t.file === q;
             const body = kept.map((r) => {
               const lines = r.hitLines.length > 0
                 ? "\n  " + r.hitLines.slice(0, 3).join("\n  ")
                 : "\n  （主题/文件名命中，无正文行摘录）";
-              return "【" + r.t.label + "】" + r.t.file + "（相关度 " + r.score.toFixed(1) + "）" + lines;
+              // v2.8.6：相关度仍报原始词频分；衰减/重要度只在有偏离时附注（无 frontmatter 的旧条目完全静默）
+              const meta = [];
+              if (r.decay < 0.999) meta.push("衰减 " + r.decay.toFixed(2));
+              if (Math.abs(r.importance - 1) > 0.001) meta.push("重要度 " + r.importance.toFixed(2));
+              if (r.recency > 1.001) meta.push("近期 +" + Math.round((r.recency - 1) * 100) + "%");
+              const note = meta.length ? "；" + meta.join("，") : "";
+              return "【" + r.t.label + "】" + r.t.file + "（相关度 " + r.rawScore.toFixed(1) + note + "）" + lines;
             }).join("\n\n");
             // 单一精确命中（query == 文件名）→ 返回全文（原有行为保留）
             if (exactSingle) {
@@ -7302,7 +11121,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
         // 零副作用：不落盘 → 不触发看护续期；只连环 preview 不真写会被 D4 watchdog 停，预览不能成空转避风港。
         toolSvc.register({
           name: "memory_size_preview",
-          description: "提交前 dry-run 预览（仅 dream 整合子代理用）：传 { file, action, content } 或 { file, action:edit, old_string, new_string } 计算「将落盘后的字符数与预算」——返回 { ok, rel, action, wouldChars, budget, overBy, fits, sections }；sections 为 ## 分节字符表（## 归档/漏网会话补档 族标 preferExtract，首选提取），所有文件均返回。写 global/index/projects 这类 budget 敏感文件前先 dry-run 一次量准再真调 memory_dream_patch；sessions/|knowledge/|tools/ 无预算——无需预览，直接 memory_dream_patch 写入即可；**每文件 10 分钟滑动窗内最多 4 次、每会话 8 次，超出工具直接拒绝并回传差数**；不落盘、纯只读。file 越界/action 非法返回错误清单。",
+          description: "提交前 dry-run 预览（dream 整合子代理与主代理均可调用）：传 { file, action, content } 或 { file, action:edit, old_string, new_string } 计算「将落盘后的字符数与预算」——返回 { ok, rel, action, wouldChars, budget, overBy, fits, sections }；sections 为 ## 分节字符表（## 归档/漏网会话补档 族标 preferExtract，首选提取），所有文件均返回。写 global/index/projects 这类 budget 敏感文件前先 dry-run 一次量准再真调 memory_dream_patch；sessions/|knowledge/|tools/ 无预算——无需预览，直接 memory_dream_patch 写入即可；**每文件 10 分钟滑动窗内最多 4 次、每会话 8 次，超出工具直接拒绝并回传差数**；不落盘、纯只读。file 越界/action 非法返回错误清单。",
           parameters: {
             type: "object",
             properties: {
@@ -7384,7 +11203,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
           async execute() {
             ensureStaleNotified();
             const stale = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt())
-              .filter((s) => archivePendingEntry(s) && !sessionMentionedInMemory(s.id));   // v1.12.19→v2.4.3 水位重入判定
+              .filter((s) => shouldReArchive(s, reArchiveOpts()));   // v2.8.4（P13/P15）：单一谓词（原两道闸串行 ⇒ 已落盘会话永不可重档）
             if (ARCHIVE_WM_DIRTY) { saveStaleNotified(); ARCHIVE_WM_DIRTY = false; }
             if (stale.length === 0) return "当前没有待归档的漏网会话（含已归档且无新增的会话）。";
             const r = await runStaleArchive(stale);   // v2.1.4 起成功/失败冷却窗对手动确认同样生效（拒绝理由会回显给模型）
@@ -7403,7 +11222,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       try {
         toolSvc.register({
           name: "memory_onboard",
-          description: "dsh-memory 初始化与升级状态工具（仅可在 run_code 程序内调用：await tools.memory_onboard({ action: \"status\" })）。action=status 体检记忆库并回显版本/状态；action=init 立刻重发一次初始化引导；action=snooze 用户说回头再弄，暂停提醒 hours 小时（默认 24）；action=check-update 立即检查新版本。",
+          description: "dsh-memory 初始化与升级状态工具。action=status 体检记忆库并回显版本/状态；action=init 立刻重发一次初始化引导；action=snooze 用户说回头再弄，暂停提醒 hours 小时（默认 24）；action=check-update 立即检查新版本。可直接作为工具调用；run_code 程序内亦可经 await tools.memory_onboard({ action: \"status\" }) 调用。",
           parameters: {
             type: "object",
             properties: {
@@ -7438,10 +11257,21 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
               }
               const m = inspectMemory();
               const st = readOnboardState();
+              // v2.6.4（L3 体检出口）：悬空指针 = 记忆库内指针指向不存在的文件（「能召回的必已落盘」不变量破口）。
+              //   写时 L1 拦新增，此处对**全库存量**兜底（含 maint/archive/命令等其他写入入口与历史遗留）。
+              let danglingTxt = "";
+              try {
+                const dg = scanDanglingPointers();
+                if (dg.length) {
+                  danglingTxt = "\n悬空指针 " + dg.length + " 处（指向不存在的记忆库文件；建议补写目标、或改指实存文件——已轮转会话指 sessions/archive/…）："
+                    + dg.slice(0, 5).map((d) => d.src + " → " + d.rel).join("；") + (dg.length > 5 ? " 等" : "");
+                }
+              } catch (eD) { danglingTxt = ""; }
               return "记忆库：" + m.status + " · global " + m.bytesGlobal + "B / index " + m.bytesIndex + "B"
                 + (m.missingDirs.length ? " · 缺目录 " + m.missingDirs.join(",") : "")
                 + (m.hasAgents ? " · 有 AGENTS.md" : " · 缺 AGENTS.md（安装脚本会自动补）")
                 + "\n" + onboardStatusLine()
+                + danglingTxt
                 + (st.snoozeUntil > Date.now() ? "\n初始化提醒处于暂缓中（至 " + new Date(st.snoozeUntil).toLocaleString() + "），需要时用 action=init 立即恢复。" : "");
             } catch (e) {
               return "memory_onboard 执行失败：" + (e && e.message ? e.message : String(e));
@@ -7496,10 +11326,74 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
             if (!Object.keys(next).length) return "未更新任何阈值。" + (rejected.length ? "越界被拒：" + rejected.join("、") + "。" : "") + "当前生效：rep≥" + cur.rep + " neg≥" + cur.neg + " sim≥" + cur.sim + " 窗=" + cur.w + " 冷却=" + cur.cooldownMin + "分 | E: 成功上限" + cur.sameNeg + " 步数≥" + cur.sameSteps + " 墙钟≥" + cur.sameMinSecs + "s 同质≤" + cur.sameHomo + " | W: 步数≥" + cur.watchSteps + " 墙钟≥" + cur.watchSecs + "s 冷却=" + cur.watchCooldownMin + "分 | BRK: 同指纹≥" + Math.round(cur.brkSameN) + " 上限deny " + Math.round(cur.brkMaxDeny) + " 无穿插≥" + Math.round(cur.brkMinSteps) + "步";
             const md = readMonitorData();
             const from = {}; for (const k of Object.keys(next)) from[k] = cur[k];
+            // ═══ v3.2.0（2026-10-02 Wave 1）：自校准**方向性硬闸**（R3/R5/R6/R7 + 活跃字段锁）═══
+            //   动因：`spiralThreshLog` 17 条里 6 条同一理由（"中位数 ≤ rep+0.05 ⇒ 上调"）把 rep 抬到硬上限 0.80，
+            //   上限封死后又**改别的旋钮**（09-25 原文"rep 0.85 越界被拒，改调冷却"）⇒ 只锁单字段不够，必须按方向闸。
+            //   原则：**提敏 / 回滚一律放行**（不受任何限制），**降敏必须带证据且受限**。
+            const DESENS = { rep: 1, neg: 1, sim: 1, w: 1, cooldownMin: 1, sameNeg: -1, sameSteps: 1, sameMinSecs: 1,
+              sameHomo: -1, watchSteps: 1, watchSecs: 1, watchCooldownMin: 1, brkSameN: 1, brkMinSteps: 1, brkMaxDeny: -1 };
+            const STEP_MAX = { rep: 0.05, neg: 0.05, sim: 0.05, sameNeg: 0.05, sameHomo: 0.05 };   // 其余整数字段 ≤4 步
+            const desens = [];
+            for (const k of Object.keys(next)) {
+              const dl = next[k] - cur[k];
+              if (dl && Math.sign(dl) === DESENS[k]) desens.push({ k: k, delta: dl });
+            }
+            // R3（v3.2.0）：**单轮步长上限对两个方向都生效**——既防"一次到位"的激进变更，也防一次调用把 rep
+            //   拉到 0.30 造成提醒风暴（提敏同样危险，只是方向不同）。事故级回调走代码内一次性迁移，不经此工具。
+            {
+              const over = [];
+              for (const k of Object.keys(next)) {
+                const dl = next[k] - cur[k];
+                if (!dl) continue;
+                const cap = STEP_MAX[k] != null ? STEP_MAX[k] : 4;
+                if (Math.abs(dl) > cap + 1e-9) over.push("R3 " + k + " 单轮幅度 " + Math.abs(dl) + " 超过上限 " + cap);
+              }
+              if (over.length) return "⛔ 变更被拒（v3.2.0 步长闸）：" + over.join("；") + "。请分多次小步调整（整数字段单轮 ≤4、比例字段 ≤0.05）。";
+            }
+            if (desens.length) {
+              const now0 = Date.now();
+              const log = Array.isArray(md.spiralThreshLog) ? md.spiralThreshLog : [];
+              const bad = [];
+              const rs = String(a.reason || "");
+              if (rs.trim().length < 12 || !/\d/.test(rs)) bad.push("R5 降敏变更必须带 ≥12 字且含数字的 reason");
+              for (const c of desens) {
+                for (let i = log.length - 1; i >= 0; i--) {          // R6：同字段 24h 内已降敏过 ⇒ 拒
+                  const L0 = log[i]; if (!L0 || !L0.to || (now0 - (L0.t || 0)) >= 24 * 3600e3) break;
+                  const pf = (L0.from && L0.from[c.k] !== undefined) ? L0.from[c.k] : null;
+                  if (pf === null || L0.to[c.k] === undefined) continue;
+                  if (Math.sign(L0.to[c.k] - pf) === DESENS[c.k]) { bad.push("R6 " + c.k + " 24h 内已降敏过（" + Math.round((now0 - L0.t) / 3600e3) + "h 前）"); break; }
+                }
+                for (let i = log.length - 1; i >= 0; i--) {          // 活跃字段锁：24h 内已降敏过**别的**字段 ⇒ 拒
+                  const L1 = log[i]; if (!L1 || !L1.to || (now0 - (L1.t || 0)) >= 24 * 3600e3) break;
+                  for (const k2 of Object.keys(L1.to)) {
+                    if (k2 === c.k) continue;
+                    const pf2 = (L1.from && L1.from[k2] !== undefined) ? L1.from[k2] : null;
+                    if (pf2 === null) continue;
+                    if (Math.sign(L1.to[k2] - pf2) === DESENS[k2]) { bad.push("Lock 24h 内已对 " + k2 + " 降敏，禁止再动 " + c.k + "（防棘轮换旋钮）"); break; }
+                  }
+                  if (bad.length) break;
+                }
+              }
+              try {   // R7：反向证据硬闸——近 24h D 有被拦 ≥3 次且 0 投递 ⇒ 禁止降敏
+                // v3.2.0（Wave 2 候选 C）：被拦 reason 集合扩为 {batch(旧口径), batch-cooldown, cooldown, off}；
+                //   `batch-soft` 属**已投递**（降级文案），不计入拦截。
+                const BLOCKED = ["batch", "batch-cooldown", "cooldown", "off"];
+                const ge = Array.isArray(md.gateEvents) ? md.gateEvents : [];
+                const dBlocked = ge.filter((x) => x && x.cls === "D" && BLOCKED.indexOf(x.reason) >= 0 && (now0 - (x.t || 0)) < 24 * 3600e3)
+                  .reduce((s2, x) => s2 + (x.n || 1), 0);
+                const evs = Array.isArray(md.events) ? md.events : [];
+                const dDelivered = evs.filter((x) => x && x.type === "hintD" && (now0 - (x.t || 0)) < 24 * 3600e3).length;
+                if (dBlocked >= 3 && dDelivered === 0) bad.push("R7 反向证据：近 24h D 被拦 " + dBlocked + " 次且 0 投递 ⇒ 禁止降敏");
+              } catch (e) { /* 证据读取失败不阻断；降敏另有 R5/R6 兜底 */ }
+              if (bad.length) return "⛔ 降敏变更被拒（v3.2.0 方向性硬闸）：" + bad.join("；") + "。提敏/回滚不受限；确需降敏请补证据或人工改默认。";
+            }
             md.spiralThresh = Object.assign({}, (MONITOR_DATA.spiralThresh || {}), next);
             // v2.0.4: 变更日志（滚动20条）——阈值是被 AI 自动改的政策参数，必须留痕供审计/回滚
+            // v3.2.0（Wave 1）：补 `dir`（sens/desens 方向）与 `ep`（**世代快照**：全部生效阈值）——
+            //   旧日志只有 from→to，无法判断某条样本是否跨世代；E 相关字段（sameMinSecs/sameHomo）也必须进快照。
             if (!Array.isArray(md.spiralThreshLog)) md.spiralThreshLog = [];
-            md.spiralThreshLog.push({ t: Date.now(), from: from, to: Object.assign({}, next), reason: String(a.reason || "").slice(0, 80) });
+            md.spiralThreshLog.push({ t: Date.now(), from: from, to: Object.assign({}, next), reason: String(a.reason || "").slice(0, 80),
+              dir: desens.length ? "desens" : "sens", ep: threshEpoch() });
             if (md.spiralThreshLog.length > 20) md.spiralThreshLog = md.spiralThreshLog.slice(-20);
             scheduleMonitorSave();
             const et = effectiveSpiralThresh();
@@ -7565,19 +11459,89 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
         fs.mkdirSync(MEMORY_ROOT.replace(/\//g, "/"), { recursive: true });
         // v2.0.9(M1): 账本写盘前与磁盘做并集合并——外部/人工补账的 archivedSessions、staleNotified 不再被内存态整体覆写。
         // 注：账本是 append-only 消号语义；人工「摘牌」属维护操作，需在插件重启前完成或接受回写。
-        try {
-          const disk = JSON.parse(fs.readFileSync(portable(INTEGRATE_STATE_FILE), "utf8"));
-          if (Array.isArray(disk.archivedSessions)) state.archivedSessions = Array.from(new Set([...disk.archivedSessions, ...(state.archivedSessions || [])])).slice(-300);
+        // ★★ §9.11.4-3 修正六（**红队 rev8c B② 实测**：账本半截 JSON ⇒ 该 tick 静默降级成「无待归档候选」，
+        //   并在同一次 tick 里把账本覆盖成只剩 `archiveAutoLast` 的空账本 ⇒ `archivedSessions`/`archiveWatermarks` 全清）：
+        //   **账本文件存在但解析不出来 ⇒ 拒绝本次写盘**（fail-closed）。宁可不落盘，也不能用"内存里那三份很可能是空的
+        //   账本"覆盖它 —— 那等于把"哪些会话已归档"这条唯一账本洗掉 ⇒ 下次重启全部会话重新成候选（本批要防的形态）。
+        //   修复要靠人：从备份/快照恢复，或手工重建 id 列表；**不要直接删除该文件**（删了同样让全部会话重新成候选）。
+        let diskRaw = null;
+        try { diskRaw = fs.readFileSync(portable(INTEGRATE_STATE_FILE), "utf8"); } catch (e0) { diskRaw = null; }   // 读不到 = 文件不存在（首次运行）⇒ 正常写
+        if (diskRaw !== null) {
+          let disk = null;
+          try { disk = JSON.parse(diskRaw); } catch (e1) { disk = null; }
+          if (!disk) {
+            // ★★ §9.11.4-5（**根因修复：从"拒写"升级为"抢救"**）。原实现只做 fail-closed（拒写）——
+            //   它是治标：归档从此暂停，**要人手工修**；而且"读到损坏就拒写"这条路径正是**非原子写**
+            //   制造出来的（现已改成 `writeFileAtomic`，见下方写盘处）。
+            //   现在改为**三步抢救**（宁可抢救出 id 列表，也不用空账本覆盖，也不干等人工）：
+            //     ① 把**损坏原文**另存为 `.corrupt-<时间戳>.bak`（**绝不删、绝不原地覆盖** —— 它是唯一的现场证据）；
+            //     ② 从损坏文本里**正则捞出**全部 `session-<uuid>` 形态的 id（半截 JSON 里已写下的部分仍在）；
+            //     ③ 用"抢救出的 id"作 `archivedSessions` 的**下限**（与内存态并集）⇒ 保住"哪些已归档"，
+            //        使"下次重启全部会话重新成候选"（token 爆炸）**不会发生**；水位信息无法抢救的部分**如实留痕**。
+            let rescued = [];
+            try {
+              // ★ 正则**不能只认 uuid 形态**（我第一版只写 uuid ⇒ 门夹具里的 `session-stale9`、以及任何
+              //   自定义 id 都捞不到 ⇒ 抢救形同虚设）。放宽为 `session-<非空 token>`，并**去重**。
+              const ids = String(diskRaw).match(/session-[A-Za-z0-9_-]+/g) || [];
+              rescued = Array.from(new Set(ids.map((x) => x.replace(/["',\s].*$/, "").trim()).filter((x) => x.length > 8)));
+            } catch (e5) {}
+            // ① 备份损坏原文（失败也不阻断，但会留痕）
+            let bakOk = false, bakPath = "";
+            try {
+              bakPath = portable(INTEGRATE_STATE_FILE) + ".corrupt-" + Date.now() + ".bak";
+              fs.writeFileSync(bakPath, diskRaw, "utf8");
+              bakOk = true;
+            } catch (e6) {}
+            if (rescued.length > 0) {
+              const merged = new Set([...(state.archivedSessions || []), ...rescued]);
+              state.archivedSessions = Array.from(merged).slice(-LEDGER_CAP);
+              state._rescuedFromCorrupt = { at: Date.now(), ids: rescued.length, bak: bakOk ? true : false };
+              // ★ 关键（**我第一版在这里栽了**）：抢救成功后必须把 `disk` 补成**最小可用对象** ——
+              //   否则紧随其后的 `if (Array.isArray(disk.archivedSessions))` 会对 `null` 取属性 ⇒ TypeError ⇒
+              //   被外层 catch 吞掉 ⇒ **写盘根本没发生**（实测：备份有了、账本仍是 99 B 半截）。
+              //   `archiveWatermarks` 置空数组：水位无法从半截 JSON 抢救（**如实**：它会退化成"懒置基线"，
+              //   比"全部会话重新成候选"轻得多）。
+              disk = { archivedSessions: rescued, archiveWatermarks: [] };
+              cwarn("[dsh-memory] ⚠ 账本文件存在但**读不出来**（解析失败 / 半截写 / 损坏）⇒ 已**抢救**出 " + rescued.length
+                + " 个已归档 id（原文备份" + (bakOk ? "已保存" : "**保存失败**") + "）⇒ **改为写盘**（用抢救后的账本，"
+                + "避免下次重启全部会话重新成候选）。**水位信息可能不完整**（仅能恢复 id 列表）。"
+                + "建议：从备份核对 `archiveWatermarks`，或手工补齐；**不要直接删除损坏文件**（已自动留档）。");
+              try { monitorEvent("ledger", "corrupt-rescued ids=" + rescued.length + " bak=" + (bakOk ? 1 : 0) + " refusals=" + (REFUSE_WRITE_SEEN = REFUSE_WRITE_SEEN + 1)); } catch (e2) {}
+              // 不 return ⇒ 继续走下面的并集合并与写盘（这次写的是"抢救后的账本"）
+            } else {
+              // 连 id 都捞不出来 ⇒ 退回 fail-closed（拒写），但**原文已备份**
+              let refusals = 0;
+              try { const st2 = readIntegrateState(); refusals = (Number(st2 && st2._refuseSeen) || 0) + 1; } catch (e4) {}
+              REFUSE_WRITE_SEEN = refusals;
+              cwarn("[dsh-memory] ⚠ 账本文件存在但**读不出来**（解析失败 / 半截写 / 损坏），且**抢救不出任何 id** ⇒ **本次拒绝写盘**"
+                + "（避免用空账本覆盖它；原文已备份为 `.corrupt-*.bak`）。修复：从备份/快照恢复，或手工重建 "
+                + "`archivedSessions` / `archiveWatermarks`；**不要直接删除它**。在此之前归档轮暂停（不归档、不写盘）。");
+              try { monitorEvent("ledger", "unreadable refuse-write refusals=" + REFUSE_WRITE_SEEN + " bak=" + (bakOk ? 1 : 0)); } catch (e2) {}
+              return;   // ← 关键：不写
+            }
+          }
+          if (Array.isArray(disk.archivedSessions)) state.archivedSessions = Array.from(new Set([...disk.archivedSessions, ...(state.archivedSessions || [])])).slice(-LEDGER_CAP);
           // v2.4.3: 水位账本按 id 合并（同 id 取 at 较新者），防多实例/外部补账互相覆盖水位
           if (Array.isArray(disk.archiveWatermarks)) {
             const byId = {};
             for (const w of disk.archiveWatermarks) if (w && w.id) byId[w.id] = w;
             for (const w of (state.archiveWatermarks || [])) if (w && w.id && (!byId[w.id] || (w.at || 0) >= (byId[w.id].at || 0))) byId[w.id] = w;
-            state.archiveWatermarks = Object.values(byId).slice(-300);
+            state.archiveWatermarks = Object.values(byId).slice(-LEDGER_CAP);   // 批0（P0-4）：300→LEDGER_CAP（原为第二处硬编码）
           }
-          if (Array.isArray(disk.staleNotified)) state.staleNotified = Array.from(new Set([...disk.staleNotified, ...(state.staleNotified || [])])).slice(-300);
-        } catch (e) { /* 磁盘不可读则按内存态原样写 */ }
-        fs.writeFileSync(portable(INTEGRATE_STATE_FILE), JSON.stringify(state, null, 2), "utf8");
+          if (Array.isArray(disk.staleNotified)) state.staleNotified = Array.from(new Set([...disk.staleNotified, ...(state.staleNotified || [])])).slice(-LEDGER_CAP);
+          // v2.8.4（T4·**外部补账不得被插件写洗掉**）：超限账本可由**外部工具**写入（如一次性下沉脚本
+          //   `_apply-sink-stuck.mjs` 记 `overLimitStuck`），而本进程的内存态可能是它**之前**读的 ⇒ 整对象写回会抹掉它。
+          //   语义与实现见模块级 `mergeLedgerExternalKeys`（纯函数，门直测）。
+          mergeLedgerExternalKeys(state, disk);
+        }
+        // ★★ §9.11.4-5（**根因修复**）：账本原先用 `fs.writeFileSync` **直接写** ⇒ **非原子**：
+        //   155 KB 的账本写到一半崩溃/断电/被杀 ⇒ 盘上留**半截 JSON** ⇒ 下次启动"读不出来"⇒
+        //   本批的 fail-closed 只能**拒写**（治标：归档从此暂停），而且那条"读到损坏就拒写"的路径
+        //   本身也是被这个非原子写**制造**出来的。
+        //   ⇒ 改用仓内既有 `writeFileAtomic`（临时文件 + rename + 回读校验）—— **复用现成的**，
+        //     不再自造第二套原子写（本批已因"两处各写一遍"栽过多次）。
+        const wRes = writeFileAtomic(INTEGRATE_STATE_FILE, JSON.stringify(state, null, 2), { tag: "ledger", verify: true });
+        if (wRes && wRes.readbackOk === false) cwarn("[dsh-memory] ⚠ 账本原子写回读校验不一致（盘上内容与预期不符）—— 请留意该文件");
       } catch (e) {
         cwarn("[dsh-memory] 整合状态写入失败:", e && e.message ? e.message : String(e));
       }
@@ -7605,15 +11569,21 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
     // v1.12.12：统计子代理会话消耗（多帧解压 jsonl.zstd，累计 usage chunks + turn 时长）
     function summarizeSubagentUsage(sessionDir) {
       try {
-        const zpath = sessionDir + "/session.jsonl.zstd";
-        if (!fs.existsSync(zpath)) return null;
+        const zpaths = resolveSessionLogPaths(sessionDir);   // v2.8.4（P21）：**全部**（双名目录旧实现只看其一 ⇒ 消耗少算）
+        if (!zpaths.length) return null;
         // v1.12.18.4: 复用共享解压实现（消除两套 zstd 多帧循环）
-        const text = decompressSessionLog(zpath);
+        const text = zpaths.map((zp) => decompressSessionLog(zp)).filter(Boolean).join("\n");
         if (!text) return null;
         let inT = 0, outT = 0, cacheT = 0, reasonT = 0, t0 = 0, t1 = 0;
+        let inT2 = 0, outT2 = 0, cacheT2 = 0;   // [2026-09-23 V4] 内联用量（assistant/chunk 行已取消，改收 message 内联）
         for (const line of text.split("\n")) {
           if (line.indexOf("\"usage\"") < 0 && line.indexOf("turn/") < 0) continue;
           let j; try { j = JSON.parse(line); } catch (e) { continue; }
+          // [2026-09-23 V4] 用量改内联进 assistant/message.data.usage；chunk 与内联互斥出现，收完按"有 chunk 用 chunk"取舍（防 v3+v4 双文件重叠 double count）
+          if (j.type === "assistant/message" && j.data && j.data.usage && typeof j.data.usage === "object") {
+            const u2 = j.data.usage;
+            inT2 += u2.inputTokens || 0; outT2 += u2.outputTokens || 0; cacheT2 += u2.cacheReadTokens || 0;
+          }
           if (j.type === "assistant/chunk" && j.data && j.data.chunk && j.data.chunk.type === "usage") {
             const u = j.data.chunk.usage || {};
             inT += u.inputTokens || 0; outT += u.outputTokens || 0;
@@ -7622,11 +11592,61 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
           if (j.type === "turn/start") t0 = j.time;
           if (j.type === "turn/end") t1 = j.time;
         }
+        // [2026-09-23 V4] chunk 行缺席时用内联用量（v3 文件仍优先 chunk 行，防双文件重叠 double count）
+        if (inT + outT + cacheT === 0 && (inT2 + outT2 + cacheT2) > 0) { inT = inT2; outT = outT2; cacheT = cacheT2; }
         // v1.12.17.1: turn/end 可能尚未落盘（完成回调与日志写盘竞态）→ t0 兜底到当前时间
         const durMin = t1 > t0 ? Math.round((t1 - t0) / 60000 * 10) / 10 : (t0 > 0 ? Math.round((Date.now() - t0) / 60000 * 10) / 10 : 0);
         // v1.12.17.1: 口径修正——inputTokens 仅是未命中部分，总输入 = inputTokens + cacheReadTokens
         return { input: inT, output: outT, cache: cacheT, totalIn: inT + cacheT, reasoning: reasonT, durMin: durMin };
       } catch (e) { return null; }
+    }
+
+    // v3.2.2（2026-10-18）：子代理"死于什么"必须一眼看见——
+    //   宿主 `SubagentResult` 只有 `{ output, stopReason, structured }`，**不带失败原因**
+    //   （0.2.1-rc.2 `dsh-subagent/lib/index.js` 的 `captureLocalResult` 实证：stopReason 只会是 "error"）。
+    //   于是从子会话日志尾部捞最后一次 `turn/end` 的 `reason.error{message,code}`：
+    //   现场（2026-10-18 12:00 dream 连发两次全空、输出 0 字符、usage 0）真因是
+    //   `429 GoUsageLimitError`，而插件只打得出 `stopReason=error` —— 不看子会话原始帧无法归因，
+    //   人只能误以为是写守卫/超限文件。此函数只读、失败即返回 null，绝不影响结算。
+    function readSubagentFailure(sessionDir) {
+      try {
+        const zpaths = resolveSessionLogPaths(sessionDir);
+        if (!zpaths.length) return null;
+        const text = zpaths.map((zp) => decompressSessionLog(zp)).filter(Boolean).join("\n");
+        if (!text) return null;
+        let last = null;
+        for (const line of text.split("\n")) {
+          if (line.indexOf("turn/end") < 0) continue;
+          let j; try { j = JSON.parse(line); } catch (e) { continue; }
+          if (j.type !== "turn/end") continue;
+          const r = (j.data && j.data.reason) || {};
+          const err = r.error || r.failure;
+          if (r.kind === "error" || err) {
+            last = {
+              message: (err && (err.message || err.text)) || (r.kind === "error" ? String(r.kind) : ""),
+              code: (err && err.code) || ""
+            };
+          }
+        }
+        return last;
+      } catch (e) { return null; }
+    }
+
+    // ═══ §9.12④（用户「都搞」）：**消耗统计的读取竞态** ═══
+    // 症状（既有缺陷，2026-09-18 本会话实测）：子代理 settle 时立刻读它的会话日志，尾部 `assistant/chunk(usage)`
+    //   往往**还没落盘** ⇒ `summarizeSubagentUsage` 返回 0 消耗（心跳行里"输入 0 万 / 输出 0 万"躺了很久）。
+    //   当时的旁证：`durMin` 走的是"turn/end 缺失 ⇒ 用当前时间兜底"那条分支，而约 2 秒后再读就能读到 usage。
+    // 修法：**有界重试**（不做无限轮询）—— 判据 = 读不到任何 usage；最多 USAGE_RETRY_N 次、间隔 USAGE_RETRY_MS；
+    //   并把重试次数与最终读取时刻记进账本（`usageRetry`/`usageReadAt`，读不到时另记 `usageEmpty`）
+    //   ⇒ 下次看到"0 消耗"能一眼分辨"真的没花"还是"读早了/日志没落盘"。
+    const USAGE_RETRY_N = 4, USAGE_RETRY_MS = 1500;
+    async function summarizeSubagentUsageRetry(sessionDir) {
+      const r = await retryReadUsage(() => summarizeSubagentUsage(sessionDir), { attempts: USAGE_RETRY_N, gapMs: USAGE_RETRY_MS });
+      if (!r.value) return null;                     // 保留旧语义：读不到 ⇒ null（调用方跳过）
+      // ★ B2（2026-10-07 现场：总输入 0 tokens 却 written=3）：**重试耗尽但读到一个"全 0 的不合格值"**
+      //   （现场形态 durMin 有值、inT/outT 全 0）⇒ 必须与"真的没花"分开：带 usageEmpty 出去，
+      //   读者行与账本都不会把它读成 0 消耗。判据 = retryReadUsage 带回的 ok（isDone 结论）。
+      return Object.assign({}, r.value, { usageRetry: r.tries, usageReadAt: Date.now(), usageEmpty: r.ok !== true });
     }
 
     // v1.12.17: dream 进度/结果落盘（GUI 不展示后台子代理会话——任何会话读 .integrate.json 可查）
@@ -7644,27 +11664,146 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
     // v1.12.18.6: STALE_NOTIFIED 持久化——重启后不重复提醒/重复归档跳过项；staleCount 快照可正确收敛
     function ensureStaleNotified() {
       if (staleNotifiedLoaded) return;
-      staleNotifiedLoaded = true;
       try {
-        const st0 = readIntegrateState() || {};
+        const st0 = readIntegrateState();
+        // ★ §9.11.4-3 修正五（红队 rev8b F-②）：**读不出来就不要置位**。
+        //   旧写法把 `staleNotifiedLoaded = true` 放在读盘**之前** ⇒ 一次读失败（半截 JSON / 瞬时不可读）
+        //   就把"内存账本为空"锁死到该进程生命周期，而本批新增的落盘段会无条件 `saveStaleNotified()`
+        //   ⇒ 把空账本写回磁盘（= 我本批要修的形态的窄触发版）。现在失败留给下一次调用重试。
+        //   注：账本文件**不存在**（首次运行）也走这条 —— 代价是每次调用重试一次读盘，
+        //   一旦任何写路径建出该文件，下一次调用即正常加载；相比之下"锁死空账本"的代价大得多。
+        if (!st0 || typeof st0 !== "object") {
+          // ★ §9.11.4-3 修正六（红队 rev8c B②）：**文件存在却读不出来**（半截 JSON / 损坏）⇒ 记标记并一次性警告。
+          //   不置 `staleNotifiedLoaded`（下次调用还会重试读盘 ⇒ 人工修好后**无需重启**即可恢复加载）。
+          let fileThere = false;
+          try { fileThere = fs.existsSync(portable(INTEGRATE_STATE_FILE)); } catch (e9) {}
+          if (fileThere) {
+            // ★★ 工程席 rev8k A2：同写入口 —— 警告每次都打（读入口只在人工在场路径与每 tick 调，非热路径），
+            //   证据记**内存 + `.monitor.json`**（`monitorEvent`），**不写损坏账本**（那会毁掉 fail-closed 本身）。
+            REFUSE_WRITE_SEEN++;
+            cwarn("[dsh-memory] ⚠ 账本文件存在但**读不出来**（读盘失败 / 损坏）⇒ 归档轮暂停：不归档、**不写盘**"
+              + "（否则会用空账本覆盖它，下次重启全部会话重新成候选）。修复：从备份恢复该文件，或手工重建；"
+              + "**不要直接删除它**。");
+            try { monitorEvent("ledger", "unreadable abort refusals=" + REFUSE_WRITE_SEEN); } catch (e8) {}
+          }
+          return;
+        }
+        staleNotifiedLoaded = true;
         (st0.staleNotified || []).forEach((id) => STALE_NOTIFIED.add(id));
         // v2.4.3: 载入增量重档水位账本
-        (st0.archiveWatermarks || []).forEach((w) => { if (w && w.id) ARCHIVE_WATERMARK.set(w.id, { frames: typeof w.frames === "number" ? w.frames : null, round: w.round || 1, at: w.at || 0 }); });
+        // §9.11.4-3：`empty` = 该 sid 是**"确无内容"**消号的（不是"提取失败"）；`skipped` = 本轮**一个文件都没读**
+        //   （水位已判其帧消费完）。二者都是"账本自答为什么判它已归档"的载体。
+        //   ★ 口径更正（**工程席 rev8f A2 实测**）：原文写它们"是 `unitLost` 的排除项" —— **那是描述一个不存在的实现**
+        //   （`unitLost` 读的是 `LAST_ARCHIVE_FLOW`/单元文件，从不读水位字段），且这两个字段当时**只有写点**。
+        //   现已把计数落盘（`archiveWmEmpty`/`archiveWmSkipped`）并接进 `formatArchiveSignal` ⇒ **有活读点**：
+        //   健康行会写"确无内容消号 N 个 … 这些会话本来就没有单元、不算丢了单元"。
+        (st0.archiveWatermarks || []).forEach((w) => { if (w && w.id) ARCHIVE_WATERMARK.set(w.id, normalizeWatermark(w, "load")); });
         (st0.archivedSessions || []).forEach((id) => ARCHIVED_SESSIONS.add(id));   // v1.12.19: 双账本加载
         if (st0.archiveLastRunAt) ARCHIVE_LAST_RUN_AT = st0.archiveLastRunAt;   // v2.0.9: 归档节流时间戳跨重启生效
         if (st0.archiveLastFailAt) ARCHIVE_LAST_FAIL_AT = st0.archiveLastFailAt;   // v2.4.7.1: 发起失败短冷却同样跨重启生效
       } catch (e) { /* 忽略 */ }
     }
+    // ★ 修正七（红队 rev8d P1）：**现问**"这一轮能否读出账本"——不缓存、不粘滞。
+    //   判据只有一条：**文件存在但解析不出**（`readIntegrateState() === null` ∧ 文件在盘上）。
+    //   文件不存在 = 首次运行（正常，照常跑）；读得出来 = 正常。⇒ 瞬时失败可自愈。
+    function ledgerUnreadableNow() {
+      try {
+        if (readIntegrateState() !== null) return false;
+        return fs.existsSync(portable(INTEGRATE_STATE_FILE));
+      } catch (e) { return false; }
+    }
     function saveStaleNotified() {
       try {
+        // ★★ §9.11.4-6（**本项：读写契约不对称** —— 用**逐行实测**定性，不是推演）。
+        //   对象：`readIntegrateState()` 对**两种**情况都返回 `null` —— ①文件不存在（首次运行，正常）
+        //   ②**文件存在但解析不出**（半截 JSON / 损坏）。调用方无法从返回值区分，这本身没错；
+        //   错在**两个入口对同一个 `null` 给出了不同契约**：
+        //     · 读入口 `ensureStaleNotified`（L10317）：坏账本 ⇒ **fail-closed**（L10327 判 `!st0` ⇒
+        //       `cwarn` + `monitorEvent` + `return`，**不置** `staleNotifiedLoaded`、**不写盘**）。
+        //     · 写入口 `saveStaleNotified`（本函数）：坏账本 ⇒ `readIntegrateState() || {}` 起手 ⇒
+        //       **继续往下走、照样写盘**，只靠 `writeIntegrateState` 内部的"抢救"兜底。
+        //   实测证据（探针 `_probe-946-asym.mjs`，逐行判定、已删）：
+        //     读入口 fail-closed = **true**；写入口取值行 = `const st = readIntegrateState() || {};`
+        //     （`|| {}` 骨架 = **true**）；写入口自带坏账本闸（`ledgerUnreadableNow` / `JSON.parse(diskRaw)`）= **false** ×2。
+        //   ⇒ "该不该写"由**两个不同判据**决定，且写入口的判据是**走后门**的（靠下游兜底，不靠自己）。
+        //     后果不是"立刻丢数据"（rev8q 的抢救在写路径上确实拦住了），而是**契约不可推理**：
+        //     任何改动 `writeIntegrateState` 兜底策略的人（含未来的我）都会**无声地**改变写入口的语义 ——
+        //     这正是本批反复出现的"两处各写一遍、各自成真理"形态的**读侧同构体**。
+        //   修法：**写入口自己拿同样的闸**。判据复用 `ledgerUnreadableNow()`（单一来源，L10361），
+        //     语义与读入口**完全对齐**：文件不存在 ⇒ 正常写（新装用户必须能建档）；读得出 ⇒ 正常写；
+        //     **存在但读不出 ⇒ 本轮不写**（`REFUSE_WRITE_SEEN++` + 每轮留痕，与 `ensureStaleNotified` 同口径）。
+        //   ★ 为什么**不删** `|| {}`：文件不存在的首次运行需要它建出骨架，这是正常路径。
+        //   ★ 为什么**保留**下游抢救：这是纵深防御（第二道），不是替代品 —— 兜底仍在，只是不再是**唯一**防线。
+        if (ledgerUnreadableNow()) {
+          REFUSE_WRITE_SEEN++;
+          cwarn("[dsh-memory] ⚠ 账本存在但**读不出来** ⇒ `saveStaleNotified` **本轮不写盘**"
+            + "（与读入口 `ensureStaleNotified` 同口径；否则要用内存空账本覆盖它）。"
+            + "修复：从备份/`.corrupt-*.bak` 恢复，或手工重建；**不要直接删除它**。");
+          try { monitorEvent("ledger", "unreadable save-refuse refusals=" + REFUSE_WRITE_SEEN); } catch (e9) {}
+          return;
+        }
         const st = readIntegrateState() || {};
-        st.staleNotified = Array.from(STALE_NOTIFIED).slice(-300);
-        st.archivedSessions = Array.from(ARCHIVED_SESSIONS).slice(-300);   // v1.12.19
-        // v2.4.3: 水位随账本对齐保存（与 archivedSessions 同 300 上限）
-        st.archiveWatermarks = Array.from(ARCHIVED_SESSIONS).slice(-300).map((id) => { const w = ARCHIVE_WATERMARK.get(id); return w ? { id: id, frames: w.frames, round: w.round, at: w.at } : null; }).filter(Boolean);
+        // 批0（P0-4）：上限 300 → 5000，且**裁剪必须留痕**。
+        //   根因：三份账本原先各自硬编码同一上限 300（保存路径与写盘合并路径各一处），而盘上会话已 1065 个（实测 archivedSessions 280/300，即将顶格）。
+        //   顶格后最旧 id 被**静默**丢弃 ⇒ 重启后不在 ARCHIVED_SESSIONS ⇒ 该会话被判"待归档"重复归档，
+        //   或走懒置基线把期间的尾帧**静默吞掉**（永不再提取）。裁剪本身必要（防状态文件无限增长），
+        //   但必须可见；若将来 5000 也顶格，正确解法是**按 id 分片**，不是继续加大。
+        const _trimLedger = (arr, label) => {
+          const a = Array.from(arr);
+          if (a.length > LEDGER_CAP) {
+            cwarn("[dsh-memory] " + label + " 账本超 " + LEDGER_CAP + " 条（" + a.length + "）——裁剪最旧，最旧会话可能被重复归档或漏档；建议改为按 id 分片");
+            try { monitorEvent("ledger", "trim " + label + " " + a.length + "→" + LEDGER_CAP); } catch (e) {}
+          }
+          return a.slice(-LEDGER_CAP);
+        };
+        st.staleNotified = _trimLedger(STALE_NOTIFIED, "staleNotified");
+        st.archivedSessions = _trimLedger(ARCHIVED_SESSIONS, "archivedSessions");   // v1.12.19；批0（P0-4）：300 → 5000
+        st.archiveWatermarks = _trimLedger(ARCHIVED_SESSIONS, "archiveWatermarks").map((id) => { const w = ARCHIVE_WATERMARK.get(id); return w ? normalizeWatermark(w, "save", id) : null; }).filter(Boolean);
+        // ★★ §9.11.4-3 修正九（工程席 rev8f A2）：把 `empty`/`skipped` 的**计数**落盘 ⇒ `formatArchiveSignal`
+        //   有活读点（"为什么判它已归档"与"为什么它没有单元"都在**用户可见的健康行**上自答；
+        //   原先这两个字段只有写点、注释却声称是 `unitLost` 的排除项 = 描述了一个不存在的实现）。
+        try {
+          let nEmpty = 0, nSkipped = 0;
+          for (const id of ARCHIVED_SESSIONS) { const w = ARCHIVE_WATERMARK.get(id); if (w && w.empty === true) nEmpty++; if (w && w.skipped === true) nSkipped++; }
+          st.archiveWmEmpty = nEmpty; st.archiveWmSkipped = nSkipped;
+          // ★ 修正十三：把"按水位跳过"的两个计数也落盘 ⇒ 健康行能报（**红队 rev8h C-3：跨轮不可查**的整改）
+          let nWs = 0, nWsEx = 0;
+          for (const [id, w] of ARCHIVE_WATERMARK) { if (w && w.wmSkip === true) { nWs++; if ((Number(w.wmSkipRounds) || 0) >= WM_SKIP_MAX_ROUNDS) nWsEx++; } }   // ★ 工程席 rev8k A4：改遍历**水位全表**（原遍历 `ARCHIVED_SESSIONS`，而 wm-skip 标记路径**不往里加 id** ⇒ 耗尽的会话可能整个漏报，而那正是该告警存在的唯一目的）
+          st.archiveWmSkip = nWs; st.archiveWmSkipExhausted = nWsEx;
+          // ★ 工程席 rev8k A3 整改：`wmSkippedFrames` 原先**只写不读**（"加了没人读"第 4 例）⇒ 现把**合计被跳过帧数**也落盘，并在健康行报出（让它成为活字段；删掉会丢掉"跳过了多少帧"这个现场线索）。
+          let nWsFrames = 0; for (const [id, w] of ARCHIVE_WATERMARK) { if (w && w.wmSkip === true) nWsFrames += Number(w.wmSkippedFrames) || 0; }
+          st.archiveWmSkipFrames = nWsFrames;
+        } catch (e0) {}
+        // ★★ §9.11.4-3 修正十二（**根因席 rev8f B / 工程席 rev8f P0**）：`unitLost` 的**历史**盲区。
+        //   现有 `unitLost`（L5426）= `(!unitInfo.ok) && wasExtracted`，而 `wasExtracted` 读的是**本轮内存**
+        //   `LAST_ARCHIVE_FLOW.sessionIds` ⇒ 对"**已归档**但盘上查不到单元"的**历史**会话**永远是 false**
+        //   ⇒ 那条健康信号**从不响**（根因席：给一个从不执行的信号加守卫 = 死代码延续）。
+        //   这里补一个**独立、可复算**的计数：`已归档 ∧ 无单元 ∧ 非空会话（w.empty !== true）` ——
+        //   这才是"内容可能真丢了"的可靠信号。
+        //   ★ 成本控制：289 个已归档会话逐个读盘太重 ⇒ **限量扫描**（每次最多 50 个，游标轮转，跨轮覆盖全量），
+        //     并把"本轮查了多少"一并落盘（`unitLostChecked`）⇒ 读者能判断信号的可信度，不会把"没查"误读成"没丢"。
+        try {
+          const all = Array.from(ARCHIVED_SESSIONS);
+          const CAP = 50;
+          let cursor = Number(st.unitLostCursor) || 0;
+          if (cursor >= all.length) cursor = 0;
+          const slice = all.slice(cursor, cursor + CAP);
+          let lostA = 0;
+          for (const id of slice) {
+            const w = ARCHIVE_WATERMARK.get(id);
+            if (w && w.empty === true) continue;                 // 空会话本来就没有单元，不是丢失
+            try { const u = readArchiveUnitForSkip(id); if (!u || u.ok !== true) lostA++; } catch (e1) { /* 读失败不计数，避免把环境故障算成丢失 */ }
+          }
+          st.unitLostArchived = lostA;
+          st.unitLostChecked = slice.length;
+          st.unitLostCursor = cursor + slice.length;
+          st.archiveWmTotal = all.length;   // ★ §9.11.4-9：健康行据此算"待查 N 个"（原先只报"查了 N 个" ⇒ 读者无从判断覆盖度）
+        } catch (e2) { try { st.unitLostErr = String((e2 && e2.message) || e2); } catch (e3) {} }
+        st.fmtNotified = Array.from(FMT_NOTIFIED).slice(-50);   // v2.6.5: 未识别日志名提示去重账本（跨重启不重复提示）
         writeIntegrateState(st);
       } catch (e) { /* 忽略 */ }
     }
+    __saveStaleNotified = saveStaleNotified;   // ★ §9.11.4-6：供门直调（见模块级 thunk 处说明）
     // v2.4.13(dream-live): 手动 /dream 进度实时转播回发起会话（后台子代理照旧，写守卫保留）。
     // 复用 DREAM_TRACK 心跳/settle 已喂给 dreamProgressPatch 的同源 patch，格式化后 setTimeout(0) 注入监听会话。
     // 只在 DREAM_LISTENER（手动发起）设置时生效——定期/超时自动整合不注入任何会话，避免打扰。
@@ -7688,6 +11827,8 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       else if (patch && patch.status === "failed") { line = "dream 整合失败：" + (patch.error || "未知错误"); terminal = true; tStat = "failed"; }
       else if (patch && patch.steps) { line = "dream 整合进行中：第 " + patch.steps + " 步（上次工具 " + patch.lastTool + "，" + (patch.elapsedMin || 0) + " 分钟）"; }
       else if (patch && patch.health) { line = "dream 整合验收提示：" + patch.health; }
+      // v2.6.4（L3）：存量悬空指针非阻塞提示——与 health 分离，不参与「验收通过/未过」判定（健康体检可见性问题）
+      else if (patch && patch.dangling) { line = "dream 整合提示（非阻塞）：" + patch.dangling; }
       else { return; }
       // v2.5.1(转播可见性): 进展行节流——子代理每次工具调用都会喂一条（L6482），不节流一个 dream 会灌 20~60 行；
       // 每 60 秒最多落一行（首条「已发起」/终态/health 不受限）。
@@ -7697,12 +11838,19 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       DREAM_BROADCAST_LAST_AT = terminal ? 0 : _now;
       // v2.5.1(P2-1/P2-2): 终态文案按 status 差异化——done 才「完成·请核验」；failed/stopped 用「dream 结果·请核验」；
       //   空轮无落盘内容可核验 → 只简报；仅 followup 唤醒路径用核验长文案，inject 回退用短总结（不诱导忙碌回合内自主调工具）。
-      let followupMsg = null, injectMsg = null, noticeMsg = null;
+      let followupMsg = null, injectMsg = null, noticeMsg = null, wakeMsg = null;   // [dream-visible] wakeMsg=手动「已发起」的唤醒投递文案
       if (tStat === "running") {
         // v2.5.4(B): 「已发起」即时回执——纯展示行，零唤醒（followup 会平白开一个核验回合，禁止）；
         //   走 append notice（与进度行同通道），无 append 的旧宿主回退 inject 排队。
         injectMsg = makeMessage("<system-reminder>\n【dsh-memory · dream 进度转播】" + line + "\n</system-reminder>");
         noticeMsg = makeNoticeMessage("<system-reminder>\n【dsh-memory · dream 进度转播】" + line + "\n</system-reminder>", "dream 进度转播：" + line);
+        // [dream-visible 20260930] 手动 dream 的「已发起」改走唤醒投递（见下方 setTimeout 内 wake 分支）：
+        //   非唤醒的 append/inject 行在宿主 GUI 里没有实时渲染位（实测：连 `/dream` 命令回执都要等用户
+        //   下次发言才被顶进回合）⇒ 用户发了 /dream 看不到任何反馈。唤醒代价 = 一个极短回合，
+        //   故提示词硬约束「只回一行、禁止调工具」，并在完成后由既有终态 followup 交付结果摘要。
+        wakeMsg = makeMessage("<system-reminder>\n【dsh-memory · dream 已发起】" + line
+          + "\n\n这是一条系统通知，不是任务：请**只回一行**确认（例如「已发起 dream 整合（后台跑），完成我再汇报」），"
+          + "不要调用任何工具、不要读记忆库或 ~/.dsh/memory/.integrate.json、不要自己再发一次整合。\n</system-reminder>");
       } else if (terminal) {
         const head = tStat === "done" ? "dream 完成·请核验"
           : tStat === "skipped" ? "dream 空轮"
@@ -7724,24 +11872,77 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
             // v2.5.1(P2-3): 显式排除 status===undefined（undefined!=="running" 会误放行 followup），守卫意图清晰。
             if (typeof target.followup === "function" && target.status !== undefined && target.status !== "running") {
               target.followup(followupMsg);
+              noteDreamSurface("wake:followup:terminal");
             } else {
               target.inject(injectMsg);
+              noteDreamSurface("inject:terminal");   // [dream-visible] 诊断：正在跑 ⇒ 只能排队，GUI 要等下次发言才可见
             }
             return;
+          }
+          // [dream-visible 20260930] 手动 dream 的「已发起」走唤醒投递——只此一处（reason 仅由 L11904 那条
+          //   running patch 携带，故每次手动 dream 只会唤醒一次，不会随进度行重复开回合）。
+          //   正在跑（用户回合进行中）用 steer 落进当前回合；空闲用 followup 开一个极短回合。
+          //   两条都不可用（旧宿主）则原样回退下面的 append/inject。
+          if (tStat === "running" && wakeMsg && !DREAM_WOKE) {   // [dream-visible] 同步段已唤醒过就不再重复开回合
+            if (wakeDreamNotice(target, wakeMsg, "wake")) return;
+            // 两条唤醒路都不可用 ⇒ 不改变既有行为，落到下面的 append/inject（诊断字段会记 wake-unavailable）
+            noteDreamSurface("wake-unavailable");
           }
           // v2.5.1(转播可见性): 进展行直接落会话表面（surfaceOp:"append"）——宿主 inject 明确「不唤醒」，
           // 空闲会话的排队项在 GUI 里 placement 判为 "context"、无任何渲染位（只渲染 steering/queued），
           // 故进度会一直不可见，直到用户再发一条消息把它顶进回合——这正是「发了 dream 却没有任何广播」的根因。
           // 落表即渲染为 notice 上下文行（折叠态显示 summary），零唤醒、零 LLM 回合；旧宿主无 append 才回退 inject。
-          if (target.session && typeof target.session.append === "function") {
-            target.session.append("user/message", noticeMsg, { surfaceOp: "append" });
+          const _block = surfaceAppendBlock(target);   // [400guard 20260927]："" = 可落表；否则 midstep（回合进行中）/ nohead（尚无 system 头）
+          if (!_block && target.session && typeof target.session.append === "function") {
+            try {
+              target.session.append("user/message", noticeMsg, { surfaceOp: "append" });
+              noteDreamSurface(_isStepProgress ? "append:step" : "append");   // [dream-visible] 诊断：append 是否真的被接受
+            } catch (eA) {
+              noteDreamSurface("append-failed", (eA && eA.message) || eA);   // [dream-visible] 原先静默吞掉 ⇒ 无从诊断
+              throw eA;
+            }
           } else {
             target.inject(injectMsg);
+            // [400guard 20260927]：闸子拦下时降级 inject 排队——诊断里带上阻断原因，便于复核闸子有没有生效
+            noteDreamSurface(_block ? (_isStepProgress ? "inject:step-" + _block : "inject-" + _block) : (_isStepProgress ? "inject:step" : "inject"));
           }
         } catch (e) {
+          noteDreamSurface("inject-after-error", (e && e.message) || e);
           try { if (typeof target.inject === "function") target.inject(injectMsg); } catch (e2) { /* 转播失败不影响主流程 */ }
         }
       }, 0);
+    }
+    // [dream-visible 20260930 · A] 手动 dream 的唤醒投递：正在跑（用户回合进行中）用 steer 落进当前回合；
+    //   空闲用 followup 开一个极短回合；两条都不可用（旧宿主）返回 false，调用方原样回退 append/inject。
+    //   实际走的通道一并落进 .integrate.json（tag 前缀区分 ack:* / wake:*），一次 /dream 即可确诊。
+    function wakeDreamNotice(agent, msg, tag) {
+      let _woke = false;
+      try {
+        if (agent && agent.status === "running" && typeof agent.steer === "function") {
+          try { agent.steer(msg); noteDreamSurface(tag + ":steer"); _woke = true; }
+          catch (eS) { noteDreamSurface(tag + ":steer-failed", (eS && eS.message) || eS); }
+        }
+        if (!_woke && agent && typeof agent.followup === "function") {
+          try { agent.followup(msg); noteDreamSurface(tag + ":followup"); _woke = true; }
+          catch (eF) { noteDreamSurface(tag + ":followup-failed", (eF && eF.message) || eF); }
+        }
+      } catch (e) { noteDreamSurface(tag + ":wake-error", (e && e.message) || e); }
+      if (_woke) DREAM_WOKE = true;
+      return _woke;
+    }
+    // [dream-visible 20260930 · B] 转播通道落盘：把「这条广播实际走了哪条路」写进
+    //   ~/.dsh/memory/.integrate.json 的 progress.surface / surfaceErr，一次手动 /dream 后读一眼即可确诊。
+    //   取值：ack:* / wake:* / wake:followup:terminal / inject:terminal / append / append:step /
+    //        append-failed / inject / inject:step / inject-after-error / wake-unavailable。
+    function noteDreamSurface(channel, err) {
+      try {
+        const st = readIntegrateState() || {};
+        const p = Object.assign({}, st.progress || {}, { surface: channel, surfaceAt: Date.now() });
+        if (err) p.surfaceErr = String(err).slice(0, 200);
+        else delete p.surfaceErr;
+        st.progress = p;
+        writeIntegrateState(st);
+      } catch (e) { /* 诊断落盘失败不影响转播主流程 */ }
     }
     function dreamProgressPatch(patch) {
       try {
@@ -7758,7 +11959,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
         LAST_PROJECT_AUDIT = (_audit && _audit.needBroadcast && _audit.broadcastText) ? _audit.broadcastText : null;
       } catch (e) {}
       const subagents = ctx.get("subagents");
-      if (!subagents || typeof subagents.start !== "function") {
+      if (!subagentsHasStart(subagents)) {   // v3.2.1：双协议判据（0.1.x start / 0.2.x startActivation）
         cwarn("[dsh-memory] 自动整合：subagents 服务不可用，跳过");
         DREAM_TRACK = null;   // v2.2.4: 清占位防误锁
         DREAM_LISTENER = null;   // v2.4.13(dream-live): 发起失败摘监听
@@ -7766,7 +11967,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       }
       let parent = agentForParent || (agentsBySession.size > 0 ? agentsBySession.values().next().value : null);
       if (!parent || typeof parent !== "object") {
-        // 启动时序：session-start 可能还没触发，agentsBySession 未填充 → 延迟 30 秒重试一次
+        // 启动时序：agent/created（0.1.6 前叫 agent/session-start）可能还没触发，agentsBySession 未填充 → 延迟 30 秒重试一次
         cwarn("[dsh-memory] 自动整合：无可用父 agent，30 秒后重试");
         setTimeout(() => {
           try {
@@ -7789,7 +11990,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       // v2.0.5: 发起前快照 global/index 容量与时间戳行——完成后验收"模型是否真按任务书精简"，不信任口头汇报
       const dreamSnap = {};
       try {
-        for (const df of ["global.md", "index.md"]) {
+        for (const df of ROOT_FILES) {
           const dt = fs.readFileSync(portable(MEMORY_ROOT + "/" + df), "utf8");
           dreamSnap[df] = { chars: dt.length, stampLine: (dt.split("\n").slice(0, 5).find((l) => l.includes("最后更新")) || "") };
         }
@@ -7958,6 +12159,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       }
       if (overChar.length === 0 && softChar.length > 0) {
         capacityText += "软候选（6000-9000，仅当本轮写入该文件时适用）: " + softChar.map((x) => x.rel + "(" + x.chars + ")").join("、") + " —— 可顺手精简合并重复/过时条目.\n";
+      capacityText += renderOverLimitHint(stI.overLimitHint);   // v2.8.4（A）：**主动预置**差数+分节表（替代"先写再被拒"）
       }
       capacityText += "\n";
       const scopeText = "## Input Scope（插件已按内容 hash 比对算好，本轮只读下列文件）\n" +
@@ -7989,13 +12191,28 @@ scopeText +
 "   - ## Gotchas（易踩的坑 / 陷阱）\n" +
 "   - ## Discovered durable knowledge（跨会话确证的事实）\n" +
 "3. 每条 1-3 行；合并重复条目（精确字面量：文号/路径/数字/命令逐字保留，绝不改写）；相对日期转 YYYY-MM-DD.\n" +
+"4. **index.md 指针格式（2026-09-27 约定，勿破坏）**：`- 主题（关键词 何时:触发场景）→ 文件`——括号内 `何时:` 右为**触发语**（供模型判断该不该读，插件解析时**不进关键词**），左仍为关键词。新增/改写指针行时**必须保留已有 `何时:` 段**；给新指针补一句触发语更好。压缩 index.md 时**不得删除** `何时:` 段。\n" +
+"5. **knowledge 文件可选 frontmatter（2026-09-27，检索会据此重排）**：新建或大改 knowledge/projects 档时，可在文件首行加 YAML frontmatter：`created`（YYYY-MM-DD）、`last_used`（YYYY-MM-DD，每次被检索命中后可更新）、`importance`（1-10，越高越不易被时间衰减埋掉）。**不强制**——缺省时检索按中性处理，行为与旧版一致；已存在的文件**不必回头补**。\n" +
+"\n" +
+"## Supersede (C 档：冲突/取代一等公民，2026-09-27 新增)\n" +
+"发现**同一事实的新旧两个说法**时，禁止静默覆盖或静默删除旧条目（LongMemEval 实测主流系统最常栽的失败模式就是「覆盖旧信息」）：\n" +
+"1. 保留旧条目原文，在其**末尾**追加 `（已被 <新位置或新结论> 取代 @YYYY-MM-DD）`；新条目正常写入并保留自己的来源。\n" +
+"2. 若旧条目确无价值，也应先标取代再下沉/删除，不要直接抹掉——审计链不能断。\n" +
+"3. 同一批内不要「既标取代又删旧条」——二选一。\n" +
 "\n" +
 "## Verify (D3)\n" +
 "写提到的文件路径前用 glob、函数/类名前用 grep 核实存在；无法证实但合理的标 [unverified]；被新决定/新代码推翻的条目标记删除或移除.\n" +
 "\n" +
 "## Prune (D4: 容量上限 + 修剪过期)\n" +
-"1. global/index 若超预算，memory_dream_patch 会现场拒写并回传本次将写成的字符数、差数与分节表——按差数做**整节下沉**一次成型即可，禁止自行估算或对齐任何字符数（选择标准：已稳定决策 > 死胡同 > 历史/完成步骤（## 归档/## 归档：* 命名节内条目优先）> 与当前焦点无关；任何含 knowledge/MEMORY- 引用的指针行（`- See knowledge/…`、`详见 knowledge/…`、`→ knowledge/…` 等措辞均可）不得作为提取对象、提取时保留在主文件；下沉目标 knowledge/MEMORY-global-<topic>.md（index 用 MEMORY-index-<topic>.md）；主文件删节后尾部插 `- See knowledge/<文件>（N 项）— 一句话摘要`（措辞可同左，验收按存在 knowledge/MEMORY- 引用判定）；同批原子提交；主文件删节变短属合法，replace 须带 full_rewrite:true 或改用「edit 删该节正文 + append 尾部指针」组合）。**禁止以 delete 逐条删内容替代下沉**（delete 仅用于删已标 [unverified] 的过期条目）；章节用 ## 明确分类（便于分区感知注入保留骨架）. 达标由 memory_dream_patch 写时校验判定（v2.4.28），无需自测.\n" +
+"1. global/index 若超预算，memory_dream_patch 会现场拒写并回传本次将写成的字符数、差数与分节表——按差数做**整节下沉**一次成型即可，禁止自行估算或对齐任何字符数（选择标准：已稳定决策 > 死胡同 > 历史/完成步骤（## 归档/## 归档：* 命名节内条目优先）> 与当前焦点无关；任何含 knowledge/MEMORY- 引用的指针行（`- See knowledge/…`、`详见 knowledge/…`、`→ knowledge/…` 等措辞均可）不得作为提取对象、提取时保留在主文件）；下沉目标 knowledge/MEMORY-global-<topic>.md（index 用 MEMORY-index-<topic>.md）；主文件删节后尾部插 `- See knowledge/<文件>（N 项）— 一句话摘要`（措辞可同左，验收按存在 knowledge/MEMORY- 引用判定）；同批原子提交；主文件删节变短属合法，replace 须带 full_rewrite:true 或改用「edit 删该节正文 + append 尾部指针」组合）。**禁止以 delete 逐条删内容替代下沉**（delete 仅用于删已标 [unverified] 的过期条目）；章节用 ## 明确分类（便于分区感知注入保留骨架）. 达标由 memory_dream_patch 写时校验判定（v2.4.28），无需自测.\n" +
 "2. sessions/当日文件保持精炼要点+指向（当日注入面以不超限为准，超限会被机器测量并强制拉回整合），细节归档 knowledge/ 或对应 project 文件.\n" +
+"2c. **index.md 下沉判据（2026-09-27 约定；只定「挑谁」，不新增触发条件）**：本节**仅在**你已因 index.md 超预算被拒写、要按差数下沉时适用。挑节优先级改为「**低频优先**」，按下述机械判据从上往下挑、够差数即停（不要挑整节之外的内容）：\n" +
+"   ① 行内**同时**满足「无 `何时:` 触发语」且「`/` 分隔的子主题罗列 ≥3 个」的指针段（信息密度最低、最可折叠）；\n" +
+"   ② 长尾工具类（`tools/` 下单一用途脚本，如录屏/打卡/剪贴板类）；\n" +
+"   ③ 其余低频主题。\n" +
+"   **禁止下沉**：带 `何时:` 触发语的行（那是路由核心）、`knowledge/MEMORY-dsh-memory-*`（自指）、`projects/dsh-memory记忆插件.md`。\n" +
+"   落点固定为 `knowledge/MEMORY-index-低频索引.md`（**不要**新建 `MEMORY-index-<topic>.md` 碎片档），在其内按日期分节追加原样指针；index.md 被下沉的节位置插一行汇总指针 `- <主题列表> → 见 低频索引`。\n" +
+"   ⚠ **不要**因为「接近 1800 软告警线」就主动下沉——近限带不进候选判定，主动动会变成每轮空转；近限只由插件告警提示，处理时机以**硬超限被拒写**为准。\n" +
 "2b. 近3日 dump 保护（硬纪律，工具层会直接拒绝违例补丁）：今日/昨日/前日的 sessions/YYYY-MM-DD.md 中 <!-- compaction: 标记的 dump 块不得删除或减少——只可修剪要点块；清理超过 3 天文件的 dump 时须逐块给出去向指针（durable 事实已提升到哪个文件）。（v2.4.16 起新文件不再产生 dump 块，本条仅约束存量）.\n" +
 "3. 移除：被新决定取代的条目、仅与单个会话相关不再成立的细节、与更强记忆重复的低信号条目.\n" +
 "4. 只精简/合并/修剪，不删除仍有价值的事实；删除前 [unverified] 或明确标注.\n" +
@@ -8006,13 +12223,14 @@ capacityText +
 "- 凡需写入/修改记忆库文件：调用 memory_dream_patch 工具，参数 { patches: [ { file, action, content?, old_string?, new_string?, full_rewrite?, reason? } ] }——action ∈ edit|replace|append|delete；file 为 ~/.dsh/memory/ 下相对路径（sessions|projects|knowledge|tools/ 或 global.md|index.md）；content ≤128KB（edit 免 content，用 old_string/new_string）.\n" +
 "- action 使用规则：**edit＝改局部的默认且首选方式**（old_string→new_string 精确替换，须唯一命中；old_string 从 read 该文件全量后逐字复制；new_string 空串＝删除该片段）；append＝末尾追加；delete＝删除 content 精确原文块；replace＝整文件覆盖，仅新建文件或整体重写时用——把已存在文件（尤其 global.md/index.md/projects/*.md）显著改短必须带 full_rewrite:true，否则被收缩熔断拒写。改已有文件的少数几行/某一节一律用 edit，禁止「read 全文→本地改→整份 replace 回传」（易漏抄、静默丢内容）。同一批内不要「大幅缩水 edit + 重写余量 replace」组合，拆两次调用或 replace 带 full_rewrite:true.\n" +
 "- 工具会当场校验并落盘：成功返回 wrote 清单；失败返回错误清单（哪一条/哪个字段/为什么）——按清单修正后再次调用，可多次调用直到全部通过.\n" +
+"- **指针闭合硬校验（v2.6.4）**：本批**新增**的任何库内指针（`See|详见|参见|参考|见|→ knowledge/…|projects/…|tools/…|sessions/….md` 等措辞）都必须**同批写入目标**或**指向已存在文件**，否则整批拒写并回传「指针指向未落盘文件 X」。这正是「指针先行、落盘未成功」的事故形态，故不再允许；确系复述描述（如事故记录里逐字引用一个未落盘文件名）时该行须含「未落盘/待补/不存在」等描述词自动豁免，或整批带 `allowDangling:true` 显式放行。\n" +
 "- 不要输出 JSON 文本/代码块；一切写入只走 memory_dream_patch 工具.\n" +
-"- **看护续期纪律（v2.6.1 根因修复）**：本子代理受 15 分钟软警告/25 分钟硬停看护（计时自最近落盘或任意工具活动；无落盘工具活动累计 24 次同样进入 3 分钟宽限）。**组装大 patch 前先落一条最小成功 patch 续期**（如先 edit/append 一条 knowledge 小文件或先写一个文件的指针行，成功落盘即重置计时），再逐步提交其余内容；巨型 replace 优先「edit 删节 + append 指针」组合（见 Prune）而非整文件全文回传。禁止「只读/只预览、长时间不落盘」的组装方式——会被看护硬停（本次事件教训：停在组装大 patch 的冒号前被 15 分钟硬杀）。\n" +
+"- **看护续期纪律（v2.6.1 根因修复，v2.6.4 收紧）**：本子代理受 15 分钟软警告/25 分钟硬停看护（计时自最近落盘或任意工具活动；无落盘工具活动累计 24 次同样进入 3 分钟宽限）。**组装大 patch 前先落一条最小成功 patch 续期**——但续期的必须是**内容类** patch（如 append/edit 一个 knowledge 小文件的**正文**、或 edit 一个已存在文件的局部），成功落盘即重置计时；**严禁把「指针行」单独落盘续期**（v2.6.4 起 memory_dream_patch 会直接拒写指向未落盘文件的指针：指针必须与其目标同批，见 5.；若确需先落指针，该指针只能指向**已存在**的文件）。巨型 replace 优先「edit 删节 + append 指针」组合（见 Prune）而非整文件全文回传。禁止「只读/只预览、长时间不落盘」的组装方式——会被看护硬停（本次事件教训：停在组装大 patch 的冒号前被 15 分钟硬杀）。\n" +
 "\n" +
 "\n" +
 "## Efficiency\n" + "- 文件长度一律由插件机器测量并写时校验（v2.4.28）；**禁止手工数/估字符数**；输出长度机器裁决：超限重试时按差数做整节下沉，一次成型，不必对齐任何数字.\n" + "- **局部修改优先 action:\"edit\"**（old_string/new_string），避免整文件 replace 造成误覆盖；不确定改动范围时先 read 该文件全量再定位精确 old_string（v2.5.0）.\n" +
 "- dry-run 预算：每个文件 memory_size_preview 最多 3 次；第 4 次起（10 分钟滑动窗内）工具直接拒绝并回传本次将写成的字符/差数/分节表——按该差数做整节下沉一次成型提交，不要再用 preview 试探.\n" +
-"- 同一文件预算类拒写 ≥2 次：放弃该文件，先落盘其他内容（可最后回头一次，不允许无限迭代）.\n" +
+"- 同一文件预算类拒写 ≥2 次：放弃该文件，先落盘其他内容（可最后回头一次，不允许无限迭代）。放弃时**不得留下指向未落盘目标的指针**——要么把目标文件与指针同批写入，要么不写指针（v2.6.4 起工具层会拒写新增悬空指针）。\n" +
 "- 不要花步骤试探运行时能力——本节已给出全部事实.\n" +
 "\n" +
 "- 每个文件 edit 前先 read 全量（禁止局部读+整体覆写）；不更新 global/index 的时间戳行（保前缀缓存）;\n" +
@@ -8021,12 +12239,14 @@ capacityText +
 "\n" +
 "## D-threshold Self-Calibration（D类「LLM循环试错提醒」阈值自校准）\n" +
 "- 实测统计（插件已算好，直接引用，勿自行读取文件或计算数字）：" + calibStats + "\n" +
-"- 若统计提示数据不足则跳过本节。否则按此对照调整：repRate 中位数 ≤ 当前 rep+0.05 且伴随错误少 → rep 上调 0.05 降误报；打转周期占比 >50%（提醒过吵）→ neg 上调 0.05；占比 <10% 且有真实空转漏报迹象 → rep 下调 0.05 提高灵敏；提醒后很少跟进 → cooldownMin 上调。各字段合法范围见 dsh_spiral_thresh 工具描述（越界会被拒绝回退）。\n" +
+"- ⛔ **本节的旧判据已废止（v3.2.0）**：禁止再用「repRate 中位数 ≤ 当前 rep+0.05 → rep 上调」——`spiralEvents` **只在命中时落盘**（截断偏差）、且存的是四舍五入值 ⇒ 该判据**恒真**；实测它把 rep 单向推到硬上限 0.80 并造成 D 类自 2026-09-29 静默 2 天+（17 条变更日志里 6 条同一理由）。\n" +
+"- 现行口径（证据分级，缺证据就别动）：① **先看 `gateEvents`**——若 `cls=\"D\"` 且 `reason` 属 {`cooldown`,`batch-cooldown`,`off`}（或旧口径 `batch`）的计数高、而 `ok`/`batch-soft` 极少，那是**闸门**问题而非阈值问题，**不要调阈值**（`batch-soft` = 已降级投递，是正常产出）；② 仅当「连续多轮 0 次 D 命中」且 `gateEvents` 连被拦记录都没有（=压根没触发判定）时，才允许**提敏**（rep 下调，步长 ≤0.05 且必须跨 k/winLen 格点）；③ 样本必须**同世代**（只统计 `ep` 与当前生效值全等的那些，见 `spiralThreshLog[].ep`），跨世代样本一律不计；④ **降敏一律要求 ≥12 字且含数字的 reason**，并受插件方向性硬闸限制（同字段 24h≤1 次、24h 内不得跨字段换旋钮、近 24h 有拦截且 0 投递时直接拒绝）。各字段合法范围见 dsh_spiral_thresh 工具描述。\n" +
 "- 应用变更只准调用 dsh_spiral_thresh 工具并带 reason 参数（一句话理由，插件侧钳制校验+落盘+记变更日志；禁止直写 .monitor.json——会被插件内存态覆盖）.\n" +
 "- 无需调整就不调用工具。最终 Output 加一行 Thresholds: kept/changed + 一句理由.\n" +
 "## E-loop Self-Calibration（E类「成功同质循环」阈值自校准，v2.4.30）\n" +
 "- 实测统计（插件已算好，直接引用）：" + eCalibStats + "\n" +
-"- 若统计提示数据不足则跳过本节。否则按此对照调整：E 触发周期占比高（提醒过吵/用户常在成功循环中正常推进）→ sameSteps 上调或 sameNeg 下调降敏；E 样本稀疏但用户反馈「成功重复未被提醒」→ sameSteps 下调或 sameMinSecs 下调提敏；同质率中位远低于 sameHomo → sameHomo 下调收紧。合法范围见 dsh_spiral_thresh 工具描述（越界会被拒绝回退）。\n" +
+"- ⛔ **「E 触发周期占比」判据已废止（v3.2.0）**：`turnProfiles` 的分母**系统性缺失**（`settleTurnProfile` 只在顶层会话 step1 的 A 类 handler 里结算 ⇒ 子代理周期永不结算、未续话的顶层周期也不结算；实测近 200 条画像里 D 命中样本 ≥6 条却只有 2 个周期）⇒ 任何「占比高/低」的推断都不成立。\n" +
+"- 现行口径：只在**样本充分**（同世代 E 样本 ≥5 条）时，按瓶颈动刀——实测 E 的两个瓶颈是 `sameMinSecs`（簇墙钟）与**借用 D 的 rep 闸**，`sameHomo`/`sameSteps`/`sameNeg` **都不是瓶颈**（再收紧只会更死）；提敏（`sameMinSecs` 下调等）不受硬闸限制，降敏受 §D 同款 R5/R6/活跃字段锁约束。\n" +
 "- 应用变更只准调用 dsh_spiral_thresh 工具并带 reason 参数；无需调整就不调用工具。\n" +
 "## Watchdog Self-Calibration（W类「无介入长空转」阈值自校准，v2.4.30）\n" +
 "- 实测统计（插件已算好，直接引用）：" + wCalibStats + "\n" +
@@ -8074,7 +12294,7 @@ lessonFeedText + "\n" +
       let _drmCtrl = null;   // v2.4.28（D4）：dream controller 持引用（注册 SUBAGENT_GUARDS）
       try {
         _drmCtrl = new AbortController();
-        const run = await subagents.start("spawn", {
+        const run = await startSubagentCompat(subagents, {   // v3.2.1：兼容 0.1.x/0.2.x
           label: "dsh-memory-自动整合-" + reason,
           prompt: [{ type: "text", text: promptText }],
           parent: parent,
@@ -8099,12 +12319,25 @@ lessonFeedText + "\n" +
           try {
             const result = await run.result;
             const outText = (result.output || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n");
-            clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符）");
+            // v3.2.2（2026-10-18）：把"死于什么"打进同一行——stopReason 只是 error/aborted 这类枚举，
+            //   真实原因（如 429 额度、鉴权、上下文超限）只在子会话的 turn/end.reason.error 里。
+            let _fail = null;
+            if (result.stopReason && result.stopReason !== "completed") {
+              const _fdir = findNewestSpawnedSession(startedAt);
+              _fail = _fdir ? readSubagentFailure(_fdir) : null;
+            }
+            const _failTxt = (_fail && _fail.message)
+              ? "，失败原因=" + String(_fail.message).slice(0, 300) + (_fail.code ? "（code=" + _fail.code + "）" : "")
+              : "";
+            clog("[dsh-memory] 自动整合完成（" + reason + "，stopReason=" + result.stopReason + ", 输出 " + outText.length + " 字符" + _failTxt + "）");
+            if (_fail && /QUOTA|429|usage limit|额度|余额/i.test((_fail.code || "") + " " + (_fail.message || ""))) {
+              cwarn("[dsh-memory] 整合子代理被**模型额度**拦住（" + String(_fail.message).slice(0, 200) + "）——这不是记忆库或插件故障：换一个有额度的模型，或等额度恢复后再 /dream；本轮未落盘，2 小时自动重试大概率同样失败。");
+            }
             let u = null;
             const sdir = findNewestSpawnedSession(startedAt);
             if (sdir) {
-              u = summarizeSubagentUsage(sdir);
-              if (u) clog("[dsh-memory] 整合消耗: 总输入 " + (u.totalIn || u.input) + " tokens（其中缓存命中 " + u.cache + "）| 输出 " + u.output + (u.reasoning > 0 ? " | 推理 " + u.reasoning : "") + " tokens | 总时长 " + u.durMin + " 分钟");
+              u = await summarizeSubagentUsageRetry(sdir);   // §9.12④：同上（读不到 usage 时有界重试）
+              if (u) clog("[dsh-memory] 整合消耗: 总输入 " + (u.totalIn || u.input) + " tokens（其中缓存命中 " + u.cache + "）| 输出 " + u.output + (u.reasoning > 0 ? " | 推理 " + u.reasoning : "") + " tokens | 总时长 " + u.durMin + " 分钟" + (u.usageEmpty ? "（⚠️ usage 读取失败：重试 " + u.usageRetry + " 次仍无 usage，**别当成 0 消耗**）" : ""));
             }
             let doneOk = LAST_DREAM_WROTE_AT >= startedAt;
             // v2.4.28（三审 P1）：dream 被 guard 硬停（部分落盘后 abort）→ 强制 doneOk=false 走失败路径（lastFailAt → 2h 重试），
@@ -8120,7 +12353,7 @@ lessonFeedText + "\n" +
                 status: doneOk ? "done" : "stopped:incomplete",
                 finishedAt: Date.now(),
                 durMin: u ? u.durMin : Math.round(((Date.now() - startedAt) / 60000) * 10) / 10,
-                tokens: u ? ("totalIn " + (u.totalIn || u.input) + " (cache " + u.cache + ") / out " + u.output) : null,
+                tokens: (u && u.usageEmpty !== true) ? ("totalIn " + (u.totalIn || u.input) + " (cache " + u.cache + ") / out " + u.output) : null,
                 summary: tidyTruncatedMarkdown(outText.slice(0, 200) + (outText.length > 200 ? "…" : "")),
                 writtenRels: _wr
               });
@@ -8184,8 +12417,8 @@ lessonFeedText + "\n" +
                     const smsg = makeNoticeMessage(_sbody, ("dream 回归结算：" + settleNote).slice(0, 140));
                     setTimeout(() => {
                       try {
-                        if (settleListener.session && typeof settleListener.session.append === "function") settleListener.session.append("user/message", smsg, { surfaceOp: "append" });
-                        else if (typeof settleListener.inject === "function") settleListener.inject(makeMessage(_sbody));
+                        if (canSurfaceAppend(settleListener) && settleListener.session && typeof settleListener.session.append === "function") settleListener.session.append("user/message", smsg, { surfaceOp: "append" });
+                        else if (typeof settleListener.inject === "function") settleListener.inject(makeMessage(_sbody));   // [400guard 20260927]：中途落表会打断 tool_calls/tool 配对 ⇒ 降级 inject 排队
                       } catch (e) {}
                     }, 0);
                   }
@@ -8196,11 +12429,14 @@ lessonFeedText + "\n" +
             } catch (e7) { cwarn("[dsh-memory] 回归结算异常:", e7 && e7.message ? e7.message : String(e7)); }
             try {
               const health = [];
-              for (const df of ["global.md", "index.md"]) {
+              for (const df of ROOT_FILES) {
                 try {
                   const dt = fs.readFileSync(portable(MEMORY_ROOT + "/" + df), "utf8");
-                  const lim = df === "global.md" ? 3000 : 2000;
-                  if (dt.length >= lim) health.push(df + " " + dt.length + "字符未达精简目标(<" + lim + ")");
+                  // v2.6.7（W1）：原为硬编码第二真源（global 3000 / index 2000）且比较符 `>=`——把「恰好 == 硬预算」
+                  //   这一**合规态**（sectionAwareSlice 在 <= 时不截断、checkSizeOverflow 亦用 `>`）误判为未达标；
+                  //   统一走 limitOf（同一真源）+ `>` 比较符。
+                  const lim = limitOf(df, CHAR_LIMIT);
+                  if (dt.length > lim) health.push(df + " " + dt.length + "字符未达精简目标(≤" + lim + ")");
                   if (dreamSnap[df] && dreamSnap[df].stampLine && !dt.includes(dreamSnap[df].stampLine)) health.push(df + " 时间戳行被改动(前缀缓存失效)");
                 } catch (e2) {}
               }
@@ -8219,6 +12455,72 @@ lessonFeedText + "\n" +
                     health.push(pcc.rel + " 偏大（字符 " + pcc.chars + "，6000-9000，本轮已写——可精简合并）");
                   }
                 }
+                // ═══ v2.8.4（容量治理·硬保证）：**机械下沉**触发 ═══
+                // 破的死循环（实测 2026-09-18）：验收每轮报"仍超限…**下次整合优先提取**"，而那句"下次优先"只是
+                //   **字符串拼接**；模型那条"整节下沉"引导挂在「patch **被拒写**」事件上，实况却是"**本轮未写**"
+                //   ⇒ 引导永不触发；维护两次无进展即停手（stuck=infeasible）；注入端 hard-cut 兜着 ⇒ 没人真正缩小文件。
+                // ⇒ 这里给"**连续 2 轮超限 ∧ 本轮未写**"的文件一个**不依赖模型判断**的执行者，并把轮数与动作记账（读者见心跳行）。
+                try {
+                  const wrSet0 = DREAM_WRITTEN_RELS || new Set();
+                  const overList = [];
+                  for (const pcc of listProjectChars()) if (pcc.chars > PROJECT_CHAR_HARD) overList.push({ rel: pcc.rel, chars: pcc.chars, limit: PROJECT_CHAR_HARD, target: PROJECT_CHAR_SOFT });
+                  try {
+                    const so2 = await checkSizeOverflow();
+                    for (const i9 of (so2 || [])) {
+                      if (!i9.truncated) continue;
+                      const relS = (String(i9.label || "").match(/(\d{4}-\d{2}-\d{2}\.md)/) || [])[1];   // 摘要的 label 形如「最近摘要 2026-09-18.md」
+                      if (relS) overList.push({ rel: "sessions/" + relS, chars: i9.chars, limit: i9.charLimit, target: Math.round(Number(i9.charLimit) * 0.8), key: i9.key });
+                    }
+                  } catch (eS) {}
+                  if (overList.length) {
+                    const stO = readIntegrateState() || {};
+                    let hintObj = Object.assign({}, stO.overLimitHint || {});   // v2.8.4（A）：喂下一轮的差数/分节表
+                    const stuck = Object.assign({}, stO.overLimitStuck || {});
+                    for (const e of overList) {
+                      const prev = stuck[e.rel] || {};
+                      const notWritten = !wrSet0.has(e.rel);
+                      const rounds = notWritten ? (Number(prev.rounds) || 0) + 1 : 0;   // 本轮写了 ⇒ 清零（滞回，防抖动）
+                      stuck[e.rel] = { rounds: rounds, lastAt: Date.now(), lastChars: e.chars, limit: e.limit, lastAction: String(prev.lastAction || "") };
+                      // v2.8.4（A）：本轮写了 ⇒ **清掉**该文件的提示；仍超限 ⇒ 记下**差数 + 分节表**供下一轮直接下沉。
+                      //   ★ §9.11.4-7 修正（红队 rev8b E-2：`delete` 会被逐路径并账复活；红队 rev8c B①：写侧不能只有源码正则看门）
+                      //   ⇒ 语义收敛到模块级**纯函数** `applyOverLimitHintEntry`（门按输出直测），这里只负责接线。
+                      // ★ 修正七（红队 rev8d A）：由 `if/else` 收敛为**单次无条件调用**，把"清还是记"压成一个表达式
+                      //   （接线面越小越不容易被等价改写绕过；**注意**：接线层仍只有源码 lint —— 端到端需要一个真 dream 轮，
+                      //    本轮**如实豁免**，见 `_test-matrix.mjs` 里 `hint-callsite-if-false` 的豁免记录）。
+                      {
+                        let secs = [];
+                        if (rounds !== 0) {
+                          // ★★ v3.0.1（**定版后核验实测发现的真缺口**）：原先写死 `sectionTableOf(…, 12)`
+                          //   ⇒ **只入库前 12 节**，第 13 节起**永久不进 hint**。
+                          //   实测：`projects/徕卡一瞬.md` 有 **21 节** ⇒ dream **看不到后 9 节 / 20098 字符（17%）**；
+                          //   而被截掉的恰是**最新的一批**（10:46–13:40 的 v12/v13/v14 交付记录）= **当前最相关的内容**。
+                          //   ⇒ 改法：**生成侧不截断**（传 0 ⇒ `sectionTableOf` 按其语义取默认上限 15 仍会截，
+                          //     故这里显式传一个足够大的值），把"要不要少给"这件事**只留给渲染侧**做
+                          //     （渲染侧仍保 `slice(0, 30)` 防 prompt 爆）—— 信息**入库不丢**、**渲染有界**。
+                          //   ★ 为什么不信"默认 15 够用"：`sectionTableOf` 的默认是 15，而现场已有 21 节的真实文件。
+                          try { secs = sectionTableOf(fs.readFileSync(portable(MEMORY_ROOT + "/" + e.rel), "utf8"), 200).map((s) => ({ title: s.title, chars: s.chars, preferExtract: SINK_PREFER_RE.test(String(s.title || "")) })); } catch (e0) {}
+                        }
+                        hintObj = applyOverLimitHintEntry(hintObj, e.rel, rounds === 0 ? null : { chars: e.chars, limit: e.limit, target: e.target, overBy: Math.max(0, e.chars - e.target), sections: secs, at: Date.now() });
+                      }
+                      if (rounds >= 2) {
+                        const rr = sinkOverLimitFile(e.rel, { target: e.target });
+                        stuck[e.rel].lastAction = rr.ok ? ("sink:" + rr.movedCount + "节/" + rr.movedChars + "字→" + rr.sinkRel) : ("sink-skip:" + rr.why);
+                        if (rr.ok) {
+                          health.push(e.rel + " **已机械下沉**：" + rr.before + "→" + rr.after + " 字符（搬走 " + rr.movedCount + " 节 → " + rr.sinkRel + "）");
+                          cwarn("[dsh-memory] 机械下沉 " + e.rel + "：" + rr.before + "→" + rr.after + " 字符，搬 " + rr.movedCount + " 节 → " + rr.sinkRel);
+                          try { monitorEvent("sink", e.rel + " moved=" + rr.movedCount + " chars=" + rr.movedChars); } catch (e4) {}
+                        } else {
+                          cwarn("[dsh-memory] 机械下沉未执行 " + e.rel + "（" + rr.why + "）");
+                        }
+                      } else if (rounds === 1) {
+                        health.push(e.rel + " 连续 " + rounds + " 轮超限未写（再 1 轮将自动机械下沉，不再只报「下次优先」）");
+                      }
+                    }
+                    stO.overLimitStuck = stuck;
+                    stO.overLimitHint = hintObj;
+                    writeIntegrateState(stO);
+                  }
+                } catch (eS1) { try { cwarn("[dsh-memory] 机械下沉环节异常: " + (eS1 && eS1.message)); } catch (e5) {} }
                 for (const r2 of wrSet) {
                   if (!/^knowledge\//.test(r2)) continue;
                   const bn2 = r2.slice(r2.lastIndexOf("/") + 1);
@@ -8247,15 +12549,74 @@ lessonFeedText + "\n" +
                   }
                 }
               } catch (eS7) {}
+              // v2.7.0（拆 fixed）：原「耐久层 fixed.md 被删减 → health 留痕」整段（含 `dreamSnap["fixed.md"]` 判空、
+              //   `wrSet9.has("fixed.md")` 守卫、净减 ≥40 判定与 TypeError 防线）已随该层删除——层不存在则判据无对象。
+              // v2.6.4（L3）：悬空指针反向核对（指针 → 目标存在）——补 L1 只覆盖 memory_dream_patch 的缺口
+              //   （maint/archive/命令等旁路写入入口，以及历史存量）。分级（2026-09-15 诊断第三节）：
+              //   「本轮写入」= 源文件在本轮落盘清单内，**或**其 mtime 晚于本轮起始（后者覆盖旁路入口/直接写盘）；
+              //     → 计入 health（阻塞验收，本轮该修）；
+              //   其余（历史存量，本轮没碰它）→ 只作**非阻塞**提示（dangling 字段），否则存量悬空会永久卡死
+              //     「验收通过 → health 清空」分支，每轮转播挂同一条告警（v2.4.35 记录过的过期告警形态）。
+              //   注：L1 生效后 dream 侧新增悬空已被写时拒，本闸主要价值在旁路入口 + 存量可见性（防复发）。
+              let danglingLegacyTxt = "";
+              try {
+                const wrD = DREAM_WRITTEN_RELS || new Set();
+                const allD = scanDanglingPointers();
+                const mtimeOf = (rel) => { try { return fs.statSync(portable(MEMORY_ROOT + "/" + rel)).mtimeMs; } catch (e) { return 0; } };
+                const isThisRound = (d) => wrD.has(d.src) || mtimeOf(d.src) >= startedAt;
+                const mineD = allD.filter(isThisRound);
+                const legacyD = allD.filter((d) => !isThisRound(d));
+                for (const d of mineD) {
+                  health.push("悬空指针：" + d.src + " → " + d.rel + "（目标不存在；本轮写入）——把目标内容与指针放同一批写入，或改指实存文件（已轮转会话指 sessions/archive/…）");
+                }
+                if (legacyD.length) {
+                  danglingLegacyTxt = "存量悬空指针 " + legacyD.length + " 处（非本轮写入，不阻塞验收）：" + legacyD.slice(0, 3).map((d) => d.src + " → " + d.rel).join("；") + (legacyD.length > 3 ? " 等" : "");
+                }
+              } catch (eL3) { cwarn("[dsh-memory] L3 悬空指针核对异常（跳过该闸）: " + (eL3 && eL3.message ? eL3.message : eL3)); }
+              // ═══ v2.6.8（P4 / 提案③）未沉淀清单：只读、非阻塞、不自动动作 ═══
+              //   不进 health（不阻塞验收）；沿用 danglingLegacyTxt 这条「非阻塞可见性」通道一并转播。
+              //   水位账本落**独立点文件** .deposit-watch.json——不碰 .integrate.json，避免与 dream 结算双写互相覆盖
+              //   （工程席审核：L7018 与 L8774 都写 .integrate.json，新字段必须走同一 read-modify-write，独立文件更稳）。
+              try {
+                const dw = scanUndeposited({ days: 14 });
+                if (dw && dw.ok && dw.items.length) {
+                  const st2 = updateDepositWatch(dw.items);
+                  const txt2 = "重要但未沉淀 " + dw.items.length + (dw.truncated ? "+（已达扫描上限）" : "") + " 条（新增 " + st2.fresh + "，滞龄 >21 天 " + st2.aged + "）"
+                    + (st2.fresh ? "；例：" + dw.items.slice(0, 2).map((x) => x.lit.slice(0, 36) + "（" + x.src + "）").join("；") : "")
+                    + "——只读报告，不自动下沉；可用 memory_search 检索或手工提升";
+                  danglingLegacyTxt = danglingLegacyTxt ? (danglingLegacyTxt + "；" + txt2) : txt2;
+                }
+              } catch (eDW) { cwarn("[dsh-memory] 未沉淀清单扫描异常（跳过）: " + (eDW && eDW.message ? eDW.message : eDW)); }
+              // v2.6.4（L3 可见性修复）：health 转播此前**从未送达**——done 转播后 L8346 已把 DREAM_LISTENER 置 null，
+              //   rebroadcastDream 的 patch.health 分支因此永远短路（验收结论只落在 .integrate.json，会话里看不见）。
+              //   仿 v2.4.16 回归结算通道，用 settle 前捕获的 settleListener 落一条 notice（无监听=定期/自动整合轮，不打扰）。
+              const noticeSettle = (text) => {
+                if (!text || !settleListener) return;
+                const body = "<system-reminder>\n【dsh-memory · dream 整合提示】" + text + "\n</system-reminder>";
+                const msg = makeNoticeMessage(body, ("dream 整合提示：" + text).slice(0, 140));
+                setTimeout(() => {
+                  try {
+                    if (canSurfaceAppend(settleListener) && settleListener.session && typeof settleListener.session.append === "function") settleListener.session.append("user/message", msg, { surfaceOp: "append" });
+                    else if (typeof settleListener.inject === "function") settleListener.inject(makeMessage(body));   // [400guard 20260927]：中途落表会打断 tool_calls/tool 配对 ⇒ 降级 inject 排队
+                  } catch (e) {}
+                }, 0);
+              };
               if (health.length) {
                 cwarn("[dsh-memory] 整合验收未过: " + health.join("; ") + "——下次整合优先处理");
-                if (DREAM_PATCH) DREAM_PATCH({ health: health.join("; ").slice(0, 200) });
+                // v2.6.4：health 串会被截到 200 字符转播，存量悬空清单另存 dangling 字段保完整（不参与验收判定）
+                if (DREAM_PATCH) DREAM_PATCH({ health: (health.join("; ") + (danglingLegacyTxt ? "；另有" + danglingLegacyTxt : "")).slice(0, 200), dangling: danglingLegacyTxt });
+                noticeSettle("整合验收未过：" + (health.join("；") + (danglingLegacyTxt ? "；另有" + danglingLegacyTxt : "")).slice(0, 260));
               } else if (dreamSnap["global.md"]) {
-                clog("[dsh-memory] 整合验收通过: global/index 容量与时间戳行合规");
+                clog("[dsh-memory] 整合验收通过: global/index 容量与时间戳行合规" + (danglingLegacyTxt ? "（另有" + danglingLegacyTxt + "）" : ""));
                 // v2.4.35（评审 S3）：验收通过必须清 progress.health 旧值——否则上一轮的过期告警永久挂在
                 //   .integrate.json/转播里误导用户（实证 2026-09-07：本轮全部达标，health 仍显示上轮「2119≥1500」）。
                 //   Object.assign merge 语义下空串覆盖即清除；rebroadcastDream 对 falsy health 短路不转播空话。
-                if (DREAM_PATCH) DREAM_PATCH({ health: "" });
+                // v2.6.4：dangling 同批刷新（空串=清除），存量悬空只走非阻塞转播，绝不进 health。
+                if (DREAM_PATCH) DREAM_PATCH({ health: "", dangling: danglingLegacyTxt });
+                noticeSettle(danglingLegacyTxt ? "整合验收通过；" + danglingLegacyTxt : "");   // v2.6.4：存量悬空非阻塞可见性
+              } else if (danglingLegacyTxt && DREAM_PATCH) {
+                DREAM_PATCH({ dangling: danglingLegacyTxt });   // 无快照档的非正常轮：也把存量悬空提示落出去
+                noticeSettle(danglingLegacyTxt);
               }
             } catch (e2) {}
             try {
@@ -8269,6 +12630,9 @@ lessonFeedText + "\n" +
             DREAM_FEED_ROUND = null;   // v2.4.14(lesson-settle): 结算完成清清单
 DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步清
             DREAM_WRITTEN_RELS = null;   // v2.4.20: 同步清
+            // v3.1.0（A 次挂点）：dream 结算后顺带刷新检索索引（异步、不 await、异常不外泄）；
+            //   此刻 settleListener 仍在作用域 ⇒ 真建了才播报一行（自动/定期轮恒静默）。
+            try { void refreshSearchIndex({ reason: "dream-settle", listener: settleListener }); } catch (e) {}
           } catch (e) {
             cwarn("[dsh-memory] 整合结算异常:", e && e.message ? e.message : String(e));
             try { const st = readIntegrateState() || {}; st.lastIntegrateAt = Date.now(); st.lastFailAt = Date.now(); writeIntegrateState(st); } catch (e2) {}
@@ -8292,7 +12656,7 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
 DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步清
             DREAM_WRITTEN_RELS = null;   // v2.4.20: 同步清
             try { guardClear(String(run.id || "")); } catch (eG) {}   // v2.4.28（D4）：失败路径清看护
-        });        // v2.2.4: DREAM_TRACK 占位已上移至 runDreamPipeline 入口（同步段），此处不再重设（避免刷新心跳基准）
+        }).finally(() => { try { void refreshSearchIndex({ reason: "dream-settle-fallback" }); } catch (e) {} });        // v2.2.4: DREAM_TRACK 占位已上移至 runDreamPipeline 入口（同步段），此处不再重设（避免刷新心跳基准）
         dreamProgressPatch({ status: "running", reason: reason, startedAt: Date.now(), steps: 0, lastTool: "-" });
         clog("[dsh-memory] 已发起自动整合子代理（" + reason + "，后台执行中；进度见 ~/.dsh/memory/.integrate.json progress 字段）");
         return true;
@@ -8333,6 +12697,9 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
     //   同步段只保留：互斥检查 + DREAM_TRACK 代际占位 + 监听挂接，立即返回「已发起」；
     //   进度/终态可见性由 v2.5.1 转播链承担（首条 running patch 的「已发起」行经 notice 落表）。
     async function runDreamPipeline(reason, agentForParent) {
+      // v2.6.5（用户拍板）：手动 /dream 不吃 settings.staleSessionDays——改固定活跃下限 30 分钟
+      //   （只挡仍在写入的活跃会话，含发起会话本身）；自动定时整合仍按 settings 天数。
+      const isManual = reason === "手动";
       const busyMsg = dreamBusyCheck();   // v2.2.4: 在途互斥检查（仍在同步段，双发窗口封死）
       if (busyMsg) {
         cwarn("[dsh-memory] dream 管线拒绝发起（" + reason + "）：" + busyMsg + "——已有整合在跑，等完成后再试");
@@ -8342,23 +12709,49 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       DREAM_TRACK = { since: Date.now(), sessionId: null, steps: 0 };   // v2.2.4: 占位提前到同步段（原赋值在 await subagents.start 之后，快速连发存在双发窗口）
       const _gen = DREAM_TRACK;   // v2.5.4(B): 代际引用——后台清理只在仍属本轮时执行，防误清下一轮占位
       DREAM_BROADCAST_LAST_AT = 0;   // v2.5.1(转播可见性): 每轮重置节流水位——新 dream 的首条进度必落表
+      DREAM_WOKE = false;            // [dream-visible 20260930] 每轮重置唤醒水位（本轮是否已用唤醒投递过发起行）
       // v2.4.13(dream-live): 手动 /dream 才设监听会话（后台子代理照旧），进度实时转播回去；定期自动整合不打扰任何会话。
       // v2.5.1(转播可见性): 可用条件放宽——inject（旧注入路径）或 session.append（新落表路径）任一即可。
       DREAM_LISTENER = (agentForParent && (typeof agentForParent.inject === "function" || (agentForParent.session && typeof agentForParent.session.append === "function"))) ? agentForParent : null;
+      // [dream-visible 20260930] 同步段即时回执（关键时序）：归档阶段位于 spawnIntegrate 之前、可能耗时数分钟，
+      //   原先「已发起」要等 spawnIntegrate 里那条 running patch 才发出 ⇒ 用户 /dream 后长时间毫无反馈。
+      //   这里在命令受理的那一刻就唤醒一行（steer/followup），并置 DREAM_WOKE ⇒ 后续 running patch 不再重复开回合。
+      //   只手动走这里：自动/定期整合传的是 agentForParent=null（见 checkIntegrate → runDreamPipeline("定期", null)），
+      //   那时 DREAM_LISTENER 为空，条件不成立，不打扰任何会话。
+      try {
+        if (isManual && DREAM_LISTENER && !DREAM_WOKE) {
+          wakeDreamNotice(DREAM_LISTENER, makeMessage("<system-reminder>\n【dsh-memory · dream 已发起】已发起 dream 管线（后台执行中，" + reason + "）：漏网会话先归档（silent 自动，其他模式待你确认）→ 接续整合全部摘要。进度随时转播，完成给结果摘要。\n\n这是一条系统通知，不是任务：请**只回一行**确认，不要调用任何工具、不要读记忆库、不要自己再发一次整合。\n</system-reminder>"), "ack");
+        }
+      } catch (eAck) { /* 即时回执失败不影响管线 */ }
       void (async () => {   // v2.5.4(B): 归档→整合整段后台化
         try {
           ensureStaleNotified();
           let note = "";
           try {
-            const pending = findStaleSessions(PLUGIN_CFG.staleSessionDays, getEnabledAt(), true)   // v2.5.4(C): force 绕 TTL 缓存，归档清单必须现扫
-              .filter((s) => archivePendingEntry(s) && !sessionMentionedInMemory(s.id));   // v1.12.19→v2.4.3：只看水位重入判定
+            // v2.6.5: 手动 = 活跃下限 30 分钟（忽略 settings 天数）；自动 = settings 天数
+            const scanDays = isManual ? (MANUAL_STALE_MIN_IDLE_MS / 86400000) : PLUGIN_CFG.staleSessionDays;
+            const scanPending = () => findStaleSessions(scanDays, getEnabledAt(), true)   // v2.5.4(C): force 绕 TTL 缓存，归档清单必须现扫
+              .filter((s) => shouldReArchive(s, reArchiveOpts()));   // v2.8.4（P13/P15）：单一谓词（水位重入 + 掐断续跑 + 可选旁路）
+            let pending = scanPending();
             if (ARCHIVE_WM_DIRTY) { saveStaleNotified(); ARCHIVE_WM_DIRTY = false; }
             if (PLUGIN_CFG.staleAction === "silent" && pending.length > 0) {
               clog("[dsh-memory] dream 管线: 先归档 " + pending.length + " 个漏网会话，完成后自动接续整合");
-              const r = await runStaleArchive(pending);   // v2.4.7.1: r.ok=已发起，r.done=结算链（resolve 处置字符串）
+              let r = await runStaleArchive(pending);   // v2.4.7.1: r.ok=已发起，r.done=结算链（resolve 处置字符串）
+              // v2.6.6（撞车兜底，用户拍板）：会话启动时的 silent 自动归档与手动 /dream 常同刻相撞，此时本函数被
+              //   STALE_RUNNING 防重入拒（r.ok=false）。旧行为直接跳到 spawnIntegrate → 归档与整合并行、
+              //   「先归档后整合」静默失效（实证 2026-09-16 17:06:17→19）。改为：等在跑的归档结算完 → 重扫剩余 → 补一轮。
+              if (!r.ok && STALE_ACTIVE_DONE) {
+                clog("[dsh-memory] dream 管线: 已有归档在跑（" + r.reason + "），等其结算后再补一轮归档");
+                await Promise.race([STALE_ACTIVE_DONE, new Promise((res) => setTimeout(() => res("timeout"), DREAM_ARCHIVE_WAIT_MS))]);
+                pending = scanPending();   // 结算已写账本 → 此处拿到的是「剩余未归档」
+                if (pending.length > 0) r = await runStaleArchive(pending);
+                else note = "已有归档已收走全部候选 → ";
+              }
               if (r.ok && r.done) {   // 消号 v1.12.19.1 起在子代理完成回调内执行
-                const flag = await Promise.race([r.done, new Promise((res) => setTimeout(() => res("timeout"), 25 * 60000))]);
-                note = "已归档 " + r.count + " 个漏网会话（" + flag + "）→ ";
+                const flag = await Promise.race([r.done, new Promise((res) => setTimeout(() => res("timeout"), DREAM_ARCHIVE_WAIT_MS))]);
+                note = "本轮归档 " + r.count + " 个候选漏网会话（口径 " + (isManual ? "手动·30 分钟活跃下限" : "自动·" + PLUGIN_CFG.staleSessionDays + " 天") + "，" + flag + "）→ " + note;
+              } else if (!r.ok) {
+                note = "归档未发起（" + r.reason + "）→ ";
               }
             } else if (pending.length > 0) {
               note = "另有 " + pending.length + " 个漏网会话未归档（staleAction=" + PLUGIN_CFG.staleAction + " 待确认，确认后下次 /dream 将一并处理）；";
@@ -8416,6 +12809,18 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
         checkIntegrate();
         // v0.5（P0b-5）：回归超时判定随周期跑——48h dropped / 30d archived（levelApplyTimeout 内部 only 在变更时落盘）
         try { lessonApplyTimeout(Date.now()); } catch (e) {}
+        // v2.8.4（自动归档包）：静默自动归档 —— 与 checkIntegrate **各自 try/catch**，任一抛不连坐；
+        //   本行**只调归档 tick**，不调 runDreamPipeline ⇒ 整合层仍守 integrateDays（用户裁决 + 根因席划线）。
+        try {
+          const p = runStaleSilentTick(Date.now());
+          if (p && typeof p.catch === "function") p.catch((e) => { try { monitorEvent("archive", "auto-tick-throw " + (e && e.message ? e.message : String(e))); } catch (e2) {} });
+        } catch (e) { try { monitorEvent("archive", "auto-tick-sync-throw " + (e && e.message ? e.message : String(e))); } catch (e2) {} }
+        // v3.1.0：索引自动刷新（主挂点）—— 异步 fire-and-forget，**不 await**（await 会把本 tick 串行化）；
+        //   与上面几段各自 try/catch，任一抛不连坐。
+        try {
+          const pr = refreshSearchIndex({ reason: "hourly-tick" });
+          if (pr && typeof pr.catch === "function") pr.catch((e) => { try { monitorEvent("search-index", "refresh-throw"); } catch (e2) {} });
+        } catch (e) { try { monitorEvent("search-index", "refresh-sync-throw"); } catch (e2) {} }
       }, 3600000);
     } catch (e) {
       cwarn("[dsh-memory] 自动整合定时器启动失败:", e && e.message ? e.message : String(e));
@@ -8444,6 +12849,66 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       }
     } catch (e) {
       cwarn("[dsh-memory] /dream 命令注册失败:", e && e.message ? e.message : String(e));
+    }
+
+    // [logpane 20260930] /memory-panel —— 在系统默认浏览器打开记忆统计面板（含「本次启动以来」的实时日志）。
+    //   为什么不走设置页链接：桌面窗口源是 dsh-app://app，页面里对 /dsh-memory/* 的 fetch 到不了插件路由
+    //   （协议处理器只服务 app 文档/资源，其余落 400），`<a target="_blank">` 又被 Electron 的
+    //   setWindowOpenHandler 拦掉 ⇒ 只能由宿主进程自己拉起浏览器（宿主知道 PANEL_PORT）。
+    //   命令由宿主执行、不经页面 origin，故 web 端与桌面端同样可靠；回执里带 URL 便于手动复制。
+    try {
+      if (ctx.commands && typeof ctx.commands.register === "function") {
+        ctx.commands.register({
+          name: "memory-panel",
+          description: "在系统默认浏览器打开 dsh-memory 记忆统计面板（统计 + 本次启动以来的插件实时日志）。无需参数。",
+          handler: async () => {
+            // v3.1.1 修复：旧实现直接用注册期快照 PANEL_PORT，桌面端实测拿到 0 ⇒ URL 变
+            //   http://127.0.0.1:0/dsh-memory/stats ，浏览器打开了但必然 400/连不上。
+            //   现在①触发时实时向服务句柄要 port（快照仅兜底）②先探活面板路由，探不到就如实报错并给排查指引。
+            const livePort = (() => {
+              try { const p = PANEL_WSRV && Number(PANEL_WSRV.port); if (p) return p; } catch (e) { /* 句柄失效走快照 */ }
+              return Number(PANEL_PORT) || 0;
+            })();
+            if (!livePort) {
+              return { kind: "error", text: "面板端口不可用（webServer 服务未就绪或本进程无 Web 服务）。\n"
+                + "• 桌面端/Web 端：确认 DSH 已完整启动（设置页--插件--dsh-memory 应显示「统计面板已挂载」）。\n"
+                + "• CLI/headless：本模式没有 Web 服务，面板不可用属预期。\n"
+                + "排查：看本次启动日志里 [dsh-memory] 统计面板已挂载 / webServer 注入失败 两行。" };
+            }
+            const url = "http://127.0.0.1:" + livePort + "/dsh-memory/stats";
+            // 探活：确认插件路由真在监听（服务在但路由没挂上时，浏览器会开出 404 页面——旧实现照样报"已打开"）
+            let reachable = false;
+            try {
+              reachable = await new Promise((resolve) => {
+                let done = false;
+                const fin = (v) => { if (!done) { done = true; resolve(v); } };
+                try {
+                  const req = http.get(url, { timeout: 2500 }, (res) => { res.resume(); fin(res.statusCode >= 200 && res.statusCode < 400); });
+                  req.on("error", () => fin(false));
+                  req.on("timeout", () => { try { req.destroy(); } catch (e0) {} fin(false); });
+                } catch (e0) { fin(false); }
+              });
+            } catch (e0) { reachable = false; }
+            let ok = false, err = "";
+            if (reachable) {
+              try {
+                execFile("cmd", ["/c", "start", "", url], { windowsHide: true }, (e) => { if (e) cwarn("[dsh-memory] 拉起浏览器失败:", e.message); });
+                ok = true;
+              } catch (e) { err = String((e && e.message) || e); cwarn("[dsh-memory] 拉起浏览器失败:", err); }
+            } else {
+              err = "面板路由探活失败（HTTP 无响应/非 2xx-3xx）";
+              cwarn("[dsh-memory] /memory-panel 探活失败：" + url);
+            }
+            return ok
+              ? { kind: "success", text: "已在系统默认浏览器打开记忆统计面板： " + url + "\n（面板含「本次启动以来」的插件实时日志；打不开就手动复制这个地址）" }
+              : { kind: "error", text: "打开面板失败：" + err + "\n面板地址： " + url + "\n（可手动复制该地址到浏览器；若仍打不开，看日志里 [dsh-memory] 统计面板路由注册失败/统计面板已挂载 两行定位）" };
+          }
+        });
+      } else {
+        cwarn("[dsh-memory] commands 服务不可用，/memory-panel 命令未注册");
+      }
+    } catch (e) {
+      cwarn("[dsh-memory] /memory-panel 命令注册失败:", e && e.message ? e.message : String(e));
     }
 
     // v2.3.0：/memory-init 与 /memory-update —— 新装用户的两个自助入口
@@ -8504,7 +12969,7 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
 
     // v1.12.19.2: 启动横幅合并为单条就绪日志（各组件注册失败仍有独立 cwarn/cerr 报告）
     if (!ZSTD_OK) cerr("[dsh-memory] 当前 Node 缺少 zlib.zstdDecompressSync（需 ≥22.17），会话日志提取不可用 → 漏网归档强制降级 remind（防批量静默丢失）");
-    clog("[dsh-memory] 就绪 v" + PLUGIN_VERSION + "：staleSessionDays=" + PLUGIN_CFG.staleSessionDays
+    clog("[dsh-memory] 就绪 v" + PLUGIN_VERSION + "（构建 " + SELF_FP + "）· ★本行配置值 = **默认层**（cordis base）；用户配置/用户文件覆盖后的真值见「生效配置」行（启动时它在上一条；运行期改动会再报一次）—— 两者不一致时以那行为准：staleSessionDays=" + PLUGIN_CFG.staleSessionDays
       + " staleAction=" + PLUGIN_CFG.staleAction + (ZSTD_OK ? "" : "(已降级remind:无zstd)")
       + " active=" + PLUGIN_CFG.active
       + " integrate=" + (PLUGIN_CFG.integrateEnabled ? PLUGIN_CFG.integrateDays + "天/次" : "关")
@@ -8516,6 +12981,11 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
 
     // v2.2.6：检索层启动自检——异步错峰执行不阻塞就绪；结果进监控汇总与零结果提示，失配必暴露
     setTimeout(() => { runRetrievalSelfCheck(); }, 3000);
+
+    // v2.8.4（P18/自动归档包⑤）：自动归档**启动自检** —— 上一进程的 tick 结论 + 内容见证在每次启动露一次面。
+    //   与心跳行的分工：心跳行只在字段变化时推送（重启后可能半天不出现）；本行保证"一重启就看得见上次干了什么"。
+    //   成本：**只进插件控制台（clog），不进模型上下文** ⇒ 零 token。
+    setTimeout(() => { try { clog("[dsh-memory] 自动归档自检：" + archiveSignalLine()); } catch (e) {} }, 3200);
 
     // v2.3.0：记忆库体检（顺手补齐骨架目录）+ 升级检查（每日一次，错峰 6 秒不拖启动）
     try {
