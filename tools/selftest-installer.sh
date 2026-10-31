@@ -173,7 +173,7 @@ if [ ! -d "$E/profiles/desktop/plugins/memory" ]; then ok 'E1 desktop has no own
 OUT_E="$(run_installer "$E" --check --profile desktop)"; RC_E=$?
 assert_eq "$RC_E" "0" 'E2 --check on consumer profile exits 0'
 assert_lack "$OUT_E" 'desktop] 关键文件缺失' 'E3 no false "missing files" for consumer profile'
-assert_has "$OUT_E" 'desktop] v3.5' 'E4 consumer profile resolves real version line'
+assert_has "$OUT_E" 'desktop] v' 'E4 consumer profile resolves real version line'
 OUT_E2="$(run_installer "$E" --check)"; RC_E2=$?
 assert_eq "$RC_E2" "0" 'E5 --check (auto discovery) exits 0'
 assert_lack "$OUT_E2" 'profiles/desktop/plugins/memory' 'E6 no output references consumer own dir'

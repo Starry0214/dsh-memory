@@ -4,6 +4,31 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.0.0（2026-10-31）：**主题库为唯一真源（破坏性变更）**
+
+> 为什么是主版本号：三处**行为**变了，老用户升级后能直接感觉到——
+> ① 库模式下**读不到** `projects/` `knowledge/` 下的 md（要按主题读）；
+> ② `memory_dream_patch` 传裸 md 路径会被**整批拒绝**（要改用 `topic:`）；
+> ③ 容量超限判据从"md 文件字节"变成"主题字符"，三档口径（9000/40000/200000）。
+> 数据不丢：md 文件原样保留（只是不再被读），主题库内容不变；回退办法见文末。
+
+### 破坏性变更（仅 `memoryTopicDbEnabled=on` 时生效；off 时行为与 v3.5 完全一致）
+- **读**：`read` / `grep` / `glob` 命中 `~/.dsh/memory/{projects,knowledge}/**.md` ⇒ 拒绝执行，提示改用 `memory_read` / `memory_search` 按主题读
+  - 放行：`global.md` / `index.md`（人工稳定层）、`_export/**`（导出快照）、`sessions/**` 与 `tools/**`（漏网归档链路）
+- **写**：`memory_dream_patch` 收到裸导出视图路径（`projects|knowledge|sessions|tools/*.md` 且未给 `topic`）⇒ `EXPORT_VIEW_READONLY`，整批不写；给了 `topic` 则以 topic 为准
+- **容量**：主主题 9,000 / 明细主题 40,000 / 索引类 200,000；明细与索引**不再**用"连续 N 轮未处理"催办
+
+### 回退到 v3.5 行为
+`~/.dsh/memory/.config.json` 里把 `memoryTopicDbEnabled` 设为 `false` 并重启：md 恢复为可读可写的主路径，
+主题库数据仍在（不会删），随时可再开。
+
+### 随包工具
+- `memtopic/src/split-oversized.mjs`：超大主题自救（默认 dry-run，`--apply` 才写，内置守恒校验）
+- `tools/sync-payload.mjs` / `tools/selftest-installer.ps1`（81 断言）/ `tools/selftest-installer.sh`（33 断言）
+
+### 验证
+插件侧 11 门 481 断言 + `test/split-oversized.check.mjs` 23 + `test/plugin.smoke.test.mjs` 全绿；安装器 PS 81/81、sh 33/33；
+payload 20 文件 / zip 687,824B / sha256 `214632d981e189959e2cda9b14e35326ff712c41c77b3a6cff49751be6b4fefd`。
 ## v3.5.7（2026-10-31）：随包发布 `split-oversized.mjs`（超大主题自救工具）
 
 - 新增 `memtopic/src/split-oversized.mjs`：把超大主题按字符上限从尾部切段（默认 dry-run，`--apply` 才写），子主题自动继承源主题父节点、内置守恒校验（句数/字符数前后必须相等）
