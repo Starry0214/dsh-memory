@@ -80,12 +80,29 @@ function Get-JsonProp($Obj, [string]$Name) {
   return $null
 }
 
+# [BUG-6] payload 的 client/** 落在 <plugins>/dsh-memory-client/，其余落在 <pluginDir>/
+function Get-PayloadAbs([string]$PluginDir, [string]$Rel) {
+  $rel = $Rel -replace '/', '\'
+  if ($rel -like 'client\*') {
+    return (Join-Path (Join-Path (Split-Path -Parent $PluginDir) 'dsh-memory-client') ($rel.Substring('client\'.Length)))
+  }
+  return (Join-Path $PluginDir $rel)
+}
+
 function Get-PatchIdRows([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 0 }
   $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
   if ($null -eq $text) { return 0 }
   $text = $text -replace "`r", ''
   return @([regex]::Matches($text, '(?m)^[ \t]*-[ \t]*id:[ \t]*dsh-memory[ \t]*($|#)')).Count
+}
+
+function Get-PatchIdRows2([string]$Path, [string]$IdName) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 0 }
+  $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+  if ($null -eq $text) { return 0 }
+  $text = $text -replace "`r", ''
+  return @([regex]::Matches($text, '(?m)^[ \t]*-[ \t]*id:[ \t]*' + [regex]::Escape($IdName) + '[ \t]*($|#)')).Count
 }
 
 function Get-TopicCounts([string]$DbPath) {
@@ -120,7 +137,7 @@ Assert-That ($r.Code -eq 0) 'A0 install exit code 0' ("exit=" + $r.Code)
 $filesOk = 0; $fileTotal = 0; $badFiles = @()
 foreach ($f in @($manifest.files)) {
   $fileTotal++
-  $abs = Join-Path $pluginDir (([string]$f.path) -replace '/', '\')
+  $abs = Get-PayloadAbs $pluginDir ([string]$f.path)
   if ((Get-Sha $abs) -eq ([string]$f.sha256).ToLowerInvariant()) { $filesOk++ } else { $badFiles += [string]$f.path }
 }
 Assert-That ($filesOk -eq $fileTotal) 'A1 all payload files match manifest sha256' ($filesOk.ToString() + '/' + $fileTotal + ' bad=' + ($badFiles -join ','))
@@ -141,18 +158,24 @@ $modsA = @(Get-ChildItem -LiteralPath (Join-Path $pluginDir 'memtopic\src') -Fil
 Assert-That ($modsA.Count -ge 12) 'A6 memtopic/src has >=12 runtime modules' ('count=' + $modsA.Count)
 Assert-That (Test-Path -LiteralPath (Join-Path $pluginDir 'memtopic\src\migrate.mjs')) 'A7 migrate.mjs installed'
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $memRoot '.memtopic\migrate-pending.json'))) 'A8 fresh user: no pending marker'
+# [BUG-6] 设置界面半区必须装到 dsh-memory-client 并注册（否则新用户看不到「通用设置 → 记忆」）
+$clientDir = Join-Path $homeA 'profiles\web\plugins\dsh-memory-client'
+Assert-That (Test-Path -LiteralPath (Join-Path $clientDir 'lib\index.js') -PathType Leaf) 'A11 client 设置界面已装到 dsh-memory-client/lib/index.js'
+Assert-That (Test-Path -LiteralPath (Join-Path $clientDir 'package.json') -PathType Leaf) 'A12 client package.json 已装'
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $pluginDir 'client'))) 'A13 不再往 memory/client 写死文件'
+Assert-That ((Get-PatchIdRows2 $patchA 'dsh-memory-client') -eq 1) 'A14 client 已注册（1 行）' ('rows=' + (Get-PatchIdRows2 $patchA 'dsh-memory-client'))
 
 # ===========================================================================
 # B. 二次安装幂等
 # ===========================================================================
 Write-Host '[B] re-install idempotency'
 $hashBefore = @{}
-foreach ($f in @($manifest.files)) { $rel = [string]$f.path; $hashBefore[$rel] = (Get-Sha (Join-Path $pluginDir ($rel -replace '/', '\'))) }
+foreach ($f in @($manifest.files)) { $rel = [string]$f.path; $hashBefore[$rel] = (Get-Sha (Get-PayloadAbs $pluginDir $rel)) }
 $backupDirsBefore = @(Get-ChildItem -LiteralPath $pluginDir -Directory -Filter '_backup-*' -ErrorAction SilentlyContinue).Count
 $r2 = Invoke-Installer $homeA @('-LocalPayload', $Payload, '-ProfileName', 'web')
 Assert-That ($r2.Code -eq 0) 'B0 re-install exit code 0' ("exit=" + $r2.Code)
 $same = 0
-foreach ($f in @($manifest.files)) { $rel = [string]$f.path; if ((Get-Sha (Join-Path $pluginDir ($rel -replace '/', '\'))) -eq $hashBefore[$rel]) { $same++ } }
+foreach ($f in @($manifest.files)) { $rel = [string]$f.path; if ((Get-Sha (Get-PayloadAbs $pluginDir $rel)) -eq $hashBefore[$rel]) { $same++ } }
 Assert-That ($same -eq $fileTotal) 'B1 installed files unchanged after re-install' ($same.ToString() + '/' + $fileTotal)
 Assert-That ((Get-PatchIdRows $patchA) -eq 1) 'B2 no duplicate registration row' ('rows=' + (Get-PatchIdRows $patchA))
 $backupDirsAfter = @(Get-ChildItem -LiteralPath $pluginDir -Directory -Filter '_backup-*' -ErrorAction SilentlyContinue).Count

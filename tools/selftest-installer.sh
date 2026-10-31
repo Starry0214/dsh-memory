@@ -75,7 +75,7 @@ const fs=require('fs'),crypto=require('crypto');
 const [mf,dir]=process.argv.slice(2);
 const m=JSON.parse(fs.readFileSync(mf,'utf8'));
 let bad=[];
-for(const f of m.files){const p=dir+'/'+f.path;const h=fs.existsSync(p)?crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'):'';if(h!==String(f.sha256).toLowerCase())bad.push(f.path);}
+const path=require('path');for(const f of m.files){const p=f.path.startsWith('client/')?path.join(path.dirname(dir),'dsh-memory-client',f.path.slice(7)):path.join(dir,f.path);const h=fs.existsSync(p)?crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'):'';if(h!==String(f.sha256).toLowerCase())bad.push(f.path);}
 process.exit(bad.length?1:0);
 NODE
 assert_eq "$?" "0" 'A3 all payload files match manifest sha256'
@@ -91,6 +91,13 @@ assert_file "$PATCH" 'A8 cordis.patch.yml created'
 ROWS=$(grep -cE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*dsh-memory[[:space:]]*($|#)' "$PATCH" 2>/dev/null || echo 0)
 assert_eq "$ROWS" "1" 'A9 exactly one registration row'
 assert_nofile "$A/memory/.memtopic/migrate-pending.json" 'A10 fresh user: no pending marker'
+# [BUG-6] 设置界面半区必须装到 dsh-memory-client 并注册
+CLIENT_DIR="$A/profiles/web/plugins/dsh-memory-client"
+assert_file "$CLIENT_DIR/lib/index.js" 'A11 client 设置界面已装到 dsh-memory-client/lib/index.js'
+assert_file "$CLIENT_DIR/package.json" 'A12 client package.json 已装'
+if [ ! -d "$PA/client" ]; then ok 'A13 不再往 memory/client 写死文件'; else bad 'A13 不再往 memory/client 写死文件' 'memory/client 仍存在'; fi
+CROWS=$(grep -cE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*dsh-memory-client[[:space:]]*($|#)' "$PATCH" 2>/dev/null || echo 0)
+assert_eq "$CROWS" "1" 'A14 client 已注册（1 行）'
 
 # ── B. 幂等重装 ────────────────────────────────────────────────────────────
 echo '[B] re-install idempotency'

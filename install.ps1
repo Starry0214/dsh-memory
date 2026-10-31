@@ -892,10 +892,19 @@ function Backup-PluginDir([string]$PluginDir) {
 
 function Copy-PayloadToPlugin([string]$StageDir, [string]$PluginDir, $Manifest) {
   $count = 0
+  $pluginsRoot = Split-Path -Parent $PluginDir
+  $clientRoot = Join-Path $pluginsRoot 'dsh-memory-client'
   foreach ($f in @($Manifest.files)) {
     $rel = ([string]$f.path) -replace '/', '\'
     $src = Join-Path $StageDir $rel
-    $dst = Join-Path $PluginDir $rel
+    # [BUG-6] payload 的 client/** 是「设置界面半区」，宿主按 ./plugins/dsh-memory-client/lib/index.js 加载，
+    #   所以必须落到 <plugins>/dsh-memory-client/ 并单独注册；写进 <pluginDir>/client/ 的话没人引用（死文件），
+    #   新用户会看不到「通用设置 → 记忆」半区。
+    if ($rel -like 'client\*') {
+      $dst = Join-Path $clientRoot ($rel.Substring('client\'.Length))
+    } else {
+      $dst = Join-Path $PluginDir $rel
+    }
     $dstDir = Split-Path -Parent $dst
     if ($dstDir -and -not (Test-Path -LiteralPath $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
     Copy-Item -LiteralPath $src -Destination $dst -Force
@@ -1440,6 +1449,7 @@ function Register-Plugin {
   $merge = Merge-PatchFile -Path $PatchFile -Block $memoryBlock -IdName 'dsh-memory'
   $r.Action = $merge.Action
   $r.Detail = $merge.Detail
+
   switch ($merge.Action) {
     'created' {
       $null = Write-PatchFile -Path $PatchFile -Text $merge.Text
@@ -1460,9 +1470,26 @@ function Register-Plugin {
       $r.Ok = $false
     }
   }
+  # [BUG-6] 设置界面半区（client）单独注册：payload 的 client/** 装在 <plugins>/dsh-memory-client/，
+  #   不注册 ⇒ 新用户看不到「通用设置 → 记忆」半区（真机：全新安装只有 memory/ 一个目录）。
+  #   必须在 memory 行写盘之后做（Merge-PatchFile 基于当前文件内容，提前做会覆盖掉 memory 行）。
+  $clientDir = Join-Path (Split-Path -Parent $PluginDir) 'dsh-memory-client'
+  if (Test-Path -LiteralPath (Join-Path $clientDir 'lib\index.js') -PathType Leaf) {
+    $clientBlock = @(
+      '# --- dsh-memory-client: settings UI half-zone (installed by the dsh-memory installer) ---',
+      '- insert:',
+      '    - id: dsh-memory-client',
+      '      name: ./plugins/dsh-memory-client/lib/index.js'
+    )
+    $cMerge = Merge-PatchFile -Path $PatchFile -Block $clientBlock -IdName 'dsh-memory-client'
+    if (@('created', 'registered', 'repaired') -contains $cMerge.Action) {
+      Write-PatchFile -Path $PatchFile -Text $cMerge.Text | Out-Null
+    }
+    $r.ClientAction = $cMerge.Action
+    $r.ClientDetail = $cMerge.Detail
+  }
   return $r
 }
-
 # ===========================================================================
 # Host compatibility warning (non-blocking)
 # ===========================================================================
@@ -1922,7 +1949,13 @@ function Invoke-CheckMode {
     if ($manifest) {
       foreach ($f in @($manifest.files)) {
         $total++
-        $abs = Join-Path $c.PluginDir (([string]$f.path) -replace '/', '\')
+        $rel = ([string]$f.path) -replace '/', '\'
+        # [BUG-6] client/** 实际落在 <plugins>/dsh-memory-client/（宿主按该路径加载），不在 <pluginDir>/client/
+        if ($rel -like 'client\*') {
+          $abs = Join-Path (Join-Path (Split-Path -Parent $c.PluginDir) 'dsh-memory-client') ($rel.Substring('client\'.Length))
+        } else {
+          $abs = Join-Path $c.PluginDir $rel
+        }
         if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) { $missing += [string]$f.path; continue }
         if ((Get-Sha256File $abs) -ne ([string]$f.sha256).ToLowerInvariant()) { $mismatch += [string]$f.path; continue }
         $okCount++

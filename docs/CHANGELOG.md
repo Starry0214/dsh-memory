@@ -4,6 +4,21 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.0.1（2026-10-31）：修「新用户没有设置界面」+ 客户端代码回灌
+
+### BUG-6：安装器把 client/** 装到了没人引用的地方（新用户看不到「通用设置 → 记忆」）
+- 现象：`install.ps1 -CheckOnly` 在**健康安装**上报 `ERR 17/20 匹配；缺失 3（client/lib/client.js, client/lib/index.js, client/package.json）`
+- 根因：payload 的 `client/**` 被原样写进 `<pluginDir>/client/`，但宿主按 `./plugins/dsh-memory-client/lib/index.js` 加载设置界面
+  ⇒ 那些文件是**死文件**；全新安装后 `plugins/` 下只有 `memory/`，**没有 `dsh-memory-client/`、patch 也没注册 client**
+  ⇒ 新用户装完只有引擎，**设置界面整个缺失**
+- 修复：安装器把 `client/**` 落到 `<plugins>/dsh-memory-client/`，并**单独注册** `- id: dsh-memory-client`（幂等）；
+  `-CheckOnly` 的完整性校验改为按真实路径比对；`install.sh` 同步镜像
+- 验证：PS 自测 81 → **85**（新增 A11–A14：client 已装/已注册/不再写死文件）；sh 自测 33 → **37**（同四项）
+
+### 客户端代码回灌（仓库那份落后约 1.5 个月）
+- 现网 `dsh-memory-client/lib/client.js` = 20,216B（10-06），仓库 `client/lib/client.js` 只有 11,139B（09-27）
+  ⇒ 以**现网为准**回灌仓库 `client/**`（无个人路径/无敏感信息），payload 随之更新
+- payload 20 文件 / **691,381B** / sha256 `dd0f99a0fea82a58c4bf9b4949bc91b23490eff9444c22f5a91628348a11c4a7`
 ## v4.0.0（2026-10-31）：**主题库为唯一真源（破坏性变更）**
 
 > 为什么是主版本号：三处**行为**变了，老用户升级后能直接感觉到——

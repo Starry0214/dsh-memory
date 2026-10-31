@@ -27,8 +27,8 @@
   "license": "MIT",
   "author": "Starry0214",
   "peerDependencies": {
-    "@deepseek-ai/dsh-client-store": "^0.1.2-alpha.1",
-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.2-alpha.1",
-    "@deepseek-ai/dsh-client-ui-settings": "^0.1.2-alpha.1"
+    "@deepseek-ai/dsh-client-store": "^0.1.2-alpha.1 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.2-alpha.1 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.2-alpha.1 || ^0.2.0-rc.1"
   }
 }

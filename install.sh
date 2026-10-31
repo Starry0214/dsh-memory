@@ -311,7 +311,8 @@ if [ "$MODE" = "check" ]; then
     for n in $TARGETS; do
       pdir="$(plugin_dir_of "$n")"; miss=0; badsha=0; total=0
       while IFS="$(printf '\t')" read -r sh bytes rel; do
-        total=$((total+1)); f="$pdir/$rel"
+        total=$((total+1))
+    case "$rel" in client/*) f="$(dirname "$pdir")/dsh-memory-client/${rel#client/}" ;; *) f="$pdir/$rel" ;; esac
         if [ ! -f "$f" ]; then miss=$((miss+1)); continue; fi
         got="$(sha256_of "$f")" || got=""
         [ "$got" = "$sh" ] || badsha=$((badsha+1))
@@ -536,8 +537,14 @@ for n in $TARGETS; do
   else
     item "没有旧版本文件需要备份（该 profile 全新安装）"
   fi
+  # [BUG-6] payload 的 client/** 是「设置界面半区」，宿主按 ./plugins/dsh-memory-client/lib/index.js 加载
+  #   ⇒ 必须落到 <plugins>/dsh-memory-client/（写进 <pluginDir>/client/ 没人引用，新用户看不到设置界面）
   while IFS="$(printf '\t')" read -r sh bytes rel; do
-    dst="$pdir/$rel"; mkdir -p "$(dirname "$dst")"; cp -f "$stage/$rel" "$dst"
+    case "$rel" in
+      client/*) dst="$(dirname "$pdir")/dsh-memory-client/${rel#client/}" ;;
+      *)        dst="$pdir/$rel" ;;
+    esac
+    mkdir -p "$(dirname "$dst")"; cp -f "$stage/$rel" "$dst"
   done < <(manifest_files "$manifest")
   cnt="$(ls "$pdir/memtopic/src"/*.mjs 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$cnt" -ge 12 ]; then ok "写入完成；memtopic $cnt 个 .mjs 模块就位"; else bad "memtopic 模块不足（$cnt）"; fi
@@ -682,6 +689,24 @@ for n in $TARGETS; do
   printf '%s\n' "$block" >> "$tmp"
   cat "$tmp" > "$p"
   ok "[$n] 已在 $p 注册 dsh-memory（$form）"
+done
+
+# [BUG-6] 设置界面半区单独注册（client 已装到 <plugins>/dsh-memory-client/）
+client_block='# --- dsh-memory-client: settings UI half-zone (installed by the dsh-memory installer) ---
+- insert:
+  - id: dsh-memory-client
+    name: ./plugins/dsh-memory-client/lib/index.js'
+for n in $TARGETS; do
+  pdir="$(plugin_dir_of "$n")"
+  [ -f "$(dirname "$pdir")/dsh-memory-client/lib/index.js" ] || continue
+  p="$(patch_of "$n")"
+  if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*dsh-memory-client[[:space:]]*($|#)' "$p" 2>/dev/null; then
+    ok "[$n] 已注册 dsh-memory-client（跳过）"
+    continue
+  fi
+  cp -f "$p" "$p.bak-$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+  { printf '\n'; printf '%s\n' "$client_block"; } >> "$p"
+  ok "[$n] 已注册 dsh-memory-client（设置界面半区）"
 done
 
 # ---- final report ----
