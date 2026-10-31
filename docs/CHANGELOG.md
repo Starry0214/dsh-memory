@@ -32,7 +32,7 @@
 - 老用户识别遗留 md ⇒ 写 `.memtopic/migrate-pending.json` ⇒ 下次启动自动迁移（失败保留标记回落 md）
 - 无 node 环境用 DSH 桌面版 Electron-as-node（实测含 `node:sqlite`）
 - **BUG-5**：按注册表**绝对 `file://` 路径**解析真实插件目录（真机：desktop 的 patch 指向 `profiles/web/plugins/memory`，原实现会假报"关键文件缺失"并把迁移命令指向不存在的路径）
-- `tools/sync-payload.mjs`（确定性打包）+ `tools/selftest-installer.ps1`（**81** 条断言）
+- `tools/sync-payload.mjs`（确定性打包）+ `tools/selftest-installer.ps1`（**81** 条断言）+ `tools/selftest-installer.sh`（**33** 条断言，覆盖全新装/幂等/老用户迁移/宿主运行中安全降级/consumer profile）
 
 ### 验收
 插件侧 11 门 **481** 条断言全绿（overlimit-tier 16 / dream-nomd 43 / sink 42 / compat 39 / migrate-notice 52 / panel 143 / dream-patch 28 / p6 38 / p5 30 / intent 21 / archive 29）+ 安装器自测 81 + 新用户/老用户迁移 e2e 25。
