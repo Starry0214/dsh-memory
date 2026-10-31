@@ -4,6 +4,39 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v3.5.6（2026-10-31）：**主题库去 md 化收尾 + 安装器 v4 可分发**
+
+> 这一版把「md → 主题库」迁移真正收干净：md 只剩人工稳定层与导出视图，dream 不再读导出视图；
+> 容量治理从"md 文件字节"切到"主题字符"三档口径；安装器补齐老用户升级路径。
+
+### 容量三档口径（`overLimitTopicLimit` / `detailTopicLimit` / `indexTopicLimit`）
+- 主主题/注入层 **9,000**（原口径，保留"连续 N 轮未处理"升级）
+- 明细主题（`level=detail`）**40,000**：不进注入层、靠 `memory_read` 按需读，超限只提示 splitTopic，不再催轮次
+- 索引类（名字含「字面量索引/记忆索引」）**200,000**：§9.12③ 要求逐字保存、天生无限增长，只提示"按季度分片"
+- 真机落地：T-0182(158,966)→4 段、T-0324(96,247)→3 段、另 11 个明细主题各切 1 段、索引 T-0263(408,198)→200K×2 分片；**新口径下告警 12 → 0**，句数守恒（+指针句）
+
+### dream 去 md 化
+- 任务书只列"超限主题（ID+名字+字符数+建议 splitTopic）"，明写「md 是导出视图，不要读写」
+- 库模式不再调用 `reconcileProjectIndex()`（原读 `projects/*.md`）；实测生成任务书期间对导出视图 md 的读取 **0 次**
+- **硬闸**：`memory_dream_patch` 收到裸导出视图路径 ⇒ 整批拒绝 `EXPORT_VIEW_READONLY`（绝不半批落盘）；`tools/pre-execute` 拦截 `projects|knowledge` 下 md 的 read/grep/glob（`sessions|tools`、`_export/**`、`global.md/index.md` 放行）
+
+### 修复
+- **3.5.1** 斜杠命令全部消失：顶层 `inject` 恢复 `commands`/`skills`（延迟注入在真机不生效）
+- **3.5.2** compat 自检整条组装失败：cordis 中未 `inject` 的服务读属性会抛 ⇒ 逐属性 `safeGet` + 结果常驻 `.monitor.json`（`d.compat`）
+- **3.5.3** 「日摘要过期归档」候选发现仍在扫 md ⇒ 库模式永远 `no-candidate`：改为库内发现（先库、后 md）
+- **3.5.6** 自动路径 `no-candidate` 不再打 warn（正常空轮）
+
+### 安装器 v4
+- payload zip（19 文件：`index.js` + `client/**` + `memtopic/src/*.mjs`）逐文件 sha256 校验
+- 多 profile 自动发现；junction + 包名注册；新用户开箱（主题库默认开 + AGENTS v4）
+- 老用户识别遗留 md ⇒ 写 `.memtopic/migrate-pending.json` ⇒ 下次启动自动迁移（失败保留标记回落 md）
+- 无 node 环境用 DSH 桌面版 Electron-as-node（实测含 `node:sqlite`）
+- **BUG-5**：按注册表**绝对 `file://` 路径**解析真实插件目录（真机：desktop 的 patch 指向 `profiles/web/plugins/memory`，原实现会假报"关键文件缺失"并把迁移命令指向不存在的路径）
+- `tools/sync-payload.mjs`（确定性打包）+ `tools/selftest-installer.ps1`（**81** 条断言）
+
+### 验收
+插件侧 11 门 **481** 条断言全绿（overlimit-tier 16 / dream-nomd 43 / sink 42 / compat 39 / migrate-notice 52 / panel 143 / dream-patch 28 / p6 38 / p5 30 / intent 21 / archive 29）+ 安装器自测 81 + 新用户/老用户迁移 e2e 25。
+
 ## v3.4.5（2026-10-22）：**过期日摘要自动瘦身** —— 补「隔天起没人管」的层设计缺口
 
 > 用户：「这些日摘要超限是不是也是 bug？」→「要不看看 mimocode 怎么做的？」→「可以（做进代码）」。
