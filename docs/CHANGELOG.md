@@ -4,6 +4,12 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v3.5.7（2026-10-31）：随包发布 `split-oversized.mjs`（超大主题自救工具）
+
+- 新增 `memtopic/src/split-oversized.mjs`：把超大主题按字符上限从尾部切段（默认 dry-run，`--apply` 才写），子主题自动继承源主题父节点、内置守恒校验（句数/字符数前后必须相等）
+- 改为**相对导入**（`new URL("./", import.meta.url)`），随 payload 安装后可直接运行，不依赖开发机路径
+- payload 19 → **20 文件**（zip 687,828B / sha256 `b319dae149c457b512aba10ff6090a9dcdbcf45a2455093a0ab8c2d76bbf90e1`）
+- 设计文档补「主题库容量三档口径」「去 md 化硬闸」两节
 ## v3.5.6（2026-10-31）：**主题库去 md 化收尾 + 安装器 v4 可分发**
 
 > 这一版把「md → 主题库」迁移真正收干净：md 只剩人工稳定层与导出视图，dream 不再读导出视图；
