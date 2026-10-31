@@ -1,4 +1,4 @@
-﻿# dsh-memory installer v4 for Windows (Windows PowerShell 5.1 and PowerShell 7+)
+# dsh-memory installer v4 for Windows (Windows PowerShell 5.1 and PowerShell 7+)
 #
 # One-line install / upgrade (idempotent - re-run the same command to upgrade):
 #   irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | iex
@@ -415,7 +415,18 @@ function Get-Context {
       }
     }
   }
-  $r.Primary = if ($r.Targets -contains 'desktop') { 'desktop' } else { $r.Targets[0] }
+  # [BUG-5] 主 profile：优先"自己目录里真有插件"的那个（真机：desktop 只通过绝对路径消费 web 的目录，
+  #   若按旧规则取 desktop 会得到空目录 ⇒ 假 ERR + 迁移命令指向不存在的路径）
+  $owners = @()
+  foreach ($n in $r.Targets) {
+    $tc = Get-TargetContext $n
+    if (-not $tc.IsConsumer -and (Test-Path -LiteralPath (Join-Path $tc.PluginDir 'index.js') -PathType Leaf)) { $owners += $n }
+  }
+  if ($owners.Count -gt 0) {
+    $r.Primary = if ($owners -contains 'desktop') { 'desktop' } else { $owners[0] }
+  } else {
+    $r.Primary = if ($r.Targets -contains 'desktop') { 'desktop' } else { $r.Targets[0] }
+  }
   $r.Ok = $true
   return $r
 }
@@ -423,13 +434,47 @@ function Get-Context {
 function Get-TargetContext([string]$Name) {
   $profileDir = Join-Path (Join-Path $DSH_HOME 'profiles') $Name
   $pluginsRoot = Join-Path $profileDir 'plugins'
+  $patchFile = Join-Path $profileDir 'cordis.patch.yml'
+  # [BUG-5] 注册表若用**绝对 file:// 路径**指向别的 profile（真机实例：desktop 的 cordis.patch.yml
+  #   指向 profiles/web/plugins/memory/index.js），则插件真实目录 = 那个目录，不是 <profile>/plugins/memory。
+  #   否则 -CheckOnly 会对 desktop 报"关键文件缺失"假错，迁移命令也会指向不存在的路径。
+  $registered = Resolve-RegisteredPluginDir $patchFile
+  $pluginDir = if ($registered) { $registered } else { Join-Path $pluginsRoot 'memory' }
   return @{
     Name = $Name
     ProfileDir = $profileDir
     PluginsRoot = $pluginsRoot
-    PluginDir = (Join-Path $pluginsRoot 'memory')
-    PatchFile = (Join-Path $profileDir 'cordis.patch.yml')
+    PluginDir = $pluginDir
+    PatchFile = $patchFile
+    RegisteredDir = $registered
+    IsConsumer = [bool]$registered
   }
+}
+
+# [BUG-5] 解析 cordis.patch.yml 里 dsh-memory 的 name 字段：绝对 file:// 路径 ⇒ 返回其目录；否则 $null（走默认目录）
+function Resolve-RegisteredPluginDir([string]$PatchPath) {
+  if (-not (Test-Path -LiteralPath $PatchPath -PathType Leaf)) { return $null }
+  $txt = Read-TextFile $PatchPath
+  if (-not $txt) { return $null }
+  $lines = ($txt -replace "`r", '') -split "`n"
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -notmatch '^[ \t]*-[ \t]*id:[ \t]*dsh-memory[ \t]*($|#)') { continue }
+    for ($k = $i + 1; $k -lt [Math]::Min($i + 8, $lines.Count); $k++) {
+      $m = [regex]::Match($lines[$k], '^[ \t]*name:[ \t]*["'']?([^"''#]+?)["'']?[ \t]*($|#)')
+      if (-not $m.Success) { continue }
+      $val = $m.Groups[1].Value.Trim()
+      if ($val -notmatch '^file:/+') { return $null }          # 包名/相对路径 ⇒ 默认目录
+      $p = ($val -replace '^file:/+', '') -replace '/', '\'
+      if ($p -notmatch '^[A-Za-z]:') { return $null }
+      # .../plugins/memory/index.js → .../plugins/memory
+      $dir = Split-Path -Parent $p
+      if ($dir -match '\\index\.js$') { $dir = Split-Path -Parent $dir }
+      if ($dir -match '\\lib\\index\.js$') { $dir = Split-Path -Parent (Split-Path -Parent $dir) }
+      return $dir
+    }
+    return $null
+  }
+  return $null
 }
 
 function Format-ProfileMode([string]$Mode) {

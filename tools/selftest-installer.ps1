@@ -308,6 +308,40 @@ Assert-That (Test-Path -LiteralPath (Join-Path $homeA 'AGENTS.md')) 'E4 AGENTS.m
 Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $homeA 'profiles\web\plugins') -Directory -Filter '_uninstalled-memory-*').Count -ge 1) 'E5 plugin dir kept as _uninstalled-memory-<ts>'
 
 # ===========================================================================
+# H. BUG-5 回归：profile 通过**绝对 file:// 路径**消费别的 profile 的插件目录
+#    真机实例：desktop 的 cordis.patch.yml 写 file:///C:/Users/<u>/.dsh/profiles/web/plugins/memory/index.js
+#    ⇒ 必须解析到真实目录（web），不能对 desktop 报"关键文件缺失"假错，也不能把迁移命令指向 desktop
+# ===========================================================================
+Write-Host '[H] consumer profile (absolute file:// registration)'
+$homeH = New-TempHome 'h'
+$homes += $homeH
+New-Item -ItemType Directory -Force -Path (Join-Path $homeH 'profiles\desktop') | Out-Null
+$rh = Invoke-Installer $homeH @('-LocalPayload', $Payload, '-ProfileName', 'web')
+Assert-That ($rh.Code -eq 0) 'H0 install into web profile exit 0' ("exit=" + $rh.Code)
+$webPlugin = Join-Path $homeH 'profiles\web\plugins\memory'
+Assert-That (Test-Path -LiteralPath (Join-Path $webPlugin 'index.js')) 'H1 web profile hosts index.js'
+# desktop 只写注册（绝对路径指向 web 的 index.js），自己不放文件
+$absUrl = 'file:///' + ((Join-Path $webPlugin 'index.js') -replace '\\', '/')
+$patchH = Join-Path $homeH 'profiles\desktop\cordis.patch.yml'
+Write-Text-Utf8 $patchH (@('# desktop 消费 web 的插件目录', '- insert:', '    - id: dsh-memory', ('      name: ' + $absUrl)) -join "`r`n")
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $homeH 'profiles\desktop\plugins\memory'))) 'H2 desktop has no own plugin dir (consumer only)'
+$rh2 = Invoke-Installer $homeH @('-CheckOnly', '-ProfileName', 'desktop')
+Assert-That ($rh2.Code -eq 0) 'H3 -CheckOnly on consumer profile exit 0' ("exit=" + $rh2.Code)
+Assert-That ($rh2.Output -notmatch '\[desktop\][^\r\n]*关键文件缺失') 'H4 no false "关键文件缺失" for consumer profile' $null
+Assert-That ($rh2.Output -match '\[desktop\][^\r\n]*index\.js\s+\d+\s+bytes') 'H5 consumer profile resolves to real files (version + bytes)' $null
+$rh3 = Invoke-Installer $homeH @('-CheckOnly')
+Assert-That ($rh3.Code -eq 0) 'H6 -CheckOnly (auto discovery) exit 0' ("exit=" + $rh3.Code)
+# 核心回归：任何输出都不得引用"consumer profile 自己的空目录"（真机 desktop 目录根本不存在）
+Assert-That ($rh3.Output -notmatch 'profiles\\desktop\\plugins\\memory') 'H7 no output references the consumer profile''s own (nonexistent) plugin dir' $null
+# 若给出了迁移命令（含 --md-root），路径必须落在真实目录（web）上
+$migLine = (@($rh3.Output -split "`r?`n") | Where-Object { $_ -match '--md-root' } | Select-Object -First 1)
+$h8ok = if ($migLine) { $migLine -match 'profiles\\web\\plugins\\memory' } else { $true }
+Assert-That $h8ok 'H8 migration command (when printed) points at the real web plugin dir' $migLine
+$rh4 = Invoke-Installer $homeH @('-LocalPayload', $Payload)
+Assert-That ($rh4.Code -eq 0) 'H9 full install with consumer profile exit 0' ("exit=" + $rh4.Code)
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $homeH 'profiles\desktop\plugins\memory\index.js'))) 'H10 installer did not create a duplicate copy under desktop' $null
+
+# ===========================================================================
 Write-Host ''
 Write-Host ('self-test summary: ' + $script:pass + ' passed, ' + $script:fail + ' failed')
 if (-not $KeepTemp) {

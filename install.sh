@@ -178,11 +178,48 @@ else
   fi
 fi
 [ -n "$TARGETS" ] || die "没有可用的 profile"
-PRIMARY="$(printf '%s' "$TARGETS" | tr ' ' '\n' | grep -x 'desktop' 2>/dev/null | head -n1)"
-[ -n "$PRIMARY" ] || PRIMARY="$(printf '%s' "$TARGETS" | awk '{print $1}')"
-
-plugin_dir_of() { printf '%s/plugins/memory' "$profiles_dir/$1"; }
 patch_of()      { printf '%s/cordis.patch.yml' "$profiles_dir/$1"; }
+# [BUG-5] 注册表若用**绝对 file:// 路径**指向别的 profile（真机：desktop 的 cordis.patch.yml 指向
+#   profiles/web/plugins/memory/index.js），则插件真实目录 = 那个目录，不是 <profile>/plugins/memory。
+#   否则 -CheckOnly/迁移指引会指向不存在的路径，还会对 desktop 报"关键文件缺失"假错。
+registered_dir_of() {
+  local p line v
+  p="$(patch_of "$1")"; [ -f "$p" ] || return 0
+  line="$(awk '
+    /^[ \t]*-[ \t]*id:[ \t]*dsh-memory[ \t]*($|#)/ { f=1; c=0; next }
+    f && c < 8 {
+      c++
+      if ($0 ~ /^[ \t]*name:[ \t]*"?file:\/\//) { print; exit }
+      if ($0 ~ /^[ \t]*name:[ \t]*/) exit
+    }
+  ' "$p")"
+  [ -n "$line" ] || return 0
+  v="${line#*name:}"
+  v="$(printf '%s' "$v" | sed -E 's/^[ \t]*"?//; s/[ \t]*$//; s/"$//')"
+  v="$(printf '%s' "$v" | sed -E 's#^file:/+##')"
+  case "$v" in
+    [A-Za-z]:/*) printf '%s\n' "${v%/*}" ;;
+    *) return 0 ;;
+  esac
+}
+plugin_dir_of() {
+  local reg; reg="$(registered_dir_of "$1")"
+  if [ -n "$reg" ]; then printf '%s\n' "$reg"; else printf '%s/plugins/memory' "$profiles_dir/$1"; fi
+}
+# [BUG-5] 主 profile：优先"自己目录里真有插件"的（consumer profile 的目录可能根本不存在）
+pick_owner() {
+  local n d
+  for n in $TARGETS; do
+    [ "$n" = "desktop" ] || continue
+    d="$profiles_dir/$n/plugins/memory"; [ -f "$d/index.js" ] && { printf '%s\n' "$n"; return; }
+  done
+  for n in $TARGETS; do
+    d="$profiles_dir/$n/plugins/memory"; [ -f "$d/index.js" ] && { printf '%s\n' "$n"; return; }
+  done
+}
+PRIMARY="$(pick_owner)"
+[ -n "$PRIMARY" ] || PRIMARY="$(printf '%s' "$TARGETS" | tr ' ' '\n' | grep -x 'desktop' 2>/dev/null | head -n1)"
+[ -n "$PRIMARY" ] || PRIMARY="$(printf '%s' "$TARGETS" | awk '{print $1}')"
 mem_root="$DSH_HOME/memory"
 
 say "dsh-memory installer v4"
