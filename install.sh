@@ -1,288 +1,673 @@
 #!/usr/bin/env bash
-# dsh-memory installer for macOS / Linux (and Git Bash on Windows)
+# dsh-memory installer v4 for macOS / Linux (and Git Bash on Windows)
 #
-# One-line install:
+# One-line install / upgrade (idempotent - re-run to upgrade):
 #   curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.sh | bash
 #
-# Options (env vars):
-#   DSH_HOME          - DSH home dir (default: $HOME/.dsh)
-#   DSH_PROFILE       - profile name (default: web)
-#   DSH_MEMORY_RAW    - raw file base URL (default: GitHub raw)
-#   DSH_MEMORY_LOCAL  - path to a local index.js to install instead of downloading
+# Modes:
+#   (default)          install / upgrade; seed the memory library; register cordis.patch.yml;
+#                      decide `memoryTopicDbEnabled`
+#   --check            read-only health report (versions / payload sha / memtopic / DB / legacy md /
+#                      .config.json / AGENTS.md / patch registration / pending marker)
+#   --migrate [--yes]  old md memory -> topic database (delegates to memtopic/src/migrate.mjs).
+#                      While DSH is running it registers a pending marker (auto-migrate on next boot)
+#                      instead of applying; with --yes and DSH stopped it applies immediately.
+#                      Degraded mode: if migrate.mjs or node is unavailable it only prints the
+#                      manual commands (see docs/迁移指南.md).
 #
-# First run: the plugin checks the memory library; if empty, it walks the user through
-# initialization inside the first DSH session. /memory-init, /memory-update available.
+# Target profiles (same rules as install.ps1, desktop-first fix 2026-10-30):
+#   1) --profile <name>  explicitly
+#   2) all profiles whose cordis.patch.yml already has `- id: dsh-memory`
+#   3) fresh user: desktop if present, else web
+#   $DSH_PROFILE is only logged, never overrides discovery.
 #
-# v2 (2026-08-28): cordis.patch.yml registration rewritten (see install.ps1 for details)
-#                 + memory-library seeding + version echo.
-set -e
+# Options / env:
+#   --profile <name>        target profile (explicit)
+#   --local-payload <zip>   offline install (install-manifest.json in the same dir or its parent)
+#   --raw-base <url>        mirror / local http server
+#   DSH_HOME, DSH_PROFILE, DSH_MEMORY_RAW, DSH_MEMORY_LOCAL (zip), DSH_MEMORY_MANIFEST,
+#   DSH_MEMORY_NODE (node executable override), DSH_DESKTOP_NODE_EXECUTABLE
+#
+# Not provided by this script: --uninstall (use install.ps1 -Uninstall on Windows, or remove the
+# registration by hand). Requires: curl, sha256sum (or shasum), unzip (or python3) and node or
+# python3 to parse the manifest and run the migration engine.
+set -u
 
 RAW_BASE="${DSH_MEMORY_RAW:-https://raw.githubusercontent.com/Starry0214/dsh-memory/main}"
+CDN_BASE="${DSH_MEMORY_CDN:-https://cdn.jsdelivr.net/gh/Starry0214/dsh-memory@main}"
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
-PROFILE_NAME="${DSH_PROFILE:-web}"
+DSH_HOME="${DSH_HOME%/}"
+MODE="install"
+PROFILE_ARG=""
+LOCAL_PAYLOAD="${DSH_MEMORY_LOCAL:-}"
+DO_YES="no"
+ASSUME_STOPPED="no"
+MERGE_FLAG="no"
 
-echo "dsh-memory installer"
-echo "  DSH_HOME : $DSH_HOME"
-echo "  profile  : $PROFILE_NAME"
-echo ""
-
-# 1. Validate DSH home
-if [ ! -d "$DSH_HOME/profiles" ]; then
-  echo "ERROR: no profiles directory found under $DSH_HOME" >&2
-  echo "Make sure DSH is installed and DSH_HOME points to the right place." >&2
-  exit 1
-fi
-
-# 2. Validate profile
-profile_dir="$DSH_HOME/profiles/$PROFILE_NAME"
-if [ ! -d "$profile_dir" ]; then
-  echo "ERROR: profile '$PROFILE_NAME' not found. Available: $(ls "$DSH_HOME/profiles" 2>/dev/null | tr '\n' ',')" >&2
-  echo "Set DSH_PROFILE to one of them and retry." >&2
-  exit 1
-fi
-
-# 3. Create plugin dir and fetch index.js
-plugin_dir="$profile_dir/plugins/memory"
-mkdir -p "$plugin_dir"
-target="$plugin_dir/index.js"
-
-if [ -n "${DSH_MEMORY_LOCAL:-}" ]; then
-  if [ ! -f "$DSH_MEMORY_LOCAL" ]; then
-    echo "ERROR: DSH_MEMORY_LOCAL is set but is not a readable file: $DSH_MEMORY_LOCAL" >&2
-    exit 1
-  fi
-  echo "Copying index.js from $DSH_MEMORY_LOCAL ..."
-  cp -f "$DSH_MEMORY_LOCAL" "$target"
-else
-  echo "Downloading index.js ..."
-  if ! curl -fsSL --connect-timeout 30 "$RAW_BASE/index.js" -o "$target" 2>/dev/null; then
-    echo "GitHub raw failed, trying jsDelivr CDN ..."
-    if ! curl -fsSL --connect-timeout 30 "https://cdn.jsdelivr.net/gh/Starry0214/dsh-memory@main/index.js" -o "$target" 2>/dev/null; then
-      echo "ERROR: failed to download index.js. Check your network / proxy, or pre-copy the file and set DSH_MEMORY_LOCAL to it." >&2
-      exit 1
-    fi
-  fi
-fi
-echo "  OK: $target"
-
-# 3.5 Seed the memory library (never overwrites user files):
-#     skeleton dirs + the read/write protocol AGENTS.md + empty global/index placeholders.
-mem_root="$DSH_HOME/memory"
-for sub in "" sessions projects tools knowledge; do
-  mkdir -p "$mem_root/$sub"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) PROFILE_ARG="${2:-}"; shift 2 ;;
+    --profile=*) PROFILE_ARG="${1#*=}"; shift ;;
+    --local-payload) LOCAL_PAYLOAD="${2:-}"; shift 2 ;;
+    --local-payload=*) LOCAL_PAYLOAD="${1#*=}"; shift ;;
+    --raw-base) RAW_BASE="${2:-}"; shift 2 ;;
+    --raw-base=*) RAW_BASE="${1#*=}"; shift ;;
+    --check) MODE="check"; shift ;;
+    --migrate) MODE="migrate"; shift ;;
+    --yes|-y) DO_YES="yes"; shift ;;
+    --assume-host-stopped) ASSUME_STOPPED="yes"; shift ;;
+    --merge) MERGE_FLAG="yes"; shift ;;
+    -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "未知参数：$1（--help 查看用法）" >&2; exit 1 ;;
+  esac
 done
-agents_target="$DSH_HOME/AGENTS.md"
-if [ ! -f "$agents_target" ]; then
-  cat > "$agents_target" <<'AGENTS_TEMPLATE'
-# 全局自动记忆协议（AGENTS.md — 每次会话自动注入）
+RAW_BASE="${RAW_BASE%/}"
+CDN_BASE="${CDN_BASE%/}"
 
-> 本文件由 DSH 机制在每次会话开始时自动注入到模型上下文，是「全局自动记忆」的协议引擎。
-> 记忆库位于 `~/.dsh/memory/`，所有会话、所有项目共享。
-> **自动注入已由 dsh-memory 插件接管**（会话开始时插件注入 global.md+index.md+最近摘要），本协议负责读写纪律。
-> 安装 dsh-memory 时若本文件不存在，安装脚本会从仓库 AGENTS.template.md 复制一份；已存在则不覆盖（本文件归你所有）。
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  OK   %s\n' "$*"; }
+warn() { printf '  WARN %s\n' "$*"; }
+bad()  { printf '  ERR  %s\n' "$*" >&2; }
+item() { printf '  %s\n' "$*"; }
+sect() { printf '\n%s\n' "$*"; }
+die()  { bad "$*"; exit 1; }
 
-## 记忆库结构
+TMPDIR_BASE="${TMPDIR:-/tmp}"
+WORK="$(mktemp -d "$TMPDIR_BASE/dsh-memory-install.XXXXXX")" || die "无法创建临时目录"
+cleanup() { rm -rf "$WORK" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
 
-```
-~/.dsh/memory/
-├── global.md        # 全局记忆：用户画像、通用偏好、跨项目经验（稳定层）
-├── index.md         # 记忆索引：主题 → 知识文件路径（稳定层）
-├── projects/        # 项目层：每个项目一个文件（半稳定层）
-│   └── <项目名>.md
-├── sessions/        # 会话摘要层：每轮会话一个文件（动态层）
-│   └── YYYY-MM-DD.md
-├── tools/           # 自研工具/脚本登记（半稳定层）
-│   └── <工具名>.md
-└── knowledge/       # 主题知识文件（MEMORY-*.md 等，按需检索，不常驻上下文）
-    └── MEMORY-<主题>.md
-```
+# ---------------------------------------------------------------------------
+# primitives
+# ---------------------------------------------------------------------------
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else return 1; fi
+}
 
-## 缓存纪律（前缀缓存：命中与未命中差价约 10 倍）
+http_get() { # url dest
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsSL --connect-timeout 30 --max-time 300 "$1" -o "$2" 2>/dev/null
+}
 
-**前缀结构**：`[系统提示+工具定义] → [注入的稳定记忆] → [注入的最近摘要] → [用户消息...]`
-- **系统提示**：插件不碰；动态工具 schema 固定。
-- **稳定层（global.md / index.md）**：注入时自动剥离时间戳行；**文件内容只在实质变化时更新**（新增/修改/删除知识点），禁止为了记录而更新时间戳——任何字节变化都会使该文件及其后的前缀缓存全部失效。
-- **半稳定层（projects/ tools/ knowledge/）**：按需更新，不在会话开始注入，不影响前缀。
-- **动态层（sessions/）**：每会话更新，放稳定层之后注入，失效范围最小。
-- **AGENTS.md 本文件**：是前缀的一部分，**定稿后不再修改**（除非记忆机制本身要调整，改一次=全部缓存失效一次）。
+fetch_remote() { # relpath dest label
+  rel="$1"; dest="$2"; label="$3"
+  item "下载 $label ..."
+  if http_get "$RAW_BASE/$rel" "$dest"; then return 0; fi
+  warn "主源失败，改用备用源（jsDelivr）..."
+  if http_get "$CDN_BASE/$rel" "$dest"; then return 0; fi
+  return 1
+}
 
-## 协议规则（每个会话必须执行）
+json_tool() {
+  if command -v node >/dev/null 2>&1; then printf 'node'; return; fi
+  if command -v python3 >/dev/null 2>&1; then printf 'python3'; return; fi
+  printf ''
+}
+JSON_TOOL="$(json_tool)"
 
-### 1. 会话开始（读）
-- 插件已自动注入 global.md + index.md + 最近摘要；在此基础上：
-- 若当前工作目录属于某个已登记项目，用 read/memory_search 读对应的 `projects/<项目名>.md`。
-- 需要细节（某主题的踩坑、接口字段）时用 memory_search 按索引路径读取，不全文常驻。
-- **先查记忆再动手**：a) 已知领域关键词命中 → 首条命令前先 memory_search；b) 同一错误第 2 次出现 → 立即查；c) 连败 3 次找不到根因 → 强制查 + 查 skill 目录。
+manifest_field() { # file, dotted key
+  file="$1"; key="$2"
+  if [ "$JSON_TOOL" = "node" ]; then
+    node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));let v=j;for(const p of process.argv[2].split("."))v=v==null?null:v[p];console.log(v==null?"":String(v))' "$file" "$key" 2>/dev/null
+  elif [ "$JSON_TOOL" = "python3" ]; then
+    python3 - "$file" "$key" <<'PY'
+import json,sys
+j=json.load(open(sys.argv[1],encoding="utf-8"))
+v=j
+for p in sys.argv[2].split("."):
+    v = v.get(p) if isinstance(v,dict) else None
+print("" if v is None else str(v))
+PY
+  else return 1; fi
+}
 
-### 2. 会话进行中（写）
-- 出现以下内容时**立即**写入记忆：
-  - **精确字面量**（文号、合同号、路径、API 字段、命令、配置值）——**逐字保存，绝不改写或概括**。
-  - 关键决策（做了什么决定、为什么）。
-  - 踩坑经验（遇到了什么问题、怎么解决的）。
-  - 用户偏好/口径（用户明确表达的工作习惯）。
-- 写入目标分层：
-  - 跨项目通用 → global.md（实质更新才改）
-  - 项目相关 → projects/<项目名>.md
-  - 工具相关 → tools/<工具名>.md
-  - 主题知识 → knowledge/MEMORY-<主题>.md（并在 index.md 登记一行）
-  - 本会话流转 → sessions/今日.md
-- 更新记忆用 edit 工具精确修改对应文件，保留文件头部和结构；**不更新时间戳行**。
-- 写入被沙箱拒时，带 sandbox_permissions + justification 重试一次（记忆库是正常写入目标，用户会看到审批）。
+manifest_files() { # file -> "sha256<TAB>bytes<TAB>path"
+  file="$1"
+  if [ "$JSON_TOOL" = "node" ]; then
+    node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));for(const f of j.files)console.log(f.sha256+"\t"+f.bytes+"\t"+f.path)' "$file" 2>/dev/null
+  elif [ "$JSON_TOOL" = "python3" ]; then
+    python3 - "$file" <<'PY'
+import json,sys
+j=json.load(open(sys.argv[1],encoding="utf-8"))
+for f in j["files"]:
+    print('%s\t%s\t%s' % (f["sha256"], f["bytes"], f["path"]))
+PY
+  else return 1; fi
+}
 
-### 3. 会话结束（归档）
-- 在 `sessions/` 新建/更新当日摘要，四段式：
-  - 本次会话目标 → 完成情况
-  - 关键决策（可提升到项目层）
-  - 踩坑经验（可提升到 global 层）
-  - 遗留事项 + 下一步行动（最重要的衔接点）
-- 摘要控制在 200-400 字，条目化。
+# ---------------------------------------------------------------------------
+# profile discovery
+# ---------------------------------------------------------------------------
+profiles_dir="$DSH_HOME/profiles"
+[ -d "$profiles_dir" ] || die "DSH_HOME 下没有 profiles 目录：$DSH_HOME（确认 DSH 已安装、DSH_HOME 正确）"
 
-### 4. 定期整理（对标 dream / 自校准）
-- 每完成一个里程碑（或用户要求时）：
-  - 把 sessions/ 中重复出现、跨会话成立的知识**提升**到 projects/ 或 global.md。
-  - 清理过时条目（标注已失效或删除）。
-  - 项目结项时把项目文件移到 archive/（如需要）。
-- dsh-memory 提供 `/dream`（手动整合）、`/memory-init`（记忆库体检+初始化）、`/memory-update`（查新版），以及设置 → 通用设置 → 记忆 的开关项。
+list_profiles() {
+  for d in "$profiles_dir"/*; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    [ "$n" = "node_modules" ] && continue
+    printf '%s\n' "$n"
+  done
+}
 
-AGENTS_TEMPLATE
-  echo "Wrote the memory protocol to $agents_target (from the embedded template)."
+has_memory_registration() { # patch file
+  [ -f "$1" ] || return 1
+  tr -d '\r' < "$1" | grep -Eq '^[[:space:]]*-[[:space:]]*id:[[:space:]]*dsh-memory([[:space:]]|$|#)'
+}
+
+TARGETS=""
+MODE_SRC=""
+if [ -n "$PROFILE_ARG" ]; then
+  [ -d "$profiles_dir/$PROFILE_ARG" ] || die "profile '$PROFILE_ARG' 不存在。可用：$(list_profiles | tr '\n' ' ')"
+  TARGETS="$PROFILE_ARG"; MODE_SRC="显式指定（--profile）"
 else
-  echo "Kept your existing $agents_target (the installer never overwrites it)."
-fi
-for f in global.md index.md; do
-  fp="$mem_root/$f"
-  if [ ! -f "$fp" ]; then
-    if [ "$f" = "global.md" ]; then echo "# 全局记忆" > "$fp"; else echo "# 记忆索引" > "$fp"; fi
-    echo "Created empty $fp (your first session will fill it in)."
-  fi
-done
-
-# 4. Register the plugin in cordis.patch.yml (shape-aware, idempotent)
-patch_file="$profile_dir/cordis.patch.yml"
-
-# 4.0 [2026-09-01 标准对齐] 包名加载前置：建 profiles/node_modules/dsh-memory 符号链接 → <profile>/plugins/memory。
-#     包名 registration（name: dsh-memory）要求该名可被 ESM 解析；符号链接指向带依赖链的真实源码目录。
-#     profile 结构形如 ~/.dsh/profiles/{web,headless,...}，node_modules 在 profiles 根级。
-nm_target="$DSH_HOME/profiles/node_modules"
-have_nm="no"
-if [ -d "$nm_target" ]; then
-  have_nm="yes"
-  nm_link="$nm_target/dsh-memory"
-  if [ "$(readlink "$nm_link" 2>/dev/null)" = "$plugin_dir" ]; then
-    echo "  dsh-memory symlink already points at $plugin_dir (skipped)."
+  found=""
+  for n in $(list_profiles); do
+    has_memory_registration "$profiles_dir/$n/cordis.patch.yml" && found="$found $n"
+  done
+  found="$(printf '%s' "$found" | sed 's/^ *//;s/ *$//')"
+  if [ -n "$found" ]; then
+    TARGETS="$found"; MODE_SRC="自动发现（cordis.patch.yml 已有 dsh-memory 注册）"
   else
-    rm -rf "$nm_link"
-    ln -s "$plugin_dir" "$nm_link"
-    echo "  created dsh-memory symlink -> $plugin_dir"
+    if [ -d "$profiles_dir/desktop" ]; then TARGETS="desktop"
+    elif [ -d "$profiles_dir/web" ]; then TARGETS="web"
+    else TARGETS="$(list_profiles | head -n1)"; fi
+    MODE_SRC="默认（全新用户：desktop 优先，否则 web）"
+  fi
+fi
+[ -n "$TARGETS" ] || die "没有可用的 profile"
+PRIMARY="$(printf '%s' "$TARGETS" | tr ' ' '\n' | grep -x 'desktop' 2>/dev/null | head -n1)"
+[ -n "$PRIMARY" ] || PRIMARY="$(printf '%s' "$TARGETS" | awk '{print $1}')"
+
+plugin_dir_of() { printf '%s/plugins/memory' "$profiles_dir/$1"; }
+patch_of()      { printf '%s/cordis.patch.yml' "$profiles_dir/$1"; }
+mem_root="$DSH_HOME/memory"
+
+say "dsh-memory installer v4"
+say "  DSH_HOME : $DSH_HOME"
+say "  profile 来源 : $MODE_SRC"
+say "  目标 profile : $TARGETS"
+if [ -n "${DSH_PROFILE:-}" ]; then
+  if [ -d "$profiles_dir/$DSH_PROFILE" ]; then
+    item "检测到宿主 profile=$DSH_PROFILE，已按自动发现处理（不覆盖发现结果）"
+  else
+    item "检测到 DSH_PROFILE=$DSH_PROFILE（该 profile 不存在），已按自动发现处理"
+  fi
+fi
+[ "$JSON_TOOL" = "" ] && die "需要 node 或 python3 来解析 install-manifest.json（Windows 请用 install.ps1）"
+sha256_of "$0" >/dev/null 2>&1 || die "需要 sha256sum 或 shasum（macOS 自带）"
+
+# ---------------------------------------------------------------------------
+# node resolver (install itself never needs node; only detect/migrate do)
+# ---------------------------------------------------------------------------
+node_runner() {
+  if [ -n "${DSH_MEMORY_NODE:-}" ] && [ -x "${DSH_MEMORY_NODE}" ]; then printf '%s\n' "$DSH_MEMORY_NODE"; return 0; fi
+  if command -v node >/dev/null 2>&1; then command -v node; return 0; fi
+  if [ -n "${DSH_DESKTOP_NODE_EXECUTABLE:-}" ] && [ -x "${DSH_DESKTOP_NODE_EXECUTABLE}" ]; then printf '%s\n' "$DSH_DESKTOP_NODE_EXECUTABLE"; return 0; fi
+  for c in "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" "/opt/DeepSeek Harness/deepseek-harness" "/usr/lib/deepseek-harness/deepseek-harness"; do
+    [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+NODE_EXE="$(node_runner || true)"
+run_node() {
+  if [ "$(basename "$NODE_EXE" 2>/dev/null)" = "node" ]; then "$NODE_EXE" "$@"
+  else ELECTRON_RUN_AS_NODE=1 "$NODE_EXE" "$@"; fi
+}
+detect_flags() { # migrate script json out -> "1/0" x4: needs,migrated,empty,hostRunning
+  [ -n "$NODE_EXE" ] || return 1
+  out="$("$NODE_EXE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=s.indexOf("{");const b=s.lastIndexOf("}");try{const j=JSON.parse(s.slice(a,b+1));console.log([j.needsMigration?"1":"0",j.alreadyMigrated?"1":"0",j.empty?"1":"0",(j.host&&j.host.running)?"1":"0"].join(""))}catch(e){console.log("")}})' 2>/dev/null)"
+  [ -n "$out" ] && printf '%s\n' "$out"
+}
+pending_path() { printf '%s/.memtopic/migrate-pending.json' "$mem_root"; }
+write_pending() { # pluginVersion note
+  pv="$1"; note="$2"; p="$(pending_path)"; d="$(dirname "$p")"
+  mkdir -p "$d" || { warn "无法创建 $d"; return 1; }
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tmp="$p.tmp.$$"
+  if [ "$JSON_TOOL" = "node" ]; then
+    "$NODE_EXE" -e 'const fs=require("fs");const o={schemaVersion:1,at:process.argv[1],requestedBy:"installer",mdRoot:process.argv[2],dbFile:process.argv[3],pluginVersion:process.argv[4],note:process.argv[5]};fs.writeFileSync(process.argv[6],JSON.stringify(o,null,2)+"\n")' \
+      "$at" "$mem_root" "$mem_root/.memtopic/mem.db" "$pv" "$note" "$tmp"
+  else
+    python3 - "$at" "$mem_root" "$mem_root/.memtopic/mem.db" "$pv" "$note" "$tmp" <<'PY'
+import json,sys
+at,md,db,pv,note,out=sys.argv[1:7]
+o={"schemaVersion":1,"at":at,"requestedBy":"installer","mdRoot":md,"dbFile":db,"pluginVersion":pv,"note":note}
+open(out,"w",encoding="utf-8").write(json.dumps(o,ensure_ascii=False,indent=2)+"\n")
+PY
+  fi
+  mv -f "$tmp" "$p" && return 0 || { rm -f "$tmp"; return 1; }
+}
+check_pending() {
+  p="$(pending_path)"
+  [ -f "$p" ] && { warn "pending 迁移标记：存在（重启 DSH 后自动迁移）"; item "  $(tr -d '\n' < "$p")"; } || say "  pending 迁移标记：无"
+}
+
+# ---------------------------------------------------------------------------
+# mode: --check
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "check" ]; then
+  say "dsh-memory installer v4 - check only (read-only; only the small manifest is downloaded)"
+  manifest="$WORK/install-manifest.json"
+  manifest_ok="no"
+  if [ -n "$LOCAL_PAYLOAD" ]; then
+    lp="$LOCAL_PAYLOAD"
+    for cand in "$(dirname "$lp")/install-manifest.json" "$(dirname "$(dirname "$lp")")/install-manifest.json" "${DSH_MEMORY_MANIFEST:-}"; do
+      if [ -n "$cand" ] && [ -f "$cand" ]; then cp -f "$cand" "$manifest"; manifest_ok="yes"; break; fi
+    done
+  else
+    fetch_remote "install-manifest.json" "$manifest" "manifest" && manifest_ok="yes"
+  fi
+  sect "[1/6] 版本"
+  if [ "$manifest_ok" = "yes" ]; then say "  发布版本：v$(manifest_field "$manifest" version)"; else warn "无法获取发布 manifest（离线/镜像不可达）"; fi
+  for n in $TARGETS; do
+    idx="$(plugin_dir_of "$n")/index.js"
+    if [ -f "$idx" ]; then
+      v="$(grep -oE 'const PLUGIN_VERSION = "[^"]+"' "$idx" | head -n1 | sed -E 's/.*"([^"]+)"/\1/')"
+      ok "[$n] v${v:-unknown}，index.js $(wc -c < "$idx" | tr -d ' ') bytes"
+    else warn "[$n] 未安装（运行本脚本即可）"; fi
+  done
+  sect "[2/6] payload 完整性"
+  if [ "$manifest_ok" = "yes" ]; then
+    for n in $TARGETS; do
+      pdir="$(plugin_dir_of "$n")"; miss=0; badsha=0; total=0
+      while IFS="$(printf '\t')" read -r sh bytes rel; do
+        total=$((total+1)); f="$pdir/$rel"
+        if [ ! -f "$f" ]; then miss=$((miss+1)); continue; fi
+        got="$(sha256_of "$f")" || got=""
+        [ "$got" = "$sh" ] || badsha=$((badsha+1))
+      done < <(manifest_files "$manifest")
+      if [ "$miss" -eq 0 ] && [ "$badsha" -eq 0 ]; then ok "[$n] $total/$total 个文件 sha256 全部匹配"
+      else warn "[$n] 缺失 $miss / 不一致 $badsha / 共 $total（重跑安装器）"; fi
+    done
+  else warn "无 manifest，跳过逐文件 sha 校验"; fi
+  sect "[3/6] memtopic + 主题库"
+  for n in $TARGETS; do
+    d="$(plugin_dir_of "$n")/memtopic/src"; cnt=0
+    [ -d "$d" ] && cnt="$(ls "$d"/*.mjs 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$cnt" -ge 12 ]; then ok "[$n] $cnt 个 .mjs"; else warn "[$n] 仅 $cnt 个 .mjs（重跑安装器）"; fi
+  done
+  db="$mem_root/.memtopic/mem.db"
+  if [ -f "$db" ]; then say "  主题库：存在（$(wc -c < "$db" | tr -d ' ') bytes）"; else say "  主题库：不存在"; fi
+  sect "[4/6] 遗留 md"
+  legacy_cnt=0
+  for sub in sessions knowledge projects tools; do
+    [ -d "$mem_root/$sub" ] || continue
+    c="$(find "$mem_root/$sub" -type f -name '*.md' ! -name '*.bak*' 2>/dev/null | wc -l | tr -d ' ')"
+    legacy_cnt=$((legacy_cnt + c)); [ "$c" -gt 0 ] && say "  $sub：$c 个 md"
+  done
+  [ "$legacy_cnt" -eq 0 ] && say "  无遗留 md"
+  sect "[5/6] 开关 / AGENTS / pending"
+  cfg="$mem_root/.config.json"
+  if [ -f "$cfg" ]; then say "  .config.json：$(tr -d '\n' < "$cfg")"; else say "  .config.json：不存在（新装会写 memoryTopicDbEnabled=true）"; fi
+  ag="$DSH_HOME/AGENTS.md"
+  if [ -f "$ag" ]; then
+    if grep -q 'dsh-memory-agents-template: v4' "$ag"; then ok "AGENTS.md：v4 协议"
+    else warn "AGENTS.md：不是 v4（重跑安装器会按白名单升级；改过的文件不会覆盖）"; fi
+  else warn "AGENTS.md：不存在（安装器会写 v4 模板）"; fi
+  check_pending
+  sect "[6/6] patch 注册"
+  for n in $TARGETS; do
+    p="$(patch_of "$n")"
+    if has_memory_registration "$p"; then
+      nm="$(tr -d '\r' < "$p" | grep -A2 'id:[[:space:]]*dsh-memory' | grep -E 'name:' | head -n1 | sed 's/^ *//')"
+      ok "[$n] 已注册（$nm）"
+    else warn "[$n] 未注册（重跑安装器）"; fi
+  done
+  sect "下一步"
+  item "安装/升级：bash $0"
+  item "迁移旧记忆：bash $0 --migrate --yes（DSH 运行中会先登记 pending）"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# mode: --migrate
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "migrate" ]; then
+  migrate_script=""
+  for n in $TARGETS; do
+    c="$(plugin_dir_of "$n")/memtopic/src/migrate.mjs"
+    [ -f "$c" ] && { migrate_script="$c"; break; }
+  done
+  if [ -z "$migrate_script" ]; then
+    bad "迁移器未就绪：<插件目录>/memtopic/src/migrate.mjs 不存在（先重跑安装器升级到 v4）"
+    exit 3
+  fi
+  if [ -z "$NODE_EXE" ]; then
+    bad "未找到 node：--migrate 需要 node 或已安装的 DSH 桌面版"
+    item "出路：① 安装 Node.js（≥22.5）② 设置 DSH_MEMORY_NODE ③ 暂时不迁移，md 模式照常工作"
+    exit 3
+  fi
+  common=(--md-root "$mem_root" --db "$mem_root/.memtopic/mem.db" --dsh-home "$DSH_HOME")
+  sect "检测（只读）"
+  run_node "$migrate_script" --detect "${common[@]}" || true
+  flags="$(run_node "$migrate_script" --detect --json "${common[@]}" 2>/dev/null | detect_flags || true)"
+  nb=""; mg=""; em=""; hr=""
+  if [ "${#flags}" -eq 4 ]; then
+    nb="${flags%???}"; mg="${flags#?}"; mg="${mg%??}"; em="${flags#??}"; em="${em%?}"; hr="${flags#???}"
+  fi
+  if [ "$nb" = "1" ]; then
+    if [ "$hr" = "1" ] && [ "$ASSUME_STOPPED" != "yes" ]; then
+      sect "DSH 正在运行 —— 登记为下次启动自动迁移"
+      pv="$(grep -oE 'const PLUGIN_VERSION = "[^"]+"' "$(plugin_dir_of "$PRIMARY")/index.js" 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)"/\1/')"
+      if write_pending "${pv:-unknown}" "安装器 sh --migrate：检测到 DSH 正在运行，登记为下次启动自动迁移"; then
+        ok "已登记迁移：$(pending_path)"
+        item "重启 DSH 后插件会在启动时自动执行迁移（先快照；失败自动回退 md 模式）。"
+      else
+        warn "pending 标记写入失败；请完全退出 DSH 后手工执行："
+        item "  \"$NODE_EXE\" \"$migrate_script\" --apply --yes --md-root \"$mem_root\" --db \"$mem_root/.memtopic/mem.db\" --dsh-home \"$DSH_HOME\""
+      fi
+      exit 0
+    fi
+    if [ "$DO_YES" != "yes" ]; then
+      sect "只读检测完成（未做任何改动）"
+      item "执行迁移：重跑本脚本加 --migrate --yes"
+      exit 0
+    fi
+    sect "执行迁移（migrate.mjs --apply --yes）"
+    args=(--apply --yes --md-root "$mem_root" --db "$mem_root/.memtopic/mem.db" --dsh-home "$DSH_HOME")
+    [ "$MERGE_FLAG" = "yes" ] && args+=(--merge)
+    [ "$ASSUME_STOPPED" = "yes" ] && args+=(--assume-host-stopped)
+    run_node "$migrate_script" "${args[@]}"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$(pending_path)"
+      cfg="$mem_root/.config.json"
+      if [ ! -f "$cfg" ]; then printf '{\n  "memoryTopicDbEnabled": true\n}\n' > "$cfg" && ok "已写入 .config.json（memoryTopicDbEnabled=true）"
+      elif grep -Eq '"memoryTopicDbEnabled"[[:space:]]*:[[:space:]]*false' "$cfg"; then warn "主题库开关是显式 false —— 尊重设置"
+      elif ! grep -q 'memoryTopicDbEnabled' "$cfg"; then warn "请手工在 $cfg 里加 \"memoryTopicDbEnabled\": true"; fi
+      ok "迁移完成；重启 DSH 后生效"
+    else
+      bad "迁移失败，退出码 $rc（旧 md 未被修改，可重跑 --apply 续跑）"
+    fi
+    exit "$rc"
+  elif [ "$mg" = "1" ]; then
+    ok "已迁移（主题库已有数据，无需操作）"
+    [ -f "$(pending_path)" ] && rm -f "$(pending_path)" && item "已清除过期 pending 标记"
+  elif [ "$em" = "1" ]; then
+    ok "全新用户（无旧 md、无库），无需迁移"
+  else
+    ok "无需迁移"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# mode: install / upgrade
+# ---------------------------------------------------------------------------
+sect "[1/8] 解析 install-manifest.json"
+manifest="$WORK/install-manifest.json"
+if [ -n "$LOCAL_PAYLOAD" ]; then
+  lp="$LOCAL_PAYLOAD"
+  [ -e "$lp" ] || die "--local-payload 指向的路径不存在：$lp"
+  got=""
+  for cand in "$(dirname "$lp")/install-manifest.json" "$(dirname "$(dirname "$lp")")/install-manifest.json" "${DSH_MEMORY_MANIFEST:-}"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then cp -f "$cand" "$manifest"; got="$cand"; break; fi
+  done
+  [ -n "$got" ] || die "找不到 install-manifest.json（zip 同目录或上一级；可用 DSH_MEMORY_MANIFEST 指定）"
+  item "使用本地 manifest：$got"
+else
+  fetch_remote "install-manifest.json" "$manifest" "manifest" || die "无法下载 install-manifest.json（网络/镜像不可达）；离线请用 --local-payload"
+fi
+version="$(manifest_field "$manifest" version)"
+zip_name="$(manifest_field "$manifest" zip.name)"
+zip_sha="$(manifest_field "$manifest" zip.sha256)"
+[ -n "$version" ] && [ -n "$zip_name" ] || die "manifest 缺字段（version/zip.name）"
+ok "发布版本 v$version，zip $zip_name"
+
+sect "[2/8] 获取 payload zip 并校验 sha256"
+zip_path="$WORK/$zip_name"
+if [ -n "$LOCAL_PAYLOAD" ]; then
+  lp="$LOCAL_PAYLOAD"
+  if [ -d "$lp" ]; then
+    cp -f "$lp/payload/$zip_name" "$zip_path" 2>/dev/null || cp -f "$lp/$zip_name" "$zip_path" 2>/dev/null || true
+  elif [ -f "$lp" ]; then
+    cp -f "$lp" "$zip_path"
+  fi
+  [ -f "$zip_path" ] || die "本地 payload zip 不存在：$zip_name"
+else
+  fetch_remote "payload/$zip_name" "$zip_path" "payload zip" || die "payload zip 下载失败（主源与 jsDelivr 都不可达）；离线请用 --local-payload"
+fi
+got_sha="$(sha256_of "$zip_path")" || die "无法计算 zip sha256"
+if [ "$got_sha" != "$zip_sha" ]; then
+  bad "payload zip sha256 校验失败 —— 已中止，未改动任何文件。"
+  bad "  期望 $zip_sha"
+  bad "  实际 $got_sha"
+  exit 1
+fi
+ok "zip sha256 校验通过（$(wc -c < "$zip_path" | tr -d ' ') bytes）"
+
+sect "[3/8] 解压并逐文件校验 sha256"
+stage="$WORK/stage"; mkdir -p "$stage"
+if command -v unzip >/dev/null 2>&1; then
+  unzip -q -o "$zip_path" -d "$stage" || die "解压失败（unzip）"
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -m zipfile -e "$zip_path" "$stage" || die "解压失败（python3 zipfile）"
+else die "需要 unzip 或 python3 来解压 payload"; fi
+fails=0
+while IFS="$(printf '\t')" read -r sh bytes rel; do
+  f="$stage/$rel"
+  if [ ! -f "$f" ]; then bad "缺少：$rel"; fails=$((fails+1)); continue; fi
+  actual="$(sha256_of "$f")" || actual=""
+  if [ "$actual" != "$sh" ]; then bad "sha256 不一致：$rel"; fails=$((fails+1)); fi
+done < <(manifest_files "$manifest")
+[ "$fails" -eq 0 ] || die "payload 内容校验失败 —— 已中止，未改动任何文件"
+ok "payload 全部文件 sha256 匹配"
+
+# ---- pre-detect (best effort, never blocks install) ----
+sect "[4/8] 检测记忆库状态"
+needs=""; migrated=""; empty=""; host_running=""
+staged_migrate="$stage/memtopic/src/migrate.mjs"
+if [ -f "$staged_migrate" ] && [ -n "$NODE_EXE" ]; then
+  run_node "$staged_migrate" --detect --json --md-root "$mem_root" --db "$mem_root/.memtopic/mem.db" --dsh-home "$DSH_HOME" 2>/dev/null | "$NODE_EXE" -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=s.indexOf("{");const b=s.lastIndexOf("}");try{const j=JSON.parse(s.slice(a,b+1));const l=j.legacy||{};console.log("  旧 md 文件 : "+(l.importableFiles||0)+" 个 / "+(l.importableSentences||0)+" 句（可导入）");if(j.db)console.log("  主题库    : "+(j.db.exists?("存在："+(j.db.topics||0)+" 主题 / "+(j.db.sentences||0)+" 句"):"不存在"));if(j.host)console.log("  宿主 DSH  : "+(j.host.running?"运行中":"未运行"));console.log("  判定      : "+(j.needsMigration?"需要迁移":j.alreadyMigrated?"已迁移":j.empty?"全新用户":"无需迁移"))}catch(e){}})'
+  flags="$(run_node "$staged_migrate" --detect --json --md-root "$mem_root" --db "$mem_root/.memtopic/mem.db" --dsh-home "$DSH_HOME" 2>/dev/null | detect_flags || true)"
+  if [ "${#flags}" -eq 4 ]; then
+    needs="${flags%???}"; migrated="${flags#?}"; migrated="${migrated%??}"; empty="${flags#??}"; empty="${empty%?}"; host_running="${flags#???}"
+  fi
+fi
+if [ -z "$needs" ]; then
+  warn "migrate --detect 不可用，改用静态判断"
+  legacy_cnt=0
+  for sub in sessions knowledge projects tools; do
+    [ -d "$mem_root/$sub" ] || continue
+    c="$(find "$mem_root/$sub" -type f -name '*.md' ! -name '*.bak*' 2>/dev/null | wc -l | tr -d ' ')"
+    legacy_cnt=$((legacy_cnt + c))
+  done
+  if [ -f "$mem_root/.memtopic/mem.db" ] && [ "$(wc -c < "$mem_root/.memtopic/mem.db" | tr -d ' ')" -gt 8192 ]; then migrated="1"
+  elif [ "$legacy_cnt" -gt 0 ]; then needs="1"
+  else empty="1"; fi
+fi
+
+# ---- backup + copy per profile ----
+sect "[5/8] 备份现有插件目录并写入新文件"
+multi="no"; [ "$(printf '%s\n' $TARGETS | wc -l | tr -d ' ')" -gt 1 ] && multi="yes"
+for n in $TARGETS; do
+  [ "$multi" = "yes" ] && sect "profile: $n"
+  pdir="$(plugin_dir_of "$n")"
+  mkdir -p "$pdir"
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  existing=""
+  for f in index.js package.json memtopic client AGENTS.template.md; do
+    [ -e "$pdir/$f" ] && existing="$existing $f"
+  done
+  if [ -n "$existing" ]; then
+    bak="$pdir/_backup-$stamp"; mkdir -p "$bak"
+    for f in $existing; do cp -R "$pdir/$f" "$bak/" 2>/dev/null || true; done
+    ok "已备份到 $bak（$(printf '%s' "$existing" | sed 's/^ *//')）"
+  else
+    item "没有旧版本文件需要备份（该 profile 全新安装）"
+  fi
+  while IFS="$(printf '\t')" read -r sh bytes rel; do
+    dst="$pdir/$rel"; mkdir -p "$(dirname "$dst")"; cp -f "$stage/$rel" "$dst"
+  done < <(manifest_files "$manifest")
+  cnt="$(ls "$pdir/memtopic/src"/*.mjs 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$cnt" -ge 12 ]; then ok "写入完成；memtopic $cnt 个 .mjs 模块就位"; else bad "memtopic 模块不足（$cnt）"; fi
+done
+
+# ---- memory skeleton + config ----
+sect "[6/8] 初始化记忆库骨架并按迁移状态决定主题库开关"
+mkdir -p "$mem_root" "$mem_root/sessions" "$mem_root/projects" "$mem_root/tools" "$mem_root/knowledge"
+for f in global.md index.md; do
+  if [ ! -f "$mem_root/$f" ]; then printf '# %s\n' "$f" > "$mem_root/$f"; item "新建 $mem_root/$f"; fi
+done
+cfg="$mem_root/.config.json"
+write_flag() {
+  if [ ! -f "$cfg" ]; then
+    printf '{\n  "memoryTopicDbEnabled": true\n}\n' > "$cfg"; ok ".config.json：新增 memoryTopicDbEnabled=true（主题库默认开启）"
+  elif grep -Eq '"memoryTopicDbEnabled"[[:space:]]*:[[:space:]]*false' "$cfg"; then
+    warn "主题库开关被你显式设为 false —— 尊重你的设置（可在设置里打开）"
+  elif grep -q 'memoryTopicDbEnabled' "$cfg"; then
+    ok ".config.json：保持已有 memoryTopicDbEnabled"
+  elif [ "$JSON_TOOL" = "node" ]; then
+    "$NODE_EXE" -e 'const fs=require("fs");const p=process.argv[1];const j=JSON.parse(fs.readFileSync(p,"utf8"));j.memoryTopicDbEnabled=true;fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n")' "$cfg" \
+      && ok ".config.json：新增 memoryTopicDbEnabled=true" || warn ".config.json 解析失败，未修改"
+  else
+    warn "请在 $cfg 手工加 \"memoryTopicDbEnabled\": true"
+  fi
+}
+if [ "$needs" = "1" ]; then
+  if [ "$host_running" = "1" ]; then
+    warn "DSH 正在运行且旧记忆未迁移 —— 先保持 md 模式（行为零变化），迁移完成后再开"
+  else
+    warn "旧记忆未迁移 —— 先保持 md 模式（写完能落 md），迁移完成后再开"
+  fi
+else
+  write_flag
+fi
+if [ "$needs" = "1" ] && [ "$host_running" = "1" ]; then
+  sect "登记迁移待办（重启 DSH 后自动执行）"
+  pv="$(grep -oE 'const PLUGIN_VERSION = "[^"]+"' "$(plugin_dir_of "$PRIMARY")/index.js" 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)"/\1/')"
+  if write_pending "${pv:-unknown}" "安装器安装：检测到 DSH 正在运行且旧记忆未迁移，登记为下次启动自动迁移"; then
+    ok "已登记迁移：$(pending_path)"
+    item "重启 DSH 后自动迁移（先快照；失败自动回退 md 模式，不影响使用）。"
+  else
+    warn "pending 标记写入失败（不算致命）；请完全退出 DSH 后手工执行迁移命令。"
   fi
 fi
 
-# 默认注册块用包名（官方显示名标准）：包名 → 插件清单显示 "memory"（moduleShortName 剥 dsh- 前缀）；
-# 路径 → 显示 file:// 长路径。node_modules 缺失时降级路径块保证可用性。
-if [ "$have_nm" = "yes" ]; then
-  block_file=$(mktemp)
-  cat > "$block_file" <<'BLOCK'
-# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---
+# ---- AGENTS.md ----
+sect "[7/8] 处理 AGENTS.md（记忆协议模板）"
+ag="$DSH_HOME/AGENTS.md"
+tpl="$stage/AGENTS.template.md"
+LEGACY_SHA_1="c7de0f75062511ac13321de6a321dab7f6aef89969d24eb31f55a1781c8a529e"
+LEGACY_SHA_2="3ffc27938d118a5db6cbe3b48242ee30a17ee73694ea2349a2e5f246062c4365"
+sha_of_normalized() { # strip BOM/CR, trailing spaces, trailing blank lines -> sha256
+  f="$1"; tmp0="$WORK/norm0.txt"; tmp="$WORK/norm.txt"
+  bom="$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')"
+  if [ "$bom" = "efbbbf" ]; then tail -c +4 "$f" > "$tmp0"; else cp "$f" "$tmp0"; fi
+  sed -e 's/\r$//' -e 's/[[:space:]]*$//' "$tmp0" | awk '{lines[NR]=$0} END{last=NR; while(last>0 && lines[last]=="")last--; for(i=1;i<=last;i++)print lines[i]}' > "$tmp"
+  sha256_of "$tmp"
+}
+if [ ! -f "$ag" ]; then
+  cp -f "$tpl" "$ag" && ok "已写入 v4 记忆协议：$ag"
+elif grep -q 'dsh-memory-agents-template: v4' "$ag"; then
+  ok "AGENTS.md 已是 v4 协议（跳过）"
+else
+  h="$(sha_of_normalized "$ag")" || h=""
+  if [ "$h" = "$LEGACY_SHA_1" ] || [ "$h" = "$LEGACY_SHA_2" ]; then
+    cp -f "$ag" "$ag.bak-$(date +%Y%m%d_%H%M%S)"
+    cp -f "$tpl" "$ag" && ok "AGENTS.md 已从旧模板升级为 v4（已备份）"
+  else
+    warn "AGENTS.md 存在且被改过 —— 安装器不覆盖它（参考 $tpl 自行合并）"
+  fi
+fi
+
+# ---- patch registration + junction ----
+sect "[8/8] 注册 cordis.patch.yml"
+block_pkg='# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---
 - insert:
     - id: dsh-memory
       name: dsh-memory
       config:
         staleSessionDays: 5
-        staleAction: remind
-BLOCK
-else
-  echo "WARNING: $nm_target not found - package-name registration will fail to resolve dsh-memory; registering the path form instead."
-  block_file=$(mktemp)
-  cat > "$block_file" <<'BLOCK'
-# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---
+        staleAction: remind'
+block_path='# --- dsh-memory: global auto-memory plugin (installed by the dsh-memory installer) ---
 - insert:
     - id: dsh-memory
       name: ./plugins/memory/index.js
       config:
         staleSessionDays: 5
-        staleAction: remind
-BLOCK
-fi
+        staleAction: remind'
 
-# Rewrite $1 into $2, dropping column-0 "[]" lines; append the block when $3 is "append".
-apply_merge() {
-  grep -vE '^\[[[:space:]]*\]$' "$1" > "$2" || true
-  if [ "$3" = "append" ]; then
-    printf '\n' >> "$2"
-    cat "$block_file" >> "$2"
+ensure_junction() { # target plugin dir -> "ok" / "conflict" / "nodir"
+  nm="$profiles_dir/node_modules"
+  [ -d "$nm" ] || { printf 'nodir'; return; }
+  link="$nm/dsh-memory"
+  want="$(cd "$1" 2>/dev/null && pwd -P)"
+  if [ -L "$link" ]; then
+    have="$(cd "$link" 2>/dev/null && pwd -P)"
+    if [ "$have" = "$want" ]; then printf 'ok'; return; fi
+    rm -f "$link"; if ln -s "$1" "$link" 2>/dev/null; then printf 'ok'; else printf 'conflict'; fi
+  elif [ -e "$link" ]; then
+    printf 'conflict'
+  else
+    if ln -s "$1" "$link" 2>/dev/null; then printf 'ok'; else printf 'conflict'; fi
   fi
 }
 
-if [ ! -f "$patch_file" ]; then
-  {
-    printf '%s\n' \
-      '# Your patch layer for this dsh profile, applied after every bundle layer:' \
-      '# a top-level YAML array of loader patch entries (id-targeted config' \
-      '# overrides, disables, and insert lists; `!!js` expressions allowed.' ''
-    cat "$block_file"
-  } > "$patch_file"
-  echo "Created $patch_file and registered dsh-memory."
-else
-  code_lines=$(grep -cvE '^([[:space:]]*$|[[:space:]]*#)' "$patch_file" || true)
-  empty_lines=$(grep -cE '^\[[[:space:]]*\]$' "$patch_file" || true)
-  entry_lines=$(grep -cE '^-([[:space:]]|$)' "$patch_file" || true)
-  foreign_lines=$(grep -vE '^([[:space:]]*$|[[:space:]]*#|^-([[:space:]]|$)|[[:space:]]+)' "$patch_file" | grep -cvE '^\[[[:space:]]*\]$' || true)
-  registered=$(grep -cE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*dsh-memory[[:space:]]*(#.*)?$' "$patch_file" || true)
-  tmp_file=$(mktemp)
+if [ "$multi" = "yes" ]; then
+  jr="$(ensure_junction "$(plugin_dir_of "$PRIMARY")")"
+  item "多 profile 模式：新注册用相对路径形式；junction（$jr）指向主 profile $PRIMARY"
+fi
 
-  if [ "$foreign_lines" -gt 0 ]; then
-    cat "$block_file" > "$patch_file.dsh-memory-block.txt"
-    rm -f "$block_file" "$tmp_file"
-    echo "WARNING: dsh-memory was NOT registered - $patch_file is not a top-level block sequence" >&2
-    echo "  (mapping, non-empty flow list, tab indentation or a second document?)." >&2
-    echo "  The file was NOT modified. Merge the entries saved in" >&2
-    echo "  $patch_file.dsh-memory-block.txt into it by hand as further '- insert:' items at column 0." >&2
-    exit 1
-  elif [ "$registered" -gt 0 ]; then
-    if [ "$empty_lines" -gt 0 ] && [ "$entry_lines" -gt 0 ]; then
-      cp "$patch_file" "$patch_file.bak"
-      apply_merge "$patch_file" "$tmp_file" keep
-      cat "$tmp_file" > "$patch_file"
-      echo "Repaired $patch_file (dropped the stray '[]' line(s) an older installer left beside real entries)."
-      echo "  backup: $patch_file.bak"
-    else
-      echo "dsh-memory already registered in $patch_file (skipped)."
-    fi
-  else
-    cp "$patch_file" "$patch_file.bak"
-    apply_merge "$patch_file" "$tmp_file" append
-    cat "$tmp_file" > "$patch_file"
-    if [ "$code_lines" -le "$empty_lines" ]; then
-      echo "Registered dsh-memory in $patch_file (replaced the empty '[]' document, or filled a comments-only one)."
-    else
-      echo "Appended the dsh-memory registration to $patch_file."
-    fi
-    echo "  backup: $patch_file.bak"
+for n in $TARGETS; do
+  p="$(patch_of "$n")"
+  form="relative-path"
+  block="$block_path"
+  if [ "$multi" = "no" ]; then
+    jr="$(ensure_junction "$(plugin_dir_of "$n")")"
+    if [ "$jr" = "ok" ]; then form="package"; block="$block_pkg"; fi
+    item "[$n] junction: $jr"
   fi
-  rm -f "$tmp_file" "$block_file"
-fi
+  if [ ! -f "$p" ]; then
+    {
+      printf '%s\n' '# Your patch layer for this dsh profile, applied after every bundle layer:' '# a top-level YAML array of loader patch entries (id-targeted config' '# overrides, disables, and insert lists; `!!js` expressions allowed.' ''
+      printf '%s\n' "$block"
+    } > "$p"
+    ok "[$n] 已创建 $p 并注册 dsh-memory（$form）"
+    continue
+  fi
+  if has_memory_registration "$p"; then
+    ok "[$n] 已注册（跳过，无重复行）"
+    continue
+  fi
+  tmp="$WORK/patch.tmp"
+  grep -vE '^\[[[:space:]]*\]$' "$p" > "$tmp" || true
+  if grep -vE '^([[:space:]]*$|[[:space:]]*#|^-([[:space:]]|$)|[[:space:]]+)' "$tmp" | grep -q .; then
+    printf '%s\n' "$block" > "$p.dsh-memory-block.txt"
+    warn "[$n] 未注册：$p 不是纯顶层块序列（文件未修改）；请手工把 $p.dsh-memory-block.txt 合并进去"
+    continue
+  fi
+  cp -f "$p" "$p.bak-$(date +%Y%m%d_%H%M%S)"
+  printf '\n' >> "$tmp"
+  printf '%s\n' "$block" >> "$tmp"
+  cat "$tmp" > "$p"
+  ok "[$n] 已在 $p 注册 dsh-memory（$form）"
+done
 
-# 5. Verify + report
-if [ ! -f "$target" ]; then
-  echo "ERROR: index.js missing after install." >&2
-  exit 1
+# ---- final report ----
+sect "安装完成"
+say "  发布版本：v$version"
+say "  目标 profile：$TARGETS（$MODE_SRC）"
+engines=""
+if [ -f "$stage/package.json" ] && [ "$JSON_TOOL" = "node" ]; then
+  engines="$("$NODE_EXE" -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log((j.engines&&j.engines.dsh)||"")}catch(e){}' "$stage/package.json" 2>/dev/null || true)"
 fi
-bytes=$(wc -c < "$target" | tr -d ' ')
-installed_v=$(grep -oE 'const PLUGIN_VERSION = "[^"]+"' "$target" | head -n1 | sed -E 's/.*"([^"]+)"/\1/')
-remote_v=$(curl -fsSL --connect-timeout 10 "$RAW_BASE/version.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
-echo ""
-if [ -n "$installed_v" ]; then
-  echo "dsh-memory installed successfully (v$installed_v, index.js $bytes bytes)."
-else
-  echo "dsh-memory installed successfully (index.js $bytes bytes)."
+host_v="$(dsh --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?' | head -n1 || true)"
+[ -n "$host_v" ] && say "  宿主版本：$host_v${engines:+（engines.dsh $engines）}"
+for n in $TARGETS; do
+  v="$(grep -oE 'const PLUGIN_VERSION = "[^"]+"' "$(plugin_dir_of "$n")/index.js" 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)"/\1/')"
+  has_reg="no"; has_memory_registration "$(patch_of "$n")" && has_reg="yes"
+  say "  [$n] v${v:-?}  注册=$has_reg"
+done
+sect "下一步"
+item "重启 DSH 才加载新插件。"
+if [ "$needs" = "1" ]; then
+  item "旧 md 记忆待迁移：DSH 运行中会先登记；完全退出 DSH 后执行："
+  item "  bash $0 --migrate --yes --profile $PRIMARY"
 fi
-if [ -n "$remote_v" ]; then
-  if [ "$remote_v" = "$installed_v" ]; then echo "  published : v$remote_v (up to date)"; else echo "  published : v$remote_v (newer version published; re-run this installer to upgrade)"; fi
-else
-  echo "  published : unknown (offline?)"
-fi
-echo ""
-echo "Next step: restart DSH. First-run experience:"
-echo "  - the plugin checks the memory library; if empty, guides you through initialization"
-echo "    inside the first session (about 1 minute; also /memory-init)"
-echo "  - /memory-update checks the version; Settings -> General -> Memory shows both"
+item "体检（只读）：bash $0 --check"
+item "卸载：Windows 用 install.ps1 -Uninstall（本脚本暂不提供卸载）"
+exit 0

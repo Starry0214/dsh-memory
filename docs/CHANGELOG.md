@@ -4,6 +4,278 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v3.4.5（2026-10-22）：**过期日摘要自动瘦身** —— 补「隔天起没人管」的层设计缺口
+
+> 用户：「这些日摘要超限是不是也是 bug？」→「要不看看 mimocode 怎么做的？」→「可以（做进代码）」。
+
+### 先查上游（MiMo-Code）
+
+- `packages/opencode/src/memory/paths.ts` + `fts.sql.ts`：记忆 = `global/projects/sessions` 三 scope 的 md + **FTS5 索引**，用于检索；
+- `packages/opencode/src/session/summary.ts`：`summary` 是**文件改动统计**（additions/deletions/files），**不是**每日摘要；
+- `packages/opencode/src/session/auto-dream.ts`：dream 间隔 **7 天**（distill 30 天），任务书原文 *"Use the memory files as the
+  working index and the raw mimocode trajectory database as the source of truth"*；
+- `docs/compose/spec/context-budget-control.md`：预算治理只到**上下文窗口**层，没有"记忆文件字符预算"。
+- ⇒ **「每日 sessions/YYYY-MM-DD.md + 1500 上限 + 注入」是自研层，上游没有对应物可抄**；可借的只有一条原则：
+  **真源 = 轨迹，记忆文件 = 索引/派生缓存**。据此判定：过期日摘要不该继续占大文件，应瘦成指针。
+
+### 缺口（为什么会长到 68951 字符）
+
+1. 维护只盯「最近摘要」（当天那份），**隔天起不再复查**；
+2. 深超限（>约 2308 字符）直接判 `infeasible` **跳过 slim**（刻意防烧 token），一次没压下来就永久放弃；
+3. 机械下沉只搬**冷节**（标题匹配归档/补档族），日摘要正文标题不符合 ⇒ 永远跳过。
+⇒ 实测全库 13 份超限：10-13 **68951**、10-12 39720、10-21 20631、10-20 16426、10-18 6779、10-17 5323、10-10 2830
+（另加 10-14/15/16/19/08/09）。
+
+### 改动
+
+- 模块作用域新增 `listExpiredDailyOverflow()` / `dailyMainLineOf()` / `sinkExpiredDailySummary()`（具名导出供门直测）：
+  只挑 `date < today && chars > 1500`；**先写下沉档并回读校验逐字包含原文**，再留 `.bak-sink-<stamp>`，最后把主档改成
+  「标题 + 主线一句话 + 指针」（≤600 字符，仍 ≤1500）；任一步失败 ⇒ 主档原样不动。
+- 接线：挂在 `runStaleSilentTick`（**每小时必跑**的唯一钩子）最前段，每 tick 最多 1 份，留痕
+  `过期日摘要已瘦身：<rel> N→M 字符` + `monitorEvent("maint","daily-sink …")`。
+
+### 验证
+
+- `_test-daily-sink.mjs` **10/0**：只挑过期且超限、当日/合规不动、下沉档逐字含原文、留备份、幂等（第二次 `no-candidate`）、
+  主线提取；对旧字节（无导出）必红。
+- 现场已用同一策略治完 13 份：`sessions/*.md` 全部 ≤1500（最大 1158），下沉档 13 份 / 426 KB，逐字校验全 PASS。
+
+### 附二：`session_search` 对 `session.v4.jsonl.zstd` **整类不可见**（2026-10-23 事故修复）
+
+> 用户：「为什么都是 0 命中？」—— 4 个关键词（ensureGainmap / applyCreate / 1.65526 / payload0）带 `since:2026-10-23`
+> 全部返回「命中 0 处（缓存为空或口径不符（先跑 --build））」。
+
+- **根因**：CLI `session-search.mjs` 的 `LOG_RE = /^session(\.v3)?\.jsonl\.zstd$/` 只认 legacy/v3；DSH 0.2.x 起日志名是
+  `session.v4.jsonl.zstd` ⇒ 全库 **1082 个 v4 日志**（≈09-23 之后所有会话，含当日）对 `--build` / 检索**完全不可见**。
+- **为什么一直"看起来在跑"**：`--build` 只枚举到 1263 个旧日志（=732 legacy + 531 v3，与账本 `日志 1263 个` 完全吻合），
+  这些文件 size 早已不变 ⇒ 每轮「建 0 / 跳过 1256」；缓存日目录永远停在 **2026-09-23**；`--since 今天` 无目录 ⇒
+  静默 0，而 0 命中提示里那句「先跑 --build」把人引向一条永远建不出东西的路。
+- **修复**：`LOG_RE` 纳入 v4（v4 事件类型与 v3 同构，`KEEP_KINDS` 无需改）。重修后 `--build`：**日志 2345 / sid 2280 ⇒
+  建 1082，跳过 1198，错 0，83.7s**；`2026-10-23` 日目录出现 33 个会话；四个关键词立即分别命中
+  9 / 4 / 11 / 43 处。CLI 属独立子进程 ⇒ **立即生效、无需重启**。
+- **防复发门**：`_gate-freeze-sync.mjs` 新增 **GR24** —— CLI 的 `LOG_RE` 必须覆盖 index.js `SESSION_LOG_CANDIDATES`
+  的**每一个**文件名（用真实文件名逐个 `re.test`，不看源码写法）。已做鉴别：把 LOG_RE 改回旧值 ⇒ 门红
+  「未覆盖：session.v4.jsonl.zstd ⇒ 这类日志对 session_search 整类不可见」。门现为 **17/0 全绿**。
+
+
+## v3.4.4（2026-10-22）：容量账本**反向清理** —— 修「文件回到限内了，`overLimitStuck`/`overLimitHint` 还挂着」
+
+> 用户拿 dream 结算日志来问「这个是不是有点问题？」：19:59 那轮报 `projects/湖南省发改委…` 13477、`EpointMsg插件.md` 9068
+> **仍超限**，而人工下沉后实测已是 5113 / 6828。日志本身是治理前的（时间戳 19:59），但账本确实没跟着更新 —— 查下去是真 bug。
+
+### 真 bug（不是日志时序问题）
+
+- `if (overList.length) { … }` 把整段账本更新包住了，而 `overList` 只装**当前仍超限**的文件 ⇒
+  一个文件一旦回到限内（dream 写小 / 人工下沉 / 删除），它既不进 overList、历史键也**永远不会被清**：
+  - `overLimitStuck[rel]` 残留 `rounds`/`lastChars`/`lastAction`（现场：发改委 `rounds=12`、EpointMsg `rounds=2`、
+    徕卡 `lastChars=14551`，而三档实测 5113 / 6828 / 8612）；
+  - `overLimitHint[rel]` 残留旧差数与分节表 —— 它的 `cleared` 墓碑只在「在 overList 里且本轮已写」时才会写，
+    已合规文件**永远拿不到墓碑** ⇒ 容量行与 dream prompt 继续显示不存在的超限。
+- **次生伤害（更隐蔽）**：`rounds` 是跨事件累积的。残留 12 的文件将来再超限时，第一轮就变 13 ⇒ 直接越过
+  「连续 2 轮」滞回、立刻机械下沉（把历史轮数当新轮数用）。
+
+### 修法
+
+把外层改成**无条件块**，在更新循环后做反向清理：不在 `overList` 里的历史键 ⇒ `stuck` 删除、
+`hint` 走 `applyOverLimitHintEntry(hintObj, rel, null)` 写**墓碑**（不用 `delete`，否则会被磁盘并账复活）；
+仅在有变化（`overList.length || _swept`）时落盘，并打一行 `容量账本清理：清掉 N 条已不符实况的 overLimit 记录`
++ `monitorEvent("sink","ledger-sweep N")` 留痕。
+
+### 验证
+
+- `node --check` PASS；`_test-sink-overlimit` **27/0**（新增 2 条源码锚点，旧写法必须红）。
+- 现场账本已手工校正为实况（rounds 归 0 / hint 墓碑），下次 dream 的容量行不会再点这两个文件。
+
+## v3.4.3（2026-10-22）：`session_search` 关键词**默认按字面量**匹配（元字符转义），`--re` 保留正则
+
+> 用户「按你的最优理解改」——v3.4.2 修了大小写后，同族隐患是：关键词仍被当 **正则** 送进 rg。
+
+### 改动
+
+- **CLI `session-search.mjs`**：`escRe()` + `kwPat()`；`PAT = kind ? '"k":"<esc kind>".*<kwPat>' : kwPat`。
+  默认转义 `. * + ? ^ $ { } ( ) | [ ] \`；`--re`（或 `--regex`）退回正则语义。`--kind` 前缀各自转义后拼 `.*`，语义不变。
+- **插件 `session_search`**：新增可选 `regex:true`（→ 传 `--re`）；描述与 0 命中引导语各加一行说明；
+  多词回退的每个 token 同步带 `--re`/`--cs`，保证口径一致。
+
+### 实测
+
+| 命令 | 改前 | 改后 |
+|---|---|---|
+| `"("` | rg regex parse error → exit 4（白跑） | **命中 67792 处，exit 0**（按字面量） |
+| `"("  --re` | — | 仍 exit 4 + `rg: regex parse error … unclosed group`（正则语义保留） |
+| `"d.m"` | 命中 `dim`/`d-m`/`d.m` 全体 | 只命中字面量 `d.m`（2967 处） |
+
+回归：`_test-search-commands` 13/0、`_test-session-search-tool` 23/0。CLI 属独立子进程 ⇒ **立即生效，不需重启**；
+插件侧参数需重启。
+
+### 附：门与测试的既有债清理（同日·用户要求「做完我来发起 dream」前清干净）
+
+- 加载门 `_gate-plugin-load.mjs` 两条**恒红**断言按现况校正（去陈旧，不是放宽）：
+  - 「候选表 v3 在前」钉的是 v3 时代二元素表；DSH 0.2.x 起写 `session.v4.jsonl.zstd`，代码已扩成三元素
+    （v4→v3→legacy）⇒ 改成**顺序断言**（优先级 = 新→旧、时间序 = 旧→新、两者必须互逆）。
+  - 「T2 生效配置行」钉死 `normalizeCfg(HOST_SETTINGS_SCOPE.get())`；0.1.7 起 API 换成 `normalizeCfg(mergeCfgLayers(config))`
+    ⇒ 改为「任一 `PLUGIN_CFG = normalizeCfg(` 初始化点后 1200 字符窗口内出现 `clog(cfgEffectiveLine())`」（赋值点共 3 处）。
+- `_test-sessionlog-path.mjs` A1/A2b 同步改顺序断言（v4 感知）；`_test-raw-decode.mjs` P0-4 原判据全文禁止
+  `slice(-300)`，把 monitor 环形缓冲（`gateEvents` 截 300 条）误判成「归档账本上限残留」⇒ 只对
+  `archivedSessions/archiveWatermarks/staleNotified` 查残留。
+- `_test-subagent-digest.mjs` 的「真机抽样恒红 0/3」也是**测试自身的 bug**：`if (cands.length >= 60) break;`
+  写在两个循环内部、而 readdir 不按时间序 ⇒ 只在**第一个 workspace**凑够 60 个老会话就收工，永远扫不到全库最新
+  那几个（本次实测：3f4ccded/45189195/b4bbb21a 三个都有内容，测试却报 0/3）。改为全库收集后按 mtime 取前 3 ⇒ 3/3。
+- 清理后：加载门 **137 / 0 全绿**；`_test-sessionlog-path` 24/0、`_test-raw-decode` 31/0、
+  `_test-subagent-digest` 21/0、`_test-deadprobe` 18/0、`_test-search-commands` 13/0、`_test-session-search-tool` 23/0。
+- 记忆库 `sessions/2026-10-22.md` 超预算（10483 字符 / 限 1500，维护反复 `stuck=infeasible`）→ 压到 **1076 字符**，
+  细节下沉 `knowledge/MEMORY-dsh-memory-blocked与检索口径20261022.md`。
+
+
+## v3.4.2（2026-10-22）：**blocked 的真因是「父会话已归档」** —— 择父改为最近活跃且未归档
+
+> 用户看了设置截图（「允许 Agent 为子智能体选择模型」= 关）后质疑：「关闭状态应该是默认继承吧？dream 应该用
+> 手动发起的那个会话、或最新的会话，API 必然有效」。**质疑成立** —— v3.4.1 里「子代理模型白名单」的归因是错的。
+
+### 真因（宿主源码实证）
+
+- `dsh-api-session-controller/lib/types/archived-session-gate.js`：
+  「an archived Session, **or a subagent descendant of one**, must not run a model step until it is restored …
+   a late waking delivery … proposes a step the gate rejects, **which the loop ends as `blocked` without a request**」。
+- `agent-loop` 的 `turn()`：`preStep` 返回 `{kind:"reject"}` ⇒ `turnEnds={kind:"blocked"}`，**不进 LLM**。
+- 现场：`session-ba9e8416-dd22-44da-a795-3fe95718c0c5`（agent周事项）就在
+  `~/.dsh/storages/workspace.json` 的 `archivedSessionIds` 里；而 dream 的择父写的是
+  `agentsBySession.values().next().value` = **最早注册**的那个会话 —— 恰好是它 ⇒ 每轮必 blocked。
+- 反证：白名单不构成约束（`a99b9b92` 的 policy 是 opencode-go-v41，而它子代理跑的是 commandcode，全部 completed）。
+
+### 改动
+
+1. **`pickSpawnParent` 重写**：跳过一切已归档会话（`readArchivedSessionIds()` 读 workspace.json，30s 缓存、
+   非法 JSON 降级空集、`session-` 前缀与裸 UUID 等价）；顺序 = 调用方 preferred（手动 /dream 的发起会话）→
+   同会话 live → 最近活跃未归档 → 任一未归档 live；**全无则返回 null**（不再挑一个注定被拒的父）。
+2. **记录活跃时间**：`touchAgent()` 在 `agent/created` 与每次记忆注入时打点，择父按「最近活跃」排序。
+3. **dream 择父换血**：`agentForParent || agentsBySession.values().next().value` → `pickSpawnParent(agentForParent, null)`；
+   重试路径同步。日志新增 `择父：跳过已归档会话 …（宿主的归档闸会拒掉它的子代理，必 blocked）`。
+4. **秒死日志就地归因**：`raceSubagentDead` 的失败文案改为「头号原因 = 父会话已被归档（去侧栏取消归档）」，
+   白名单降为次要排查项。
+5. **`session_search` / CLI 英文大小写不敏感**（用户当场提问「session 工具能不能适应英文大小写？」）：
+   实测旧行为 `Dream`=749 处、`dream`=6452 处（rg 无 `-i`，且关键词被当正则用）。
+   - CLI `session-search.mjs`：`RGCOMMON` 默认加 `-i`；新增 `--cs` 退回逐字区分大小写（计数与列举共用同一
+     RGCOMMON ⇒ `total` 与 `rows` 口径不会分叉）。改后实测 `Dream`=`dream`=6756 处，`--cs` 仍 749 处。
+   - 插件 `session_search`：新增可选 `case_sensitive`（默认 false → 传 `--cs` 时 true）；片段高亮与多词回退的
+     命中判据同步按同一口径折叠大小写（否则"命中却截不到关键词"）；0 命中引导语加一行说明"大小写默认已不敏感"。
+   - **CLI 属独立子进程实现 ⇒ 该项改动立即生效、不需重启**；插件侧参数与文案需重启。
+
+### 验证
+
+- `node --check` PASS；`_gate-plugin-load.mjs` 134 PASS / 3 FAIL（与改前基线**完全相同的既有债**：候选表顺序、
+  全角引号 6 处、T2 接线）。
+- `_test-deadprobe.mjs` 扩到 **18 项全绿**：新增 E1 真机归档清单可解析（>50 条）、E2 **现场父会话 ba9e8416 确在
+  归档清单里**（把真因钉成断言）、E3 深层嵌套可找到、E4 前缀等价、E5 坏 JSON 不抛。
+
+### 用户可立刻做的（任一即可恢复）
+
+把 `agent周事项` 那个会话在侧栏**取消归档**（最直接）；或重启后用本版（会自动避开归档会话挑父）。
+
+## v3.4.1（2026-10-22）：**零工作子代理收尸** —— 修「秒死 blocked ⇒ 互斥永久挂死 ⇒ 归档/整合全停」
+
+> 起因：用户看日志连问「为什么硬停了？还停了这么多次？是真的还是 bug？」
+> 结论：**硬停是真故障的收尸，不是看护误杀；但"死了没人收尸把整条管线锁死"是真 bug。**
+
+### 现场取证（两次解压 + projcache 对账）
+
+- 三个 dream 子会话 `2e0a9df1`(11:17:59) / `18d39e4a`(13:17:57) / `bb668645`(15:17:57)：各 11 帧、~15KB，
+  `turn/end {"kind":"blocked"}` 分别在 +115ms / +296ms / **+45ms**，`tokenUsage` 四项全 0 —— 一次模型请求都没发。
+  projcache `subagentTiming={descriptorSeen:true, settledMs:45, lastTurnCompleted:false}`。
+- 根因在该父会话（`session-ba9e8416`）的 per-session 白名单：`subagentModelSelectionPolicy=[{provider:"opencode-go",
+  model:"muse-spark-1.3-contributor"}]`，而当前 desktop profile 的 `opencode-go` 只定义 `deepseek-v4.1-flash`
+  （muse-spark 只写在 `profiles/web/cordis.patch.yml`），子代理实际创建路由 `deepseek-192/deepseek-flash` 也不在白名单
+  ⇒ 宿主在选模型阶段直接 blocked。
+- 对照组：`4e924cbb`（白名单 deepseek-192+commandcode）、`a99b9b92`（opencode-go-v41/deepseek-v4.1-flash）同时段
+  子代理**全部 completed** ⇒ 排除插件/看护/网络/配额。
+- 最早坏点 = **2026-10-21 19:35:30**（同一父会话的 `漏网归档-3会话-批1` + `压缩-intent` 也 blocked）。因 result 永不落定：
+  `STALE_RUNNING` 自那一刻起再没复位（`archiveLastRunAt` 停在 19:35:30）；`DREAM_TRACK` 14:32:44 那条也清不掉。
+  于是每小时触发一次 → 起一个 45ms 就死的会话 → 25 分钟后看护 abort，写下 11:45/13:45/15:45 三条「硬停」。
+
+### 改动
+
+1. **判定器（模块作用域，门可 import 真实现）**：`subagentDeadEvidence(sessionDir)` + `findSpawnedSessionDirById(runId)`。
+   判据零误杀：日志里必须已有 `turn/end`，且该轮 (a) `kind==="blocked"`，或 (b) `kind!=="completed"` 且 usage 全 0 且无
+   assistant 文本。健康三态（仍在跑=只见 turn/start、正常完成=completed、有产出=token>0）都不会命中；>1.5MB 日志直接跳过。
+2. **探针 + 竞速包装**：`armDeadProbe`（发起后 8s 起探、每 5s、连续 2 次命中才判死、最多 2 分钟）与
+   `raceSubagentDead(runId, run.result, tag)` —— result 落定则原样透传；宿主已结算但零工作则以失败 **reject**，
+   让既有 catch/finally 去做清锁。接入三处 await：dream settle（`DREAM_TRACK`）、归档批 `joinOneBatch`
+   （`STALE_RUNNING`）、`compactOnce`（maint/intent/slim 压缩轮）。
+3. **`STALE_RUNNING` 残留兜底**：加 `STALE_RUNNING_SINCE` + `staleRunningActive()`，挂满 40 分钟
+   （> `ARCHIVE_HARD_MS` 25 分 + 结算余量）自动放行并记 `monitorEvent("archive","stale-proc-release")`；
+   两处判断（`runStaleArchive` / `runStaleSilentTick`）与三处复位点同步改造。
+
+### 验证
+
+- `node --check` PASS；`_gate-plugin-load.mjs` 全绿（同步前运行处旧字节须 FAIL，鉴别成立）。
+- 新增 `_test-deadprobe.mjs`：真实 blocked 子会话（`bb668645`）判死、真实完成子会话判活、
+  以及合成夹具 4 类（仅 turn/start / completed+0 token / error+0 token / 有 token 的 error）双向断言；对旧字节 import 必红。
+
+### 未改（交给用户）
+
+该会话的子代理模型白名单仍指向已不存在的模型 —— 那是**配置**问题，请在设置页改成本 profile 存在的路由
+（`commandcode/deepseek/DeepSeek-V4.1-Flash` 或 `deepseek-192/deepseek-flash`）；本版只保证"再秒死也不会把管线锁死"。
+
+## v3.4.0（2026-10-20）：**子代理会话纳入归档**（机械摘要，零 LLM）+ 命令 `/subagents-archive`
+
+> 起因：用户「最近 session 归档效果如何？我想把子代理对话也纳入归档」。
+> 体检结论：顶层会话已收敛（463 个里 457 个已归档 = **98.7%**），但**子代理会话整类没进归档**
+> —— 子代理落盘为**裸 GUID 目录**（`~/.dsh/sessions/<工作目录>/<guid>/`），而 `findStaleSessions` 只认 `session-` 前缀。
+> 实测规模：**1699 个 / 605.6 MB**，近 7 天日均新增 35.7 个。
+
+### 为什么走"机械摘要"而不是 LLM 摘要
+
+- 单个子代理可达 **2262 帧 / 2456 万字**（几乎全是工具往返），逐条 LLM 总结既贵，又会把中间失败路径写进记忆库（ghost 轮教训）。
+- 实测 30/30 复现更省的形态：首条 `user/message` 稳定落在**第 3~4 帧**（前 12 帧内必能找到，平均 207 字）；
+  尾帧 `assistant/message` 有最终答复的 75/80（平均 725~1153 字）⇒ **只解约 5 帧**就能拿到「任务 + 结论」，**零 LLM token**。
+
+### 实现
+
+- 新增 `subagentDigestOf(dir)`：头 12 帧找 `subagent/descriptor.label` + 首条 `user/message`；尾 5 帧倒序找最后一条 `assistant/message` 与 `turn/end.reason.kind`。
+- 新增 `runSubagentDigestBatch(limit, {maxAgeDays, dry, root})`：扫描裸 GUID 目录 → 过滤（见下）→ 按天聚合写
+  `knowledge/MEMORY-子代理对话-YYYY-MM-DD.md`（追写）→ 记 `ARCHIVED_SESSIONS`（`session-<guid>`，与顶层同一账本，天然去重）；
+  **不写 `archiveWatermarks`**（水位是帧增量语义，子代理是一次性任务，无增量可续）。
+- **门槛**：尾帧结论 ≥200 字 **或** 原始日志 ≥60KB（两条 OR 分支，实测覆盖"结论长的"与"工具多但话少"的两类）。
+- **排除**：`descriptor.label` 以 `dsh-memory-` 开头的插件自身子代理（意图检查点/合并维护/漏网归档/dream）——产物已进 sessions/knowledge。
+- **通道**：① 每小时 tick 自动跑一批（16 个，1 小时节流，失败不影响顶层归档）；② 命令 `/subagents-archive`：
+  默认 1 批 / `backfill` 存量全量回填（后台分批、让出事件循环、单飞防重入）/ `dry` 只统计 / `off`·`on` 开关（记 `.integrate.json subagentArchive`）。
+- **规模控制**：按天聚合（1699 个会话 ≈ 30 个日文件 ≈ 每文件 ~30KB），不炸出 1699 个文件稀释 `memory_search` 排序。
+
+### 门
+
+`_test-subagent-digest.mjs`（**21 项全绿**）：临时 DSH_HOME 里造**真 zstd 多帧**合成会话，验 抽取（任务/结论/状态/label/帧数）→ 排除（插件自身、过薄、太新）→ 两条门槛 OR 分支 → 落盘（front-matter + 条目正文）→ 幂等（二跑 added=0）；末尾对真实环境 3 个真实子代理做只读抽取（3/3）。
+
+## v3.3.1（2026-10-20）：命令提示补上「多词条」能力（hint / description / 用法回显）
+
+> 用户实测反馈：「两个工具**但是多词条搜索的，似乎没有在提示内容中**」——多词条本来就支持（`memory_search` 是 OR 分词；`session_search` 是整串精确、0 命中后自动分词回退），
+> 但 `input.hint` 只写了单关键词，用户在输入框里看不出可以空格拆词。
+
+- `/memory-search`：`input.hint` → 「关键词，可多词条（空格分隔，如 水位信任闸 机械闸）｜或文件名」；`description` 标注 **支持多词条（OR 分词 + 相关度排序）**；用法回显新增「多词条：空格分隔即按 OR 分词…任一单词命中即入选，写 2~4 个最具体的词最好」。
+- `/session-search`：`input.hint` → 「字面量或多词条 [--limit N] [--since 日期] [--sid 前缀] [--source …] …」（原 hint 过长会被 UI 截断，收敛为「多词条 + 三个常用选项 + 省略号」）；`description` 标注 **先整串精确、0 命中自动分词回退**；用法回显补多词条语义与示例。
+- **检索语义未变**：仍只读；`parseCmdArgs` 把非 `--` 开头的 token 用空格拼回 `query`，正好喂给工具侧原有的多词条路径，没有新增分支。
+- 生效仍需重启（host 插件无热加载）：就绪行构建指纹会从 `1041506B/19E6F80B` 变为新字节，可据此确认加载了哪一份。
+
+## v3.3.0（2026-10-19）：两个检索工具开放为**用户命令** `/memory-search`、`/session-search`
+
+> 起因：用户「将两个工具开发到命令中给用户也能调用」——`memory_search` / `session_search` 此前只有模型侧能调，用户在输入框里按不到。
+
+### 做法：复用同一实现，命令层只做参数解析与裁剪
+
+- 把两个工具的注册对象提为具名常量（`sessionSearchToolDef` / `memorySearchToolDef`）并 `toolSvc.register(...)`，
+  同时把 `execute` 挂到作用域变量 `SESSION_SEARCH_EXEC` / `MEMORY_SEARCH_EXEC` ⇒ 命令与工具**共用一份检索逻辑**，
+  不复制 OR 分词、相关度排序、索引 CLI 参数映射、0 命中升级路径等语义（避免两份实现漂移）。
+- 新增 `ctx.commands.register`：
+  - `/memory-search <关键词或文件名>` —— 只读；query 等于文件名时返回该文件全文（截 4000 字）。
+  - `/session-search <精确字面量> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--sid 前缀] [--source logs|units|all] [--status] [--build]` —— 只读。
+- 参数契约（宿主 `dsh-commands`）：handler 收到 `{commandId, agent, rawInput, attachments, signal}`，`rawInput` = 命令名之后的原始尾巴；
+  命令侧 `parseCmdArgs()` 支持 `--k v` 与 `--k=v` 两种写法、无值开关（如 `--status`）；输出统一 `clipCmdText(…, 8000)` 防刷屏（截断时注明原长度并提示改用工具）。
+- 就绪行的「已挂载」清单补上两个命令名。
+
+### 纪律
+
+- 命令**只读**：两个检索命令不写记忆库；`/session-search --build` 只重建检索索引（慢，约 6 分钟），不改记忆内容。
+- 未就绪保护：工具注册失败时命令返回明确错误（指向启动日志里的注册失败行），不静默降级为用法回显。
+
 ## v3.2.0（2026-10-19，本次发布）：**宿主 0.2.1 子代理 API 断裂兼容** + dream 失败原因可见
 
 > 本次推送同时**收编 v2.5.5 → v3.1.0 全部未提交迭代**（索引自动刷新 v3.1.0、归档/解码链批0、容量治理 spillover、水位信任闸等），

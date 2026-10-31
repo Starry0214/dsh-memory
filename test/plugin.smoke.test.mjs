@@ -100,8 +100,27 @@ const run = async () => {
   for (const tn of ["memory_search", "stale_archive", "dsh_spiral_thresh", "memory_onboard"]) {
     ts2("工具已注册：" + tn, !!tool(s.ctx, tn));
   }
-  for (const cn of ["dream", "memory-init", "memory-update"]) {
+  for (const cn of ["dream", "memory-init", "memory-update", "memory-search", "session-search", "subagents-archive"]) {
     ts2("命令已注册：/" + cn, !!cmd(s.ctx, cn));
+  }
+  // v3.3.0：两个检索命令必须声明非空 input.hint（宿主 dsh-commands register 会硬校验），且空参数要回用法
+  for (const cn of ["memory-search", "session-search"]) {
+    const c = cmd(s.ctx, cn);
+    ts2("/" + cn + " 声明非空 input.hint", !!(c && c.input && String(c.input.hint || "").trim()));
+  }
+  // v3.3.1：提示必须写明「多词条」——功能本来就支持，但 hint 不写就等于用户发现不了（用户实测反馈）
+  for (const cn of ["memory-search", "session-search"]) {
+    const c = cmd(s.ctx, cn);
+    ts2("/" + cn + " hint 写明多词条", !!(c && c.input && String(c.input.hint || "").includes("多词条")));
+    ts2("/" + cn + " description 写明多词条", !!(c && String(c.description || "").includes("多词条")));
+  }
+  {
+    const r1 = await cmd(s.ctx, "memory-search").handler({ rawInput: "" });
+    ts2("/memory-search 空参数回用法（不抛异常）", !!(r1 && r1.kind === "success" && String(r1.text).includes("/memory-search")));
+    ts2("/memory-search 用法回显说明多词条语义（OR 分词）", !!(r1 && String(r1.text).includes("多词条") && String(r1.text).includes("OR 分词")));
+    const r2 = await cmd(s.ctx, "session-search").handler({ rawInput: "" });
+    ts2("/session-search 空参数回用法（含选项表）", !!(r2 && r2.kind === "success" && String(r2.text).includes("--limit")));
+    ts2("/session-search 用法回显说明多词条语义（分词回退）", !!(r2 && String(r2.text).includes("多词条") && String(r2.text).includes("分词回退")));
   }
   function ts2(name, ok) { report(name, ok ? null : new Error("未注册")); }
 

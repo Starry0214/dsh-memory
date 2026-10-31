@@ -1,0 +1,106 @@
+{
+  "version": "3.5.6",
+  "generatedAt": "2026-10-31T10:45:30.320Z",
+  "files": [
+    {
+      "path": "AGENTS.template.md",
+      "bytes": 6038,
+      "sha256": "45463dd54b87c890bd7fd8e11a96a80ebeab96ffb597c77a93d8247d1d662e58"
+    },
+    {
+      "path": "client/lib/client.js",
+      "bytes": 11139,
+      "sha256": "ba1ad37e57f07a075f2ef3527167f50e7f19e9332e7a202c1c8ed5d8e9a287d2"
+    },
+    {
+      "path": "client/lib/index.js",
+      "bytes": 255,
+      "sha256": "89c63c2cde2fcb8a947456354c3a98fb3c355e4942d1b2ffbff5d28a3ece549a"
+    },
+    {
+      "path": "client/package.json",
+      "bytes": 896,
+      "sha256": "88c2379030c890cfc06b55dea9940bef3461f2d453c8d6d6882bcbc7701af4ed"
+    },
+    {
+      "path": "index.js",
+      "bytes": 1404184,
+      "sha256": "5e2258b9460fbe32214134d3b24c39b33fc2df008da59238dabf9c317a423b0b"
+    },
+    {
+      "path": "memtopic/src/backend-ledger.mjs",
+      "bytes": 7682,
+      "sha256": "7af738bcba23f452b32dccb3b499527198ffc40344387b3dbdeca90f211d752a"
+    },
+    {
+      "path": "memtopic/src/backend-sqlite.mjs",
+      "bytes": 8291,
+      "sha256": "99887f992bc9d9b62a89a2227589a4dadf7fd47fd6cfcfc60a56a7cccf7aaac5"
+    },
+    {
+      "path": "memtopic/src/curation-apply.mjs",
+      "bytes": 25248,
+      "sha256": "b71750834b419a65d992d0ee84fc900d59d1ae15b8f96232cd9c65650460ebfb"
+    },
+    {
+      "path": "memtopic/src/curation.mjs",
+      "bytes": 118388,
+      "sha256": "c9cc17f97c251166d5b5b695fa1ee20e52921c864e8ba54a40d1b2f9fe1fc9c0"
+    },
+    {
+      "path": "memtopic/src/detect.mjs",
+      "bytes": 1802,
+      "sha256": "48ac2d75332a6a778c37b8518fa7879bcb592b4891d65e570605690171cf8621"
+    },
+    {
+      "path": "memtopic/src/governance.mjs",
+      "bytes": 16712,
+      "sha256": "8c9db0ce953fd406ab88741af6aa2e9c3fecd115262f399351dc1f13d8190ba0"
+    },
+    {
+      "path": "memtopic/src/import.mjs",
+      "bytes": 73856,
+      "sha256": "e6324a99193c69904996003890a75eeb0c765f41182c87ec4f14d632c77f96c4"
+    },
+    {
+      "path": "memtopic/src/lifecycle.mjs",
+      "bytes": 9697,
+      "sha256": "0d9fca98fdafa7486200c0c3516045b1329597d82273a465491b0460f62746e3"
+    },
+    {
+      "path": "memtopic/src/memory-store.mjs",
+      "bytes": 129683,
+      "sha256": "fef98406092c63fdfc2d9dcceff298e51458b2fb445e6ba3c34530c4022b7a06"
+    },
+    {
+      "path": "memtopic/src/migrate.mjs",
+      "bytes": 46678,
+      "sha256": "c9e527cea9640c7f64d867c1d0f4ea7966b18a1aca06ba3f2a458e7986625ad8"
+    },
+    {
+      "path": "memtopic/src/tree-apply.mjs",
+      "bytes": 49186,
+      "sha256": "305cb13f8fd576c9f8d86556b4b94653bb92350b804c0ee11543291b866bc921"
+    },
+    {
+      "path": "memtopic/src/upgrade.mjs",
+      "bytes": 96905,
+      "sha256": "d01521f15be5d014f350cee2161d7c8b49919991f5820af02c81cfe115c6fb70"
+    },
+    {
+      "path": "package.json",
+      "bytes": 651,
+      "sha256": "1db0a03b5dfbc247041a1f2ea06d96c13e0a0a8ccb147d565256f397197e3556"
+    },
+    {
+      "path": "version.txt",
+      "bytes": 5,
+      "sha256": "2576b277d97581b27d80e5c9026361295910a6f3822e92012b8fcc2f835f8b80"
+    }
+  ],
+  "zip": {
+    "name": "dsh-memory-3.5.6.zip",
+    "bytes": 685236,
+    "sha256": "ca938017c8d33a078f9249345ee5251ab7b571a37e9261e43580659eb903c01d"
+  }
+}

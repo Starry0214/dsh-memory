@@ -18,3 +18,7 @@ Thumbs.db
 
 # harness gate/boot test artifacts (_ctr-boot-*, _inc-boot-*, _inj-boot-*)
 _*-boot-*.mjs
+
+# 发布工具链（本仓库的 tools/ 是安装器/打包工具，不是记忆库导出视图，别被上面的 tools/ 误伤）
+!tools/
+!tools/**
