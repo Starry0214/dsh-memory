@@ -337,12 +337,30 @@ if [ "$MODE" = "check" ]; then
     legacy_cnt=$((legacy_cnt + c)); [ "$c" -gt 0 ] && say "  $sub：$c 个 md"
   done
   [ "$legacy_cnt" -eq 0 ] && say "  无遗留 md"
+  # [CRA M3 修复 2026-11-05] --check 段在下方（L610 附近）之前执行：归一化函数与旧 v4 sha 必须**先**定义，
+  #   否则 v4 分代判断会因「命令不存在 / 变量为空」静默失效 → 把待升级用户反向错报成 OK v4 协议。
+  LEGACY_SHA_3="45463dd54b87c890bd7fd8e11a96a80ebeab96ffb597c77a93d8247d1d662e58"
+  sha_of_normalized() { # strip BOM/CR, trailing spaces, trailing blank lines -> sha256
+    f="$1"; tmp0="$WORK/norm0.txt"; tmp="$WORK/norm.txt"
+    bom="$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')"
+    if [ "$bom" = "efbbbf" ]; then tail -c +4 "$f" > "$tmp0"; else cp "$f" "$tmp0"; fi
+    sed -e 's/\r$//' -e 's/[[:space:]]*$//' "$tmp0" | awk '{lines[NR]=$0} END{last=NR; while(last>0 && lines[last]=="")last--; for(i=1;i<=last;i++)print lines[i]}' > "$tmp"
+    sha256_of "$tmp"
+  }
   sect "[5/6] 开关 / AGENTS / pending"
   cfg="$mem_root/.config.json"
   if [ -f "$cfg" ]; then say "  .config.json：$(tr -d '\n' < "$cfg")"; else say "  .config.json：不存在（新装会写 memoryTopicDbEnabled=true）"; fi
   ag="$DSH_HOME/AGENTS.md"
   if [ -f "$ag" ]; then
-    if grep -q 'dsh-memory-agents-template: v4' "$ag"; then ok "AGENTS.md：v4 协议"
+    if grep -q 'dsh-memory-agents-template: v4' "$ag"; then
+      # [CRA M3 修复 2026-11-05] v4 分两代：--check 必须能分辨「4.0.1 旧模板（待升级）」与「已是最新」，
+      #   否则会把待升级的用户报成 OK v4 协议（反向错报）。
+      h="$(sha_of_normalized "$ag")" || h=""
+      if [ "$h" = "$LEGACY_SHA_3" ]; then
+        warn "AGENTS.md：v4 旧模板（4.0.1 时代，无会话笔记）→ 重跑安装器自动升级 v4.5（会先备份）"
+      else
+        ok "AGENTS.md：v4 协议"
+      fi
     else warn "AGENTS.md：不是 v4（重跑安装器会按白名单升级；改过的文件不会覆盖）"; fi
   else warn "AGENTS.md：不存在（安装器会写 v4 模板）"; fi
   check_pending
@@ -597,6 +615,8 @@ ag="$DSH_HOME/AGENTS.md"
 tpl="$stage/AGENTS.template.md"
 LEGACY_SHA_1="c7de0f75062511ac13321de6a321dab7f6aef89969d24eb31f55a1781c8a529e"
 LEGACY_SHA_2="3ffc27938d118a5db6cbe3b48242ee30a17ee73694ea2349a2e5f246062c4365"
+# v4 原模板（4.0.1 时代，无 memory_note）→ 4.5 升级时自动替换为含会话笔记的新模板
+LEGACY_SHA_3="45463dd54b87c890bd7fd8e11a96a80ebeab96ffb597c77a93d8247d1d662e58"
 sha_of_normalized() { # strip BOM/CR, trailing spaces, trailing blank lines -> sha256
   f="$1"; tmp0="$WORK/norm0.txt"; tmp="$WORK/norm.txt"
   bom="$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')"
@@ -607,7 +627,20 @@ sha_of_normalized() { # strip BOM/CR, trailing spaces, trailing blank lines -> s
 if [ ! -f "$ag" ]; then
   cp -f "$tpl" "$ag" && ok "已写入 v4 记忆协议：$ag"
 elif grep -q 'dsh-memory-agents-template: v4' "$ag"; then
-  ok "AGENTS.md 已是 v4 协议（跳过）"
+  # [4.5] v4 协议分两代：4.0.1 时代的 v4 模板（无 memory_note）可安全升级到 4.5；
+  #   用户改过的（sha 不在白名单）保留不动。**只按 sha 白名单判断**，避免误覆盖用户编辑。
+  # [CRA M4 修复 2026-11-05] 第三种情况必须说清楚：是 v4 但既非旧模板也非最新（被改过）——
+  #   原先把这种情况也打印「已是 v4 协议（跳过）」，属于谎报（实际拿不到 memory_note 协议）。
+  h="$(sha_of_normalized "$ag")" || h=""
+  tpl_h="$(sha_of_normalized "$tpl")" || tpl_h=""
+  if [ -n "$tpl_h" ] && [ "$h" = "$tpl_h" ]; then
+    ok "AGENTS.md 已是最新 v4.5 协议（含会话笔记）"
+  elif [ "$h" = "$LEGACY_SHA_3" ]; then
+    cp -f "$ag" "$ag.bak-$(date +%Y%m%d_%H%M%S)"
+    cp -f "$tpl" "$ag" && ok "AGENTS.md 已从 v4 升级为 v4.5（新增会话笔记协议，已备份）"
+  else
+    warn "AGENTS.md 是 v4 协议但非 4.5 模板（被改过）→ 保留不动；如需 memory_note 会话笔记协议，请按 payload 内 AGENTS.template.md 手工合并"
+  fi
 else
   h="$(sha_of_normalized "$ag")" || h=""
   if [ "$h" = "$LEGACY_SHA_1" ] || [ "$h" = "$LEGACY_SHA_2" ]; then

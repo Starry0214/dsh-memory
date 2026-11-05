@@ -29,14 +29,21 @@ const stats = (id) => {
   return { id: t.id, name: t.name, state: r.state, sents: s, chars: s.reduce((a, x) => a + String(x.text || '').length, 0), level: st.levelOf(t.id) };
 };
 
-// 从尾部取尽量多但总和 ≤ limit 的句数
+// 从尾部取**刚好让主主题降到 ≤ limit 的最少句数**（不是"尽可能多装"）。
+// 旧实现是"装到 ≤ limit 为止"，在 200K 索引类上限下会一次装下几乎全部内容 ⇒ 主主题被掏空只剩 1 句
+// （2026-11-03 真机 dry-run 实测 T-0475：3333 句 → 切走 3332 句、主主题剩 1 句）。
+// 新语义：逐句从尾部累加，**一旦剩余 ≤ limit 立即停**；单块仍不超 limit；单句就超预算时至少切 1 句。
 function pickTailCount(sents, limit) {
+  const total = sents.reduce((a, x) => a + String(x.text || '').length, 0);
+  if (total <= limit) return 0;
   let acc = 0, n = 0;
   for (let i = sents.length - 1; i >= 0; i--) {
     const c = String(sents[i].text || '').length;
-    if (acc + c > limit) break;
+    if (acc + c > limit) break;          // 单块不超 limit
     acc += c; n++;
+    if (total - acc <= limit) break;     // 主主题已达标 ⇒ 立刻停（这是与旧实现的关键差异）
   }
+  if (n === 0 && sents.length > 1) n = 1;  // 尾部单句就超块预算 ⇒ 至少切 1 句（否则永远卡住）
   return n;
 }
 

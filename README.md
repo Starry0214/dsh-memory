@@ -2,7 +2,10 @@
 
 让 DeepSeek Harness（DSH）真正**记住你**：跨会话、跨项目。装好后每个新会话自动带上你的画像、偏好和最近进展，AI 不用每次都从零开始。
 
-**v4.0.1** ｜ 记忆真源 = **SQLite 主题库**（`.memtopic/mem.db`）｜ md 只剩「人工稳定层」与「导出视图」
+**v4.5** ｜ 记忆真源 = **SQLite 主题库**（`.memtopic/mem.db`）｜ md 只剩「人工稳定层」与「导出视图」
+
+> **4.5 更新**：会话笔记 `memory_note`（默认动作 + 15% 档位提醒）｜ 压缩后**拦截式重灌**（不再有失忆窗口）｜ 检查点/笔记/项目/画像**四段注入**（6100 字上限）｜ 流式文本退化熔断 ｜ 漏网归档链整体移除（-2860 行）。
+> 从 4.0.x 升级：重跑安装命令 + 重启 DSH 即可，**无需迁移数据**（见[迁移指南](docs/迁移指南.md)）。
 
 > 设计灵感来自 [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code) 的开源持久化记忆（MIT 许可），针对 DSH 生态独立实现。
 > 技术细节 → [设计文档](docs/设计文档.md) ｜ 版本历史 → [变更日志](docs/CHANGELOG.md) ｜ 老库迁移 → [迁移指南](docs/迁移指南.md)
@@ -66,7 +69,11 @@ node <插件目录>/memtopic/src/split-oversized.mjs <db路径> --limit=40000 --
 
 ### 4️⃣ dream 治理管线：只按主题整理，绝不读写错位
 
-`/dream` 做四件事：**漏网会话归档 → 跨会话提升 → 去重/纠错 → 超限收敛**。
+`/dream` 做四件事：**笔记提炼（4.5 主职责）→ 跨会话提升 → 去重/纠错 → 超限收敛**。
+
+- **笔记优先**：候选 = 最多 10 个笔记主题 + 其他活跃主题补足到 20（无笔记时就是原来的 20 个，零回归）；会话检查点不进候选
+- 任务书带「**会话笔记提炼**」块：读笔记主题 → 按**七类映射**写入对应项目主题 / `global.md`（工作风格与硬规则、跨任务可迁移事实、Bug + 修复、设计决策、精确字面量逐字复制、长期引文、不确定就保留原处），提炼后标「已提炼 → T-xxxx」
+- **结论时效索引**：dream 每轮刷新主题 `结论时效表·自动索引`（哪些主题有「作废/失效/推翻/更正」标记、各几条），明细用 `memory_search` 现查
 
 4.0 起在库模式下加了**两道硬闸**（避免"读导出视图、改主题库"的错位）：
 
@@ -75,7 +82,7 @@ node <插件目录>/memtopic/src/split-oversized.mjs <db路径> --limit=40000 --
 | 写入口 | `memory_dream_patch` 收到**裸导出视图路径** ⇒ 整批拒绝（`EXPORT_VIEW_READONLY`），提示改用 `topic:"<主题名/ID>"`；先拒后写，**绝不半批落盘** |
 | 读入口 | `read`/`grep`/`glob` 命中 `projects/`、`knowledge/` 下的 `.md` ⇒ 拒绝，提示用 `memory_read` / `memory_search` |
 
-**放行**：`global.md` / `index.md`（人工稳定层）、`_export/**`（导出快照）、`sessions/**` 与 `tools/**`（漏网归档链路要用）。
+**放行**：`global.md` / `index.md`（人工稳定层）、`_export/**`（导出快照）、`sessions/**` 与 `tools/**`（导出视图，只读放行）。
 实测证据：生成 dream 任务书全过程对导出视图 md 的读取 **0 次**。
 
 ### 5️⃣ 会话记忆流水：压缩不丢记忆
@@ -83,9 +90,12 @@ node <插件目录>/memtopic/src/split-oversized.mjs <db路径> --limit=40000 --
 | 时机 | 落点 |
 |---|---|
 | 上下文压缩 | 检查点写入「会话检查点」线下的**当天主题**（`YYYY-MM-DD`），幂等键 = compactionId（同一压缩不重复写） |
+| 压缩后（下一次请求前） | **拦截式重灌**：先等检查点写好（上限 120 秒，可中止），再一次性补回**四段**——检查点 2400 + 会话笔记 1900 + 项目 1150 + 画像 350（body 合计 5800，整块上限 6100 字）；带「以本段为准」优先级标注与截断恢复指针 |
+| 会话进行中（随时） | 主 agent 用 `memory_note` 写本会话笔记（append-only、不进上下文；dream 整合时提炼进长期库） |
 | 日摘要过期（>N 天） | 库内 `archiveTopic(pointer:true)`：状态置 archived、父主题留指针，**原文仍可 `memory_read`** |
-| 会话结束 | `memory_archive_checkpoint` 进归档队列（不写 `sessions/*.md`） |
-| 漏网会话 | 超 `staleSessionDays` 天未交互 ⇒ 按 `staleAction` 提醒 / 自动归档 / 审批归档 |
+| 会话结束 | 4.5 起**没有**自动归档工具：关键内容用 `memory_write`（长期）/ `memory_note`（暂存）；压缩检查点仍自动写 |
+
+> 为什么压缩后要「等」：实测压缩 02:05:51 → 模型 02:06:53(+62s) 继续跑 → 重灌块 02:07:48(+117s) 才注入，前 55 秒是在失忆状态下思考。4.5 让宿主在下一次请求前等检查点写好（writer 实测 75.6 秒，上限 120 秒），超时自动降级、绝不卡会话。
 
 ### 6️⃣ 主动提醒：在你犯同样错误之前
 
@@ -95,6 +105,8 @@ node <插件目录>/memtopic/src/split-oversized.mjs <db路径> --limit=40000 --
 | B 重复错误 | 同一错误再次出现 |
 | C 连续失败 | 同一步连续失败 |
 | E/W 循环空转 | 重复占比 / 负面占比超阈值；长时间无介入 |
+| 会话笔记 | 上下文占用每跨 **15%** 提醒一次（15/30/45/60/75/90%；同会话 60s 冷却；压缩后从 15% 重来） |
+| 流式退化熔断 | 生成中途检测到同一句重复 ≥20 次 ⇒ **立即 cancel 本次生成**（不等整条消息落地） |
 | 熔断 | 同指纹反复失败 ⇒ 停轮 / 停手 |
 
 阈值可调（`dsh_spiral_thresh`），面板可见各类计数。
@@ -106,9 +118,9 @@ DeepSeek 前缀缓存命中 **0.1 元/百万 tokens**，未命中 **1 元**—�
 
 ### 8️⃣ 看得见：设置页 / 统计面板 / 知识图谱
 
-- **设置 → 通用设置 → 记忆**：开关、漏网策略、阈值、用量
+- **设置 → 通用设置 → 记忆**：开关、阈值、用量、**子代理摘要回溯天数**
 - **统计面板** `http://127.0.0.1:<端口>/dsh-memory/stats`：主题/句子规模、状态分布、TOP 命中、近 30 天事件量、熔断与告警计数
-- **知识图谱**（统计面板内页签）：三级树 + 触发词/来源边，可交互缩放搜索；数据接口 `/dsh-memory/graph.json`
+- **知识图谱**（统计面板内页签）：三级树 + 触发词/来源边，可交互缩放搜索；节点带 `kind`（笔记 / 检查点 / 普通主题**三色区分**）；数据接口 `/dsh-memory/graph.json`
 
 ---
 
@@ -126,7 +138,7 @@ irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | i
 curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.sh | bash
 ```
 
-装完**重启 DSH**；启动日志出现 `[dsh-memory]` 与版本号即成功。
+装完**重启 DSH**；启动日志出现 `[dsh-memory] 就绪 v4.5（构建 <8 位指纹>）` 即成功。
 
 安装器做的事（每步可复跑、幂等）：
 
@@ -136,7 +148,8 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 3. 备份旧插件到 `_backup-<时间戳>/`，写入 `index.js` + `memtopic/src/*.mjs`；
 4. 设置界面（`client/**`）装到 `plugins/dsh-memory-client/` 并注册 `- id: dsh-memory-client`；
 5. 新用户写 `.config.json`（`memoryTopicDbEnabled: true`）+ `AGENTS.md` v4 记忆协议；
-6. 检测到旧 md 记忆库未迁移 ⇒ 先保持 md 模式（行为零变化）+ 登记 `migrate-pending.json`，**下次启动自动迁移**。
+6. 检测到旧 md 记忆库未迁移 ⇒ 先保持 md 模式（行为零变化）+ 登记 `migrate-pending.json`，**下次启动自动迁移**；
+7. **升级用户**：`AGENTS.md` 若仍是原始 v4 模板（sha256 `45463dd5…`）⇒ **自动替换为新版**；你改过的保留并提示（不覆盖）。**4.0.x → 4.5 无需迁移数据**。
 
 显式指定 profile：`-ProfileName desktop`（sh：`--profile desktop`）。
 
@@ -150,6 +163,8 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 ## 四、从 3.x 升级
 
 4.0 是**破坏性变更**，三处行为变了。**数据不会丢**（md 原样保留，只是不再当真源读）。
+
+> **已经是 4.0.x？** 不用做下面的 md 迁移：重跑安装命令 + 重启 DSH 即可，**主题库数据原样保留**；`AGENTS.md` 若仍是原始 v4 模板会被自动替换，你改过的保留并提示。行为变化与逐步验证见[迁移指南第 6 节](docs/迁移指南.md)。
 
 | 变化 | 你会感觉到 | 怎么办 |
 |---|---|---|
@@ -174,40 +189,43 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 
 ## 五、日常使用
 
-装好后基本什么都不用做：AI 会自己 `memory_write` 沉淀、`memory_search` 检索、会话结束 `memory_archive_checkpoint` 归档。
+装好后基本什么都不用做：AI 会自己 `memory_write` 沉淀、`memory_search` 检索、随时 `memory_note` 记会话笔记（压缩时自动写检查点，并在压缩后拦截式重灌）。
 
 ### 斜杠命令（7 个）
 
 | 命令 | 作用 |
 |---|---|
-| `/dream` | 手动触发记忆整合（归档 → 提升 → 去重 → 收敛） |
+| `/dream` | 手动触发记忆整合（笔记提炼 → 提升 → 去重 → 收敛） |
 | `/memory-search <词>` | 检索主题库；`-u` 关闭结果回传到会话 |
 | `/session-search <词>` | 回查原始会话日志里的精确字面量（GUID/路径/报错串） |
 | `/memory-migrate` | 老记忆迁移报告；`--apply` 执行 |
 | `/memory-init` | 重走记忆初始化引导 |
 | `/memory-update` | 检查插件新版本 |
-| `/subagents-archive` | 归档漏网子代理会话 |
+| `/subagents-archive` | **已下线（4.5）**：子代理摘要通道退役，只回一条提示；查子代理会话用 `session_search` |
 
-### 工具（13 个）
+### 工具（12 个，另有 2 个 dream 专用）
 
 | 分组 | 工具 |
 |---|---|
 | 检索 | `memory_search` `memory_read` `memory_topics` `session_search` |
-| 写入 | `memory_write` `memory_archive_checkpoint` |
+| 写入 | `memory_write` `memory_note` |
 | 整理 | `memory_dream_patch` `memory_size_preview` `memory_export` |
-| 维护 | `stale_archive` `memory_onboard` `dsh_spiral_thresh` `dsh_maint_thresh` |
+| 维护 | `memory_onboard` `dsh_spiral_thresh` `dsh_maint_thresh` |
+
+> `memory_split_topic` / `memory_review_topic` 仅 **dream 整合子代理**可用（普通会话调用返回 `DREAM_ONLY`），用于按语义分片主题、裁决待审队列。
 
 ### 记忆数据在哪
 
 ```
-~/.dsh/memory/
-├── .memtopic/mem.db        # ★唯一真源：主题库（主题/句子/触发词/三级结构/审计）
-├── .config.json            # 插件开关（memoryTopicDbEnabled 等）
-├── AGENTS.md               # 人工稳定层：会话自动注入的记忆协议（定稿不改）
-├── global.md / index.md    # 人工稳定层：可直接编辑（实质变化才动，别更新时间戳）
-├── _export/<日期>/         # 导出快照（只读）
-├── projects/ sessions/ knowledge/ tools/   # 导出视图（由主题库导出，勿手写）
-└── .memtopic/migrate-pending.json          # 待迁移登记（迁移成功后自动删除）
+~/.dsh/
+├── AGENTS.md               # 人工稳定层：会话自动注入的记忆协议（定稿不改；在 memory 同级）
+└── memory/
+    ├── .memtopic/mem.db        # ★唯一真源：主题库（主题/句子/触发词/三级结构/审计）
+    ├── .config.json            # 插件开关（memoryTopicDbEnabled 等）
+    ├── global.md / index.md    # 人工稳定层：可直接编辑（实质变化才动，别更新时间戳）
+    ├── _export/<日期>/         # 导出快照（只读）
+    ├── projects/ sessions/ knowledge/ tools/   # 导出视图（由主题库导出，勿手写）
+    └── .memtopic/migrate-pending.json          # 待迁移登记（迁移成功后自动删除）
 ```
 
 ---
@@ -217,6 +235,8 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 **AI 读不到 `projects/xxx.md` 了？** 那是导出视图，真源在主题库。让它 `memory_read <主题名>` 或 `memory_search <关键词>`——更准（跨文件命中、带来源）。`global.md` / `index.md` / `_export/**` / `sessions/**` / `tools/**` 不受限。
 
 **主题超限了怎么办？** 见「容量三档治理」的 `split-oversized.mjs`；明细/索引类提示可以忽略（它们本来就不该被反复催）。
+
+**升级 4.5 后工具/命令变了？** `memory_archive_checkpoint`、`stale_archive` 已随漏网归档链删除；`/subagents-archive` 只回一条下线提示（查子代理会话用 `session_search`）；新增 `memory_note`。**数据不需要迁移**，详见[迁移指南第 6 节](docs/迁移指南.md)。
 
 **装了但没生效 / 工具没出现**
 
@@ -252,8 +272,8 @@ irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/fix-cordis-patc
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `staleSessionDays` | `5` | 超过 N 天没交互的会话提醒归档 |
-| `staleAction` | `remind` | 漏网会话处理：仅提醒 / 后台自动归档 / 需确认后归档 |
+| `staleSessionDays` | `5` | **子代理摘要回溯天数**（4.5 起面板改名；不再是「漏网会话」检测阈值，漏网归档链已删除） |
+| `staleAction` | `remind` | **已废弃（4.5）**：面板控件已删除、无行为分支；仅为兼容旧配置保留，改它没有效果 |
 | `integrateEnabled` | `false` | 是否开启定期自动整合（默认手动 `/dream`） |
 | `monitorEnabled` | `true` | 使用监控（提醒/检索统计） |
 | `memoryTopicDbEnabled` | `true`（新装） | 主题库开关，真值在 `.config.json`；关掉立即回退 md 模式 |

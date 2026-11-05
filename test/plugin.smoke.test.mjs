@@ -97,7 +97,9 @@ const run = async () => {
   console.log("装配：插件能被真 import，工具/命令都挂上");
   const s = await startPlugin(false);
   report("import + apply 不抛异常", null);
-  for (const tn of ["memory_search", "stale_archive", "dsh_spiral_thresh", "memory_onboard"]) {
+  // ★ 2026-11-04（用户指令「把漏网归档去掉」）：`stale_archive` / `memory_archive_checkpoint` 两个工具随归档链删除，
+  //   不再出现在注册清单里（本清单只保留存活工具）。
+  for (const tn of ["memory_search", "dsh_spiral_thresh", "memory_onboard"]) {
     ts2("工具已注册：" + tn, !!tool(s.ctx, tn));
   }
   for (const cn of ["dream", "memory-init", "memory-update", "memory-search", "session-search", "subagents-archive"]) {

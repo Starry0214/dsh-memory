@@ -250,7 +250,8 @@ if ($env:DSH_MEMORY_LOCAL -and -not $LocalPayload) { $LocalPayload = $env:DSH_ME
 # SHA256 见 docs/AGENTS.template.v3.md 与 v3 安装器内嵌文本 —— 三者同源，已实测同 sha）。
 $AGENTS_LEGACY_SHA = @(
   'c7de0f75062511ac13321de6a321dab7f6aef89969d24eb31f55a1781c8a529e',  # v3 模板（repo / install.ps1 / install.sh 内嵌均相同）
-  '3ffc27938d118a5db6cbe3b48242ee30a17ee73694ea2349a2e5f246062c4365'   # v3 pre-fixedrm 变体
+  '3ffc27938d118a5db6cbe3b48242ee30a17ee73694ea2349a2e5f246062c4365',  # v3 pre-fixedrm 变体
+  '45463dd54b87c890bd7fd8e11a96a80ebeab96ffb597c77a93d8247d1d662e58'   # v4 原模板（4.0.1 时代，无 memory_note）→ 4.5 升级时自动替换为含会话笔记的新模板
 )
 $AGENTS_V4_MARKER = 'dsh-memory-agents-template: v4'
 
@@ -987,7 +988,15 @@ function Get-AgentsState([string]$DshHome) {
   $r.Bytes = (Get-Item -LiteralPath $path).Length
   $noBom = $raw
   if ($noBom.Length -gt 0 -and $noBom[0] -eq [char]0xFEFF) { $noBom = $noBom.Substring(1) }
-  if ($noBom -match [regex]::Escape($AGENTS_V4_MARKER)) { $r.State = 'v4'; return $r }
+  if ($noBom -match [regex]::Escape($AGENTS_V4_MARKER)) {
+    # [4.5] v4 协议分两代：4.0.1 时代的 v4 模板（sha 在白名单）可安全升级到 4.5；
+    #   用户改过的（sha 不匹配）保留不动 —— 与 install.sh 同口径。
+    $normV4 = Get-NormalizedAgentsText $noBom
+    $shaV4 = Get-Sha256Text $normV4
+    $r.Sha = $shaV4
+    if ($AGENTS_LEGACY_SHA -contains $shaV4) { $r.State = 'legacy-v4'; return $r }
+    $r.State = 'v4'; return $r
+  }
   $norm = Get-NormalizedAgentsText $noBom
   $sha = Get-Sha256Text $norm
   $r.Sha = $sha
@@ -1009,8 +1018,18 @@ function Update-AgentsFile([string]$DshHome, [string]$TemplatePath) {
     $r.Action = 'created'
     return $r
   }
-  if ($state.State -eq 'v4') { $r.Action = 'current'; return $r }
-  if ($state.State -eq 'legacy-v3') {
+  if ($state.State -eq 'v4') {
+    # [CRA M4 修复 2026-11-05] v4 marker ≠ 4.5 模板：用户可能小改过 4.0.1 的 v4 文件（sha 不匹配白名单），
+    #   此时既不该谎报「已是 v4 协议（跳过）」，也不该覆盖。与 payload 模板逐字比对后给准确提示。
+    $tplSha = Get-Sha256Text (Get-NormalizedAgentsText $tpl)
+    if ($state.Sha -eq $tplSha) { $r.Action = 'current'; return $r }
+    $r.Action = 'v4-older'
+    $r.Detail = 'AGENTS.md 是 v4 协议但内容非 4.5 模板（被改过）→ 保留不动；如需 memory_note 会话笔记协议，请按 payload 内 AGENTS.template.md 手工合并'
+    return $r
+  }
+  if ($state.State -eq 'legacy-v3' -or $state.State -eq 'legacy-v4') {
+    # [4.5] legacy-v3（旧 md 协议）与 legacy-v4（4.0.1 时代 v4 模板，无 memory_note）都走升级：
+    #   先备份原文件，再用 payload 内的新模板覆盖；用户改过的文件在 Get-AgentsState 里已判为 v4/user-modified，不会进这里。
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $bak = $r.Path + '.bak-' + $stamp
     Copy-Item -LiteralPath $r.Path -Destination $bak -Force
@@ -2122,6 +2141,9 @@ function Invoke-CheckMode {
     if ($reg.Found -and $reg.Kind -eq 'package' -and (-not $junction.Exists -or -not $junction.IsLink -or -not $junction.Matches)) { $issues += ('[' + $c.Name + '] junction 缺失/不匹配 → 重跑安装器') }
   }
   if ($agents.State -eq 'legacy-v3') { $issues += 'AGENTS.md 仍是 v3 → 重跑安装器自动升级 v4' }
+  # [CRA M2 修复 2026-11-05] -CheckOnly 必须能看见 legacy-v4：否则 4.0.1 未改用户会被报成「无法读取」，
+  #   而这正是文档推荐给老用户的验证入口。
+  if ($agents.State -eq 'legacy-v4') { $issues += 'AGENTS.md 是 4.0.1 时代 v4 模板（无会话笔记 memory_note）→ 重跑安装器自动升级 v4.5（会先备份）' }
   if ($detect -and $detect.Ok) {
     $needs = ConvertTo-Boolish (Get-PropValue $detect.Json 'needsMigration')
     if ($needs) { $issues += '旧 md 记忆需要迁移 → -Migrate（DSH 运行中会登记为"重启后自动迁移"）' }

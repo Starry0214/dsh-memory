@@ -25,3 +25,25 @@ _*-boot-*.mjs
 
 # 一次性补丁脚本（old/new 字符串替换，含个人绝对路径，不入库）
 _spec-*.json
+
+# 根目录一次性临时脚本 / 探针（_xxx.mjs、_base-*.txt、_f-_test-*.txt 等）
+/_*.mjs
+/_*.txt
+/_*.json
+/_*.md
+
+# 只读诊断探针目录（_verify/_q-*.mjs 等，不进仓库；deploy-manifest 之类历史产物也在此）
+_verify/
+
+# 编辑器/工具备份
+*.bak
+*.bak-*
+*.pre-*.bak.js
+*.retired
+_tmp-*
+
+# 一次性分析产物（B5/B6/B7 系列 CSV、事故归档草稿等，不入库）
+docs/*.csv
+docs/事故-*.md
+docs/冻结清单-*.md
+docs/变体矩阵-*.md
