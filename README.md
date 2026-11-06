@@ -2,7 +2,7 @@
 
 让 DeepSeek Harness（DSH）真正**记住你**：跨会话、跨项目。装好后每个新会话自动带上你的画像、偏好和最近进展，AI 不用每次都从零开始。
 
-**v4.5** ｜ 记忆真源 = **SQLite 主题库**（`.memtopic/mem.db`）｜ md 只剩「人工稳定层」与「导出视图」
+**v4.5.1** ｜ 记忆真源 = **SQLite 主题库**（`.memtopic/mem.db`）｜ md 只剩「人工稳定层」与「导出视图」
 
 > **4.5 更新**：会话笔记 `memory_note`（默认动作 + 15% 档位提醒）｜ 压缩后**拦截式重灌**（不再有失忆窗口）｜ 检查点/笔记/项目/画像**四段注入**（6100 字上限）｜ 流式文本退化熔断 ｜ 漏网归档链整体移除（-2860 行）。
 > 从 4.0.x 升级：重跑安装命令 + 重启 DSH 即可，**无需迁移数据**（见[迁移指南](docs/迁移指南.md)）。
@@ -93,7 +93,7 @@ node <插件目录>/memtopic/src/split-oversized.mjs <db路径> --limit=40000 --
 | 压缩后（下一次请求前） | **拦截式重灌**：先等检查点写好（上限 120 秒，可中止），再一次性补回**四段**——检查点 2400 + 会话笔记 1900 + 项目 1150 + 画像 350（body 合计 5800，整块上限 6100 字）；带「以本段为准」优先级标注与截断恢复指针 |
 | 会话进行中（随时） | 主 agent 用 `memory_note` 写本会话笔记（append-only、不进上下文；dream 整合时提炼进长期库） |
 | 日摘要过期（>N 天） | 库内 `archiveTopic(pointer:true)`：状态置 archived、父主题留指针，**原文仍可 `memory_read`** |
-| 会话结束 | 4.5 起**没有**自动归档工具：关键内容用 `memory_write`（长期）/ `memory_note`（暂存）；压缩检查点仍自动写 |
+| 会话结束 | 4.5 起**没有**自动归档工具：关键内容用 `memory_note`（主代理唯一写入口；`memory_write` 仅 dream 可用）；压缩检查点仍自动写 |
 
 > 为什么压缩后要「等」：实测压缩 02:05:51 → 模型 02:06:53(+62s) 继续跑 → 重灌块 02:07:48(+117s) 才注入，前 55 秒是在失忆状态下思考。4.5 让宿主在下一次请求前等检查点写好（writer 实测 75.6 秒，上限 120 秒），超时自动降级、绝不卡会话。
 
@@ -138,7 +138,7 @@ irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.ps1 | i
 curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.sh | bash
 ```
 
-装完**重启 DSH**；启动日志出现 `[dsh-memory] 就绪 v4.5（构建 <8 位指纹>）` 即成功。
+装完**重启 DSH**；启动日志出现 `[dsh-memory] 就绪 v4.5.1（构建 <8 位指纹>）` 即成功。
 
 安装器做的事（每步可复跑、幂等）：
 
@@ -189,7 +189,7 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 
 ## 五、日常使用
 
-装好后基本什么都不用做：AI 会自己 `memory_write` 沉淀、`memory_search` 检索、随时 `memory_note` 记会话笔记（压缩时自动写检查点，并在压缩后拦截式重灌）。
+装好后基本什么都不用做：AI 会自己 `memory_note` 记会话笔记、`memory_search` 检索（长期库由 dream 整合时维护；`memory_write` 仅 dream 可用），压缩时自动写检查点并在压缩后拦截式重灌。
 
 ### 斜杠命令（7 个）
 
@@ -208,11 +208,12 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 | 分组 | 工具 |
 |---|---|
 | 检索 | `memory_search` `memory_read` `memory_topics` `session_search` |
-| 写入 | `memory_write` `memory_note` |
-| 整理 | `memory_dream_patch` `memory_size_preview` `memory_export` |
+| 写入 | `memory_note`（主代理唯一写入口）· `memory_write`（仅 dream） |
+| 整理 | `memory_dream_patch`（仅 dream）· `memory_size_preview` `memory_export` |
 | 维护 | `memory_onboard` `dsh_spiral_thresh` `dsh_maint_thresh` |
 
-> `memory_split_topic` / `memory_review_topic` 仅 **dream 整合子代理**可用（普通会话调用返回 `DREAM_ONLY`），用于按语义分片主题、裁决待审队列。
+> **写入通道（4.5.1 起收紧）**：`memory_write` 仅 dream 整合子代理可用——主代理 / 普通子代理 / teammate 调用返回 `ok:false, code=WRITE_DREAM_ONLY`，主代理改用 `memory_note`（append-only 会话笔记，dream 整合时提炼进长期库）。
+> `memory_dream_patch` 同为主代理不可调用（被 `tools/pre-execute` 拒绝）；`memory_split_topic` / `memory_review_topic` 仅 **dream 整合子代理**可用（普通会话调用返回 `DREAM_ONLY`），用于按语义分片主题、裁决待审队列。
 
 ### 记忆数据在哪
 

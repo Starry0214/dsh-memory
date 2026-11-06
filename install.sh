@@ -340,6 +340,7 @@ if [ "$MODE" = "check" ]; then
   # [CRA M3 修复 2026-11-05] --check 段在下方（L610 附近）之前执行：归一化函数与旧 v4 sha 必须**先**定义，
   #   否则 v4 分代判断会因「命令不存在 / 变量为空」静默失效 → 把待升级用户反向错报成 OK v4 协议。
   LEGACY_SHA_3="45463dd54b87c890bd7fd8e11a96a80ebeab96ffb597c77a93d8247d1d662e58"
+  LEGACY_SHA_4="2de634f589f042f970826883368af374ff25f8159c94150996ff37222186b066"
   sha_of_normalized() { # strip BOM/CR, trailing spaces, trailing blank lines -> sha256
     f="$1"; tmp0="$WORK/norm0.txt"; tmp="$WORK/norm.txt"
     bom="$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')"
@@ -356,8 +357,8 @@ if [ "$MODE" = "check" ]; then
       # [CRA M3 修复 2026-11-05] v4 分两代：--check 必须能分辨「4.0.1 旧模板（待升级）」与「已是最新」，
       #   否则会把待升级的用户报成 OK v4 协议（反向错报）。
       h="$(sha_of_normalized "$ag")" || h=""
-      if [ "$h" = "$LEGACY_SHA_3" ]; then
-        warn "AGENTS.md：v4 旧模板（4.0.1 时代，无会话笔记）→ 重跑安装器自动升级 v4.5（会先备份）"
+      if [ "$h" = "$LEGACY_SHA_3" ] || [ "$h" = "$LEGACY_SHA_4" ]; then
+        warn "AGENTS.md：v4 旧模板（4.0.1 / 4.5.0 时代）→ 重跑安装器自动升级 v4.5.1（会先备份）"
       else
         ok "AGENTS.md：v4 协议"
       fi
@@ -617,6 +618,8 @@ LEGACY_SHA_1="c7de0f75062511ac13321de6a321dab7f6aef89969d24eb31f55a1781c8a529e"
 LEGACY_SHA_2="3ffc27938d118a5db6cbe3b48242ee30a17ee73694ea2349a2e5f246062c4365"
 # v4 原模板（4.0.1 时代，无 memory_note）→ 4.5 升级时自动替换为含会话笔记的新模板
 LEGACY_SHA_3="45463dd54b87c890bd7fd8e11a96a80ebeab96ffb597c77a93d8247d1d662e58"
+# v4.5.0 模板（含 memory_note，但 memory_write 仍对主代理开放）→ 4.5.1 升级为「主代理只写 memory_note」
+LEGACY_SHA_4="2de634f589f042f970826883368af374ff25f8159c94150996ff37222186b066"
 sha_of_normalized() { # strip BOM/CR, trailing spaces, trailing blank lines -> sha256
   f="$1"; tmp0="$WORK/norm0.txt"; tmp="$WORK/norm.txt"
   bom="$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')"
@@ -634,12 +637,12 @@ elif grep -q 'dsh-memory-agents-template: v4' "$ag"; then
   h="$(sha_of_normalized "$ag")" || h=""
   tpl_h="$(sha_of_normalized "$tpl")" || tpl_h=""
   if [ -n "$tpl_h" ] && [ "$h" = "$tpl_h" ]; then
-    ok "AGENTS.md 已是最新 v4.5 协议（含会话笔记）"
-  elif [ "$h" = "$LEGACY_SHA_3" ]; then
+    ok "AGENTS.md 已是最新 v4.5.1 协议（主代理只写 memory_note）"
+  elif [ "$h" = "$LEGACY_SHA_3" ] || [ "$h" = "$LEGACY_SHA_4" ]; then
     cp -f "$ag" "$ag.bak-$(date +%Y%m%d_%H%M%S)"
-    cp -f "$tpl" "$ag" && ok "AGENTS.md 已从 v4 升级为 v4.5（新增会话笔记协议，已备份）"
+    cp -f "$tpl" "$ag" && ok "AGENTS.md 已升级为 v4.5.1（写入通道收紧为 memory_note，已备份）"
   else
-    warn "AGENTS.md 是 v4 协议但非 4.5 模板（被改过）→ 保留不动；如需 memory_note 会话笔记协议，请按 payload 内 AGENTS.template.md 手工合并"
+    warn "AGENTS.md 是 v4 协议但非 4.5.1 模板（被改过）→ 保留不动；如需「主代理只写 memory_note」协议，请按 payload 内 AGENTS.template.md 手工合并"
   fi
 else
   h="$(sha_of_normalized "$ag")" || h=""

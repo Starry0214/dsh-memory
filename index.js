@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.0";
+const PLUGIN_VERSION = "4.5.1";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -5670,14 +5670,54 @@ const TEXT_DEG_MAX_UNIQ_RATIO = 0.25;
 // 熔断档：重复次数到这个量级已不是"措辞啰嗦"，而是彻底空转（真机样本 maxN=825）。
 //   低于此档只提醒；达到此档直接 agent.cancel —— 宿主 AgentCancelCause 有专门的 `{kind:'hook'}`。
 const TEXT_DEG_CANCEL_REPEAT = 50;
+// ═══ [熔断补漏 2026-11-05] 短行退化判定（既有两条路径的盲区）═══
+// 实证：本会话两次失控输出都是 **「做。」×数百行**（每行 2 字符）——而 detectTextDegeneration /
+//   textStreamTailRepeat 都有一行 `if (s.length < 6) continue;`（为排除「- 是」「| 否 |」这类噪声），
+//   短行被整批丢弃 ⇒ rows 恒空 ⇒ 行数闸永远不过 ⇒ **熔断代码在跑但永不命中**（monitor 无
+//   text-degeneration 事件，容易被误判成"代码没被调用"）。单测复现：300 行「做。」两条路径都返回 null。
+// 判据刻意定得很严，正常文本不可能同时满足：短行 ≥30 行 + 单行重复 ≥25 次 + 该行占短行 ≥85%。
+// 排除纯符号行（`}`、`---`、`|` 等代码/表格残片）——按 Unicode 字母/数字判定，避免把代码块算进去。
+const TEXT_SHORT_MIN_ROWS = 30;
+const TEXT_SHORT_MIN_REPEAT = 25;
+const TEXT_SHORT_MIN_DOMINANCE = 0.85;
+// [CRA 2026-11-06] 取消档单独给短行定：短行单行成本低（2 字符），但 40 次已是明显空转；
+//   若不设这档，短行退化只能走"消息级 50 次"门槛 ⇒ 25~49 次只提醒不熔断，白烧。
+const TEXT_SHORT_CANCEL_REPEAT = 40;
+function shortLineRepeat(text) {
+  const rows = [];
+  for (const raw of String(text).split("\n")) {
+    const s = raw.replace(/\s+/g, " ").trim();
+    if (!s || s.length >= 6) continue;             // 长行归既有路径，这里只管短行
+    if (!/[\p{L}\p{N}]/u.test(s)) continue;        // 纯符号行不算（代码 } / 表格分隔 / 纯横线）
+    rows.push(s);
+  }
+  if (rows.length < TEXT_SHORT_MIN_ROWS) return null;
+  const cnt = new Map();
+  for (const r of rows) cnt.set(r, (cnt.get(r) || 0) + 1);
+  let maxN = 0, maxLine = "";
+  for (const [k, v] of cnt) if (v > maxN) { maxN = v; maxLine = k; }
+  if (maxN < TEXT_SHORT_MIN_REPEAT) return null;
+  if (maxN / rows.length < TEXT_SHORT_MIN_DOMINANCE) return null;
+  return {
+    kind: "short", rows: rows.length, uniq: cnt.size, maxN: maxN, maxLine: maxLine.slice(0, 60),
+    ratio: Math.round((1 - cnt.size / rows.length) * 100), chars: String(text).length,
+    cancelWorthy: maxN >= TEXT_SHORT_CANCEL_REPEAT,
+  };
+}
+
 function detectTextDegeneration(blocks) {
   try {
     const arr = Array.isArray(blocks) ? blocks : [];
     for (const b of arr) {
       if (!b || (b.type !== "reasoning" && b.type !== "text")) continue;
       const txt = String(b.text || "");
-      if (txt.length < 400) continue;   // 太短不可能是退化；400 而非 800：早期退化可能只有几十行短句（20 行×14 字≈560），
-                                        //   等到 800 字才判就晚了。行数闸（≥20）+ 重复闸（≥10）+ 唯一率（≤25%）已足够防误报。
+      // [CRA 2026-11-06] 短行退化可能只有几百字符（100 行「做。」= 300 字符）⇒ 400 字下限不能挡短行路径，
+      //   否则「<400 字只提醒不熔断」这条缝永远补不上。长行路径仍保留 400 字下限。
+      if (txt.length < 400) {
+        const sh0 = shortLineRepeat(txt);
+        if (sh0) return sh0;
+        continue;
+      }
       const rows = [];
       for (const raw of txt.split("\n")) {
         const s = raw.replace(/\s+/g, " ").trim();
@@ -5686,15 +5726,22 @@ function detectTextDegeneration(blocks) {
         if (/^[-*+]\s*$/.test(s)) continue;
         rows.push(s);
       }
-      if (rows.length < TEXT_DEG_MIN_ROWS) continue;
-      const cnt = new Map();
-      for (const r of rows) cnt.set(r, (cnt.get(r) || 0) + 1);
-      let maxN = 0, maxLine = "";
-      for (const [k, v] of cnt) if (v > maxN) { maxN = v; maxLine = k; }
-      if (maxN < TEXT_DEG_MIN_REPEAT) continue;
-      const uniqRatio = cnt.size / rows.length;
-      if (uniqRatio > TEXT_DEG_MAX_UNIQ_RATIO) continue;
-      return { kind: b.type, rows: rows.length, uniq: cnt.size, maxN: maxN, maxLine: maxLine.slice(0, 60), ratio: Math.round((1 - uniqRatio) * 100), chars: txt.length };
+      // [CRA 2026-11-06 修复] 长行路径**不再短路**短行路径：真机退化常见「若干长句 + 大量短行」混排，
+      //   旧写法 `if (rows.length < 20) { …; continue; }` 会让「20 长行 + 30 行『是』」两条路径都判不出。
+      let longHit = null;
+      if (rows.length >= TEXT_DEG_MIN_ROWS) {
+        const cnt = new Map();
+        for (const r of rows) cnt.set(r, (cnt.get(r) || 0) + 1);
+        let maxN = 0, maxLine = "";
+        for (const [k, v] of cnt) if (v > maxN) { maxN = v; maxLine = k; }
+        const uniqRatio = cnt.size / rows.length;
+        if (maxN >= TEXT_DEG_MIN_REPEAT && uniqRatio <= TEXT_DEG_MAX_UNIQ_RATIO) {
+          longHit = { kind: b.type, rows: rows.length, uniq: cnt.size, maxN: maxN, maxLine: maxLine.slice(0, 60), ratio: Math.round((1 - uniqRatio) * 100), chars: txt.length };
+        }
+      }
+      if (longHit) return longHit;
+      const sh = shortLineRepeat(txt);
+      if (sh) return sh;
     }
   } catch (e) { /* 检测失败不影响主流程 */ }
   return null;
@@ -5717,14 +5764,18 @@ function textStreamTailRepeat(text) {
     if (/^\|?[\s:|-]+\|?$/.test(s)) continue;   // markdown 表格分隔行
     rows.push(s);
   }
-  if (rows.length < 15) return null;
-  const cnt = new Map();
-  for (const r of rows) cnt.set(r, (cnt.get(r) || 0) + 1);
-  let maxN = 0, maxLine = "";
-  for (const [k, v] of cnt) if (v > maxN) { maxN = v; maxLine = k; }
-  if (maxN < TEXT_STREAM_CANCEL_REPEAT) return null;
-  if (cnt.size / rows.length > 0.3) return null;
-  return { maxN: maxN, maxLine: maxLine.slice(0, 50), rows: rows.length };
+  // [CRA 2026-11-06 修复] 长行分支算完若没命中，**仍要**走短行分支（不再按"长行数量"短路）：
+  //   真机退化常是「若干长句 + 大量短行」混排，「20 长行 + 30 行『是』」旧写法两条路径都判不出。
+  if (rows.length >= 15) {
+    const cnt = new Map();
+    for (const r of rows) cnt.set(r, (cnt.get(r) || 0) + 1);
+    let maxN = 0, maxLine = "";
+    for (const [k, v] of cnt) if (v > maxN) { maxN = v; maxLine = k; }
+    if (maxN >= TEXT_STREAM_CANCEL_REPEAT && cnt.size / rows.length <= 0.3) {
+      return { maxN: maxN, maxLine: maxLine.slice(0, 50), rows: rows.length };
+    }
+  }
+  return shortLineRepeat(text);   // [熔断补漏 2026-11-05] 短行重复退化（「做。」这类 2 字符行）
 }
 export { textStreamTailRepeat as __textStreamTailRepeat };
 // [note 提醒 2026-11-05] 自测入口（纯函数，无副作用）：档位判定 / 重置 / 文案
@@ -7286,6 +7337,39 @@ function topicDbGenericTag(t, { sep = " " } = {}) {
   const g = topicDbGenericTriggers(t);
   return g.length ? sep + "[泛化已忽略: " + g.join(", ") + "]" : "";
 }
+/** ═══ [续期接线 2026-11-06] 检索命中 ⇒ markHit（决策 13「被命中就不降级」）═══
+ * 缺口实证：`markHit` 早就在 memory-store.mjs#1596 实现，但**全仓 0 调用方** ⇒ `last_hit_at` 573/573 为 NULL
+ *   ⇒ lifecycle.isRenewed() 恒 false ⇒ 曝光阶梯只能按 stateSince/createdAt 走 ⇒ 90 天后按**创建日期**批量归档
+ *   （实测 2027-01-27 一天归档 338 条）。这是所有老化逻辑的地基：没有"使用"信号，任何老化策略都是按时间戳瞎猜。
+ * 什么算"使用"：只有**检索命中**（memory_search 工具、压缩后事实包 P1 的内部检索、memory_read 显式读取）。
+ *   **不算**：注入切片（topicDbRegistrySlice 每会话固定 12 条候选）、memory_topics 列表浏览——那是候选集不是使用，
+ *   算进去会让每个主题每会话都"续期"，等于把续期机制废掉。
+ * 节流：同主题 1 小时内只记一次（检索很频繁，逐次写库会放大写放大 + audit 噪声）。
+ * 失败纪律：记录命中失败**绝不影响检索结果**（try/catch 吞掉，只留 monitor 痕迹）。
+ */
+const HIT_DEDUPE_MS = 60 * 60 * 1000;
+const HIT_LAST = new Map();   // id -> 上次记命中的本地毫秒（readTopic 不返回 lastHitAt，靠它兜住同进程重复记）
+function markTopicHits(store, list, why) {
+  try {
+    if (!store || typeof store.markHit !== "function" || !Array.isArray(list) || !list.length) return 0;
+    const now = Date.now();
+    if (HIT_LAST.size > 2000) HIT_LAST.clear();   // 上限防长驻增长（同 PLUGIN_SUBAGENT_SIDS 手法）
+    let n = 0;
+    for (const h of list) {
+      const t = (h && h.topic) || h || {};
+      const id = t && t.id;
+      if (!id) continue;
+      const local = HIT_LAST.get(id);
+      if (local != null && now - local < HIT_DEDUPE_MS) continue;          // 同进程 1h 内已记过
+      const last = t.lastHitAt != null ? Number(t.lastHitAt) : null;
+      if (last != null && now - last < HIT_DEDUPE_MS) { HIT_LAST.set(id, last); continue; }   // 跨重启也认
+      try { store.markHit(id, { actor: "runtime" }); HIT_LAST.set(id, now); n += 1; }
+      catch (e) { try { monitorEvent("intent", "markhit-error " + id + " " + String((e && e.message) || e).slice(0, 80)); } catch (e2) { } }
+    }
+    if (n) { try { monitorEvent("intent", "hit-renew " + String(why || "") + " n=" + n); } catch (e3) { } }
+    return n;
+  } catch (e) { return 0; }
+}
 /** 主题检索：名字/别名/triggers 命中加权 + 正文行命中；返回 { hits, conflicts } */
 function topicDbSearchTopics(store, q, { maxTopics = 6 } = {}) {
   const tokens = topicDbTokens(q);
@@ -7317,6 +7401,8 @@ function topicDbSearchTopics(store, q, { maxTopics = 6 } = {}) {
     const conf = store.queryTriggerConflicts();
     conflicts = (conf.conflicts || []).filter((c) => tokens.some((tk) => String(c.trigger).toLowerCase().includes(tk) || c.norm.includes(tk)));
   } catch (e) { conflicts = []; }
+  // [续期接线 2026-11-06] 真正"命中"的才算使用：只记返回给调用方的 top-N（不记全部候选）。
+  try { markTopicHits(store, hits, "search"); } catch (eH) { }
   return { hits, conflicts };
 }
 /** memory_search 主题块渲染（受字符预算；同主题多条命中合并成一块） */
@@ -7453,7 +7539,7 @@ function topicDbRedact(s) {
 //      global.md / index.md / AGENTS.md 永不加；已有标记不重复加。
 //   ③ 导入侧（memtopic/src/import.mjs）恒定忽略该标记行 ⇒ 标记行永远不会被当正文句导入（数据安全硬约束）。
 const TOPICDB_MARK_MD_PREFIX = "<!-- dsh-memory:";
-const TOPICDB_MARK_MD_LINE = TOPICDB_MARK_MD_PREFIX + " 本文件由主题库维护，手工修改不会生效；改动请用 memory_write / memory_dream_patch -->";
+const TOPICDB_MARK_MD_LINE = TOPICDB_MARK_MD_PREFIX + " 本文件由主题库维护，手工修改不会生效；长期库改动由 dream 整合（memory_dream_patch）完成，主代理用 memory_note -->";
 const TOPICDB_MARK_MD_PROTECTED = new Set(["global.md", "index.md", "agents.md"]);   // 人工稳定层：永不标记
 const TOPICDB_EXPORT_THROTTLE_MS = 30 * 60 * 1000;      // 两种触发共用的节流（30 分钟最多一次）
 const TOPICDB_EXPORT_SESSION_GAP_MS = 6 * 60 * 60 * 1000; // 会话触发额外条件：距上次导出 > 6 小时
@@ -8315,6 +8401,8 @@ function p25SessionTopicWriteGuard(store, topicRef) {
   }
 }
 export { p25SessionTopicWriteGuard as __p25SessionTopicWriteGuard };
+// [2026-11-05 协议收紧] 自测钩子：登记插件子代理 sid ⇒ actorOf 判为 "dream"（否则只能测到 lead 拒写分支）。
+export { markPluginSubagent as __markPluginSubagent };
 
 // ═══════════════════════════════════════════════════════════════════════════
 // [P2.5 生命周期][task-20][2026-11-03] 会话主题归档 sweep —— 把 p25Topics.decideLifecycle 真正接线
@@ -8972,7 +9060,7 @@ function topicDbPanelBlock() {
   L.push('      h += "</details></div>";');
   L.push("    }");
   L.push('    h += "</details></div>";');
-  L.push('    h += "<div class=muted>面板只读：本区块只读取 stats.json，不发起任何写库操作；改主题请用 memory_write 工具。</div>";');
+  L.push('    h += "<div class=muted>面板只读：本区块只读取 stats.json，不发起任何写库操作；长期库改动由 dream 整合（memory_dream_patch）完成，主代理用 memory_note。</div>";');
   // [Lead 2026-10-30 修正] 旧面板不再整体隐藏（只隐藏 .tdb-mdonly）⇒ 这个复选框改为"显示 md 相关视图"开关。
   //   纯 CSS 实现：勾选 ⇒ body:has(#tdb-oldchk:checked) 展开 md 卡片。无 onclick、无 POST、不写库、不联网。
   L.push('    h += "<input type=checkbox id=tdb-oldchk class=tdboldchk><label for=tdb-oldchk class=tdboldlab>显示 md 相关视图（记忆文档状态等，已降为导出视图）</label>";');
@@ -11445,6 +11533,13 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
       return kind === "plugin" ? "dream" : "lead";   // 插件内子代理（dream/归档）只能走 dream 身份（draft/提案）
     } catch (e) { return "lead"; }
   };
+  // [CRA 2026-11-06 修复] 拒写文案必须按**会话类别**分流：普通子代理的 memory_note 也是关的（返回 SUBAGENT_SKIP），
+  //   无条件说"请用 memory_note"会把子代理推向另一条死路 ⇒ 模型来回重试（正好喂给 D/E 打转检测）。
+  const kindOfExec = (exec) => {
+    try {
+      return deps.kindOf ? deps.kindOf(exec && exec.agent, exec && exec.agent && exec.agent.session && exec.agent.session.id) : "top";
+    } catch (e) { return "top"; }
+  };
   const out = { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }]; } };
   const readStore = async () => { const s = await topicDbEnsure(); return s || null; };
 
@@ -11570,6 +11665,8 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
         const ref = String(a.topic || "").trim();
         if (!ref) return JSON.stringify({ ok: false, code: "EMPTY_NAME", message: "topic 不能为空" });
         const t = store.readTopic(ref);
+        // [续期接线 2026-11-06] 显式读取 = 最强的"使用"信号（与检索命中同口径，1h 内不重复记）
+        try { if (t && t.id) markTopicHits(store, [t], "read"); } catch (eMH) { }
         const budget = Math.max(200, Number(a.maxChars || 4000) || 4000);
         // [task-16] 元信息分两行：triggers: = 参与判定/加权的 effectiveTriggers；
         //   generic(ignored): = 被忽略的泛化词（保留存储、明确标注不参与判定，决策 24）。
@@ -11598,7 +11695,8 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
   // memory_write：单句 append / 单句 replace（CAS；旧调用语义不变：无整块替换）
   compatTool(toolSvc, {
     name: "memory_write",
-    description: "写主题正文：op=append 追加一句；op=replace 用 old_text 逐字匹配替换一句（CAS，贴错即拒）。"
+    description: "【仅 dream 可用】写主题正文：op=append 追加一句；op=replace 用 old_text 逐字匹配替换一句（CAS，贴错即拒）。"
+      + "主代理/普通子代理/teammate 调用会返回 ok:false + code=WRITE_DREAM_ONLY —— 请改用 memory_note 记会话笔记（append-only，dream 整合时提炼进长期库）。"
       + "【更新优先 replace】同一事实有新进展/被修正/被推翻时，先 memory_read 取原文再用 op=replace，不要反复 append 同一件事。"
       + "【相似度闸】append 前会查同主题相近句：命中会返回 ok:false + code=SIMILAR_EXISTS（不落库），"
       + "此时应改用 replace；确认是新增独立事实再带 confirm:true 重试。插件内部子代理不受此闸限制。flag 关时本工具不注册。",
@@ -11623,6 +11721,28 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
         const op = String(a.op || "").trim();
         const text = String(a.text == null ? "" : a.text);
         const actor = actorOf(exec);
+        // ═══ [2026-11-05 协议收紧 · starry 拍板] 长期库写入**只给 dream** ═══
+        // 背景：memory_write 对主代理开放 ⇒ 各会话直接往长期库追加（实测 T-0069 涨到 154 句/33K 字、
+        //   T-0436 141 句/140K 字），dream 只能在事后去重，且识别不出"哪些该合并"。
+        // 对齐 MiMo：主 agent 只有**会话级** notes 一个合法写入口，长期库由 dream 提炼维护。
+        // 判定用 actorOf：插件内子代理（dream / checkpoint-writer）→ "dream" 放行；
+        //   主会话 / 普通子代理 / teammate（独立会话，kind='top'）→ "lead" 一律拒。
+        // 回滚：删掉这个 if 块即可（不改其它语义）。
+        if (actor !== "dream") {
+          const _kind = kindOfExec(exec);
+          try { if (typeof monitorEvent === "function") monitorEvent("memory", "main-agent-write-denied kind=" + _kind); } catch (eM) { }
+          // 按会话类别给**可执行**的下一步：子代理两条通道都关（memory_write 拒 + memory_note 返回 SUBAGENT_SKIP），
+          //   只能把发现写进最终报告；顶层会话则确实有 memory_note 这条活路。
+          const _msg = (_kind === "normal")
+            ? "子代理不能写长期库，也不能写会话笔记（memory_note 会返回 SUBAGENT_SKIP）。请把值得沉淀的发现写进最终报告，由主会话决定是否记。"
+            : "长期库（主题正文）只由 dream 维护。请用 memory_note 记会话笔记（append-only，dream 整合时会提炼进长期库）；"
+              + "精确字面量也先进笔记，dream 会把它归入「精确字面量索引」。";
+          return JSON.stringify({
+            ok: false, code: "WRITE_DREAM_ONLY", op: op, actor: actor, kind: _kind, topic: topic,
+            nextAction: (_kind === "normal") ? "report-only" : "use-memory_note",
+            message: _msg,
+          });
+        }
         // [P2.5-guard][2026-11-03] 拒写「插件专用会话主题」（双条件命中才拦：名字形态 + 父线匹配）。
         //   不命中的一切主题/新建/拼错 ⇒ 原样放行，append/replace 行为与改前逐字一致。
         const _p25g = p25SessionTopicWriteGuard(store, topic);
@@ -16494,6 +16614,10 @@ compatOn(ctx, "agent/assistant-stream", ({ frame }) => {
     // 熔断：attemptId = `${sessionId}:${attempt}` ⇒ 反解 sid 找 agent
     const sid = key.split(":")[0];
     const ag = agentsBySession.get(sid);
+    // [熔断补漏 2026-11-05] 命中必须先留痕，再谈能不能 cancel —— 原实现把 monitor 写在 `if (ag…)` 里面，
+    //   一旦 agentsBySession 没这个 sid（时序/键格式变化），检测到退化也**毫无痕迹**，排查时会被
+    //   误读成"熔断没被调用"。现在：命中即记 stream-hit（带 hasAgent），cancel 成功再记 stream-cancel。
+    try { monitorEvent("spiral", "stream-hit " + String(sid).slice(0, 8) + " kind=" + hit.kind + " maxN=" + hit.maxN + " rows=" + hit.rows + " buf=" + joined.length + " hasAgent=" + !!(ag && typeof ag.cancel === "function")); } catch (eM0) {}
     if (ag && typeof ag.cancel === "function") {
       ag.cancel({ kind: "hook", reason: "text-degeneration-stream maxN=" + hit.maxN + " buf=" + joined.length }, { keepInbox: true });
       try { monitorEvent("spiral", "stream-cancel " + String(sid).slice(0, 8) + " maxN=" + hit.maxN + " rows=" + hit.rows + " buf=" + joined.length); } catch (eM) {}
@@ -17012,7 +17136,7 @@ compatOn(ctx, "session/event", (session, event) => {
               // 正是给插件用的（dsh-agent runtime-types: `cancel(cause, {keepInbox})`）。
               // 阈值取 TEXT_DEG_CANCEL_REPEAT（50）：真机样本 maxN=825，正常文本不可能把同一句刷 50 遍，
               // 因此这一档误伤概率极低；低于该档仍只提醒，不打断用户正在等的回答。
-              if (_deg.maxN >= TEXT_DEG_CANCEL_REPEAT) {
+              if (_deg.cancelWorthy === true || _deg.maxN >= TEXT_DEG_CANCEL_REPEAT) {
                 try {
                   const _ag = agentsBySession.get(session.id);
                   if (_ag && typeof _ag.cancel === "function") {
@@ -18240,7 +18364,7 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
                   if (_td) {
                     return JSON.stringify({
                       ok: true, rel: rel, action: act, mode: "topicdb", topic: _td.id,
-                      note: "该内容已入主题库，字符预算不再适用；请用 memory_read 查看主题、memory_write 改单句"
+                      note: "该内容已入主题库，字符预算不再适用；请用 memory_read 查看主题；改单句由 dream 整合处理，主代理用 memory_note"
                     });
                   }
                 } catch (eTd) { cwarn("[dsh-memory] [topicdb] preview 已迁移判定失败（走原 md 预算路径）:", (eTd && eTd.message) || String(eTd)); }

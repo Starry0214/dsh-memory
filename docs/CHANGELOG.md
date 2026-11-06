@@ -4,6 +4,48 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.5.1（2026-11-06）：**写入通道收紧（`memory_write` 仅 dream）** + 熔断补漏 + 续期接线
+
+> 4.5 发布后的三条收口：长期库写入只给 dream（主代理唯一写入口 = `memory_note`）、
+> 短行重复退化不再漏判、检索命中真正续期（`markHit` 此前 0 调用方）。
+
+### 变更：写入通道收紧（破坏性行为变更）
+
+- `memory_write` 对**主代理 / 普通子代理 / teammate** 关闭：调用返回 `ok:false, code=WRITE_DREAM_ONLY`；
+  主代理唯一合法写入口是 `memory_note`（append-only 会话笔记，dream 整合时提炼进长期库）；长期库（主题正文）只由 dream 维护
+- 为什么：主代理直写长期库会各写各的（实测 T-0069 涨到 154 句 / 33K 字、T-0436 141 句 / 140K 字），
+  dream 事后无法判重；对齐 MiMo-Code「会话级 notes 是唯一合法暂存区」
+- 子代理两条通道都关（`memory_write` 拒 + `memory_note` 返回 `SUBAGENT_SKIP`）⇒ 只能把发现写进最终报告，由主会话决定记不记
+- 回滚：删掉 `memory_write.execute` 里的 `actor !== "dream"` 判断块即可（其它语义不变）
+
+### 修复：熔断补漏（短行重复退化）
+
+- 既有 `detectTextDegeneration` / `textStreamTailRepeat` 都有 `if (s.length < 6) continue`（为排除「- 是」「| 否 |」这类噪声）
+  ⇒ 「做。」×数百行这类 2 字符行被整批丢弃 ⇒ rows 恒空 ⇒ 行数闸永不通过 ⇒ **熔断代码在跑但永不命中**（monitor 无 text-degeneration 事件）
+- 新增 `shortLineRepeat()` 短行判定路径：短行 ≥30 行 + 单行重复 ≥25 次 + 该行占短行 ≥85% 才判退化（刻意从严，正常文本不会同时满足）；
+  长行路径不再按长行数量短路短行分支（CRA 2026-11-06：真机退化常是「若干长句 + 大量短行」混排）
+- 单测：300 行「做。」必命中（改前恒 null）；纯符号短行 / 仅 25 行 / 占比 83% 均不误报
+
+### 修复：续期接线（`markHit` 0 调用方）
+
+- 缺口实证：`markHit` 早在 `memory-store.mjs` 实现，但**全仓 0 调用方** ⇒ `last_hit_at` 573/573 为 NULL
+  ⇒ `lifecycle.isRenewed()` 恒 false ⇒ 老化只能按 `stateSince`/`createdAt` 走 ⇒ 90 天后按**创建日期**批量归档（实测 2027-01-27 一天归档 338 条）
+- 现接线：检索命中（`memory_search` / 压缩后事实包内部检索）与显式读取（`memory_read`）即续期；同主题 **1 小时节流**（跨重启也认 `lastHitAt`）
+- 边界：注入切片（每会话固定 12 条候选）与 `memory_topics` 列表浏览**不算**使用（那是候选集不是使用）；记录命中失败绝不影响检索结果
+
+### 升级（4.5.0 → 4.5.1）
+
+- 重跑安装命令 + 重启 DSH；**无需迁移数据**（主题库原样保留）
+- `AGENTS.md`：原始 v4 模板（`45463dd5…`）与 4.5.0 模板（`2de634f5…`）都在安装器白名单里 ⇒ 先备份、自动替换为 4.5.1 版
+  （写入通道改为「主代理只写 `memory_note`」）；你改过的保留并提示
+- 工具列表：`memory_write` 仍在但仅 dream 可用；主代理调用会收到 `WRITE_DREAM_ONLY` + `nextAction: use-memory_note`
+
+### 验证
+
+- `node --check index.js` 0；新增/更新门：`test/_hit-renew-selftest.mjs`（F1–F3 接线静态断言）、
+  `test/_text-degeneration-selftest.mjs`（E12–E18 短行/混排）、`test/_p25-write-guard-selftest.mjs`（B6/B7 主代理 `WRITE_DREAM_ONLY`）
+- payload 20 文件（无新增运行时模块）
+
 ## v4.5（2026-11-05）：**会话笔记 + 压缩失忆窗口根治** + 漏网归档链删除（-2860 行）
 
 > 这一版回答三个真机问题：
