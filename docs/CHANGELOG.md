@@ -4,6 +4,52 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.5.2（2026-11-06）：**会话笔记收敛（清空 + 指针）** + 未提炼统计
+
+> 4.5.1 之后的核心改造：笔记主题此前 append-only、dream 提炼后只追加一句「已提炼 → T-xxxx」，
+> 正文永不删 ⇒ 无限增长（真机最大 67 句），且代码不按 marker 过滤候选 ⇒ 已提炼主题每轮重复进 dream。
+> 本版让 dream 提炼完后把主题**收敛成一行指针**，新增内容不受影响。
+
+### 变更：笔记主题收敛
+
+- dream 对「已提炼完」的笔记主题产出 `{topic, pointer, targets}`，由**插件**执行 `noteTopicCompact()`：
+  **追加指针行 → 删除收敛前快照内的旧句**（只删 `id <= snapshot.maxId` 且 sha 匹配的），
+  快照之后主 agent 新写的句子 **id 更大 ⇒ 必然幸存**
+- **三项硬断言**（不满足即留痕）：① 无 live 句满足 `id <= maxId 且 sha 匹配` ② 存在且仅存在 1 条指针行 ③ 快照外句子未被删
+- **C2' 校验**（全过才动手）：targets 非空 / 与 pointer 的 T-id 双向一致 / `doneOk` / **每个** target 本轮 `writeCount` 增长且非 archived 且非笔记主题；不通过 ⇒ **不收敛、不写 marker**、留 pending 重试
+- **幂等**：主题只剩 1 句且就是指针 ⇒ `skip(already-distilled)` 并清残留 pending（不误删既有指针）
+- **pending 重放**：`meta: noteCompact:pending:<topicId>`（先写后动手，TTL 30 分钟，崩溃后重放并**重过 C2' 校验**）
+- **指针格式**：`<日期> 已提炼 <N> 句 → <T-id 列表>（原文 session_search sid8=<sid8> 可回溯）`
+- 判据统一为 `isNotePointer()`（**双格式**：兼容 legacy「已提炼 → T-xxxx」与新指针行），候选过滤 / 提炼块 / 统计 / 幂等四处复用
+
+### 变更：dream 禁止写/删笔记主题
+
+- `memory_dream_patch` 守卫：**解析后 topic**（`store.resolveTopic`）名以 `笔记·` 开头 ⇒ 拒绝 append/edit/replace/delete，返回 `NOTE_TOPIC_DREAM_FORBIDDEN`
+- 同批堵住三条旁路：file→topic 映射、`memory_review_topic` 的 `into`、`memory_split_topic` 的**源**主题
+- dream 任务书删除「提炼完追加 marker」的旧要求，改走上面的收敛通道
+
+### 新增：未提炼统计
+
+- 口径：**最后一条指针之后的句子数**（`isNotePointer` 复用）
+- 三落点：`stats.json` / 面板 / dream 任务书开头一行 / `memory_topics` 尾部
+
+### 新增：迁移脚本
+
+- `tools/migrate-note-compact.mjs`：只处理「最后一句是 legacy marker」的主题（**部分提炼主题原样不动**）；
+  同一事务内删 marker 之前的句 + marker 就地改写为新指针；过滤墓碑句（`meta.deleted.index`）
+- 安全：`--dry-run` 对账表（只读）· `assertNoHost`（宿主在跑 exit 2 拒绝，`--force` 跳过）·
+  checkpoint 在**可写连接**上执行并校验 `busy=0`（失败分型 `CHECKPOINT_BUSY/IO/FAIL`）· `VACUUM INTO` 备份
+
+### 性能
+
+- `store.topics()` 单轮复用（真机实测 684ms/次）：任务书 4→1 次（≈2s/轮）、spawn 快照 244→132ms、validate 142→0.3ms、stats 138→0.1ms
+
+### 验证
+
+- 自测 `test/_note-compact-selftest.mjs` 81/81（含 K1-K11）；回归 434 项全绿
+- 审计：方案三轮 CRA + 实现审计 + 第 4 轮定点复核（D1/D2/D7/D8/D10 全过）
+- 真机迁移 dry-run：12 主题 → 待迁 7 / 跳过 5 / 删旧句 11 / 改写 marker 7
+
 ## v4.5.1（2026-11-06）：**写入通道收紧（`memory_write` 仅 dream）** + 熔断补漏 + 续期接线
 
 > 4.5 发布后的三条收口：长期库写入只给 dream（主代理唯一写入口 = `memory_note`）、

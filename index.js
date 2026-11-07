@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.1";
+const PLUGIN_VERSION = "4.5.2";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -1736,6 +1736,21 @@ const P2_TEST_HOOKS = {
   sections: null,
 };
 export { P2_TEST_HOOKS as __p2Hooks };
+// [4.5.2][note-compact] 笔记收敛测试钩子容器（模块级；apply 末尾把内部引用挂上）
+//   isNotePointerText / isNoteTopicName / parseNoteCompactPayload / noteFormatPointer / noteTakeSnapshot /
+//   noteTakeTargetBaseline / noteCompactValidate / noteTopicCompact / noteCompactReplayPending / noteUnrefinedStats /
+//   notePendingList / getLastCompact（dream 结算轮统计）/ hasPending(topicId)
+const NOTE_TEST_HOOKS = {
+  isNotePointerText: null, isNoteTopicName: null,
+  parseNoteCompactPayload: null, noteFormatPointer: null,
+  noteTakeSnapshot: null, noteTakeTargetBaseline: null,
+  noteCompactValidate: null, noteTopicCompact: null, noteCompactReplayPending: null,
+  noteUnrefinedStats: null, noteUnrefinedCount: null, notePendingList: null,
+  getLastCompact: null, hasPending: null, notePendingPut: null, notePendingGet: null, notePendingDel: null, notePendingIndexList: null,
+  // 常量在 apply 末尾赋值（本容器声明早于常量定义，避免 TDZ；纯常量亦可直接用 __NOTE_* 模块导出）
+  sentinel: null, ttlMs: 0, pointerRe: null,
+};
+export { NOTE_TEST_HOOKS as __noteHooks };
 // [P4][R2] 压缩后记忆重灌的测试钩子容器（模块级；apply 末尾把**内部同一份**引用挂上来）：
 //   buildPostCompactRehydrate（三段装配纯流程）/ getLastRehydrate / getRehydrateCount /
 //   hasRehydrateInjected（幂等探针）/ budgets（三段预算）/ compactOnce + startSubagentCompat（P4-A
@@ -3598,7 +3613,8 @@ function listOverLimitTopicsFromDb(store, opts) {
   const out = [];
   if (!store || typeof store.topics !== "function" || typeof store.readTopic !== "function") return out;
   let topics = [];
-  try { topics = store.topics() || []; } catch (e) { return out; }
+  // [D10 性能] rows 可选复用（调用方已取整库行时避免再扫一次 684ms）
+  try { topics = Array.isArray(o.rows) ? o.rows : (store.topics() || []); } catch (e) { return out; }
   // [P3 修信号][2026-11-03 CRA 27 §5] 旧实现用 `chars - PROJECT_CHAR_SOFT(6000)` 当 overBy、并按统一 9000 判超限
   //   ⇒ 真机把「T-0475 200014 字符（索引档上限 200000，只超 14）」渲染成「超 194014」，dream 拿着错信号会去切 200K 索引。
   //   现在按**本档上限**（主 9000 / 明细 40000 / 索引 200000）判定并算 overBy，tier 一并回传供渲染层措辞。
@@ -3734,11 +3750,12 @@ function writeConflictIndex(store) {
   } catch (e) { return null; }
 }
 // [task-54] 主题引用解析：ID 优先，其次归一化名字（与 dream_patch 的 topic 寻址同源）
-function resolveTopicRefByStore(store, ref) {
+// [D10 性能] rowsOpt：调用方已取整库行时传入，避免每次解析都重扫 store.topics()（真机 684ms/次）
+function resolveTopicRefByStore(store, ref, rowsOpt) {
   const key = String(ref == null ? "" : ref).trim();
   if (!store || !key) return null;
   let rows = [];
-  try { rows = store.topics() || []; } catch (e) { return null; }
+  try { rows = Array.isArray(rowsOpt) ? rowsOpt : (store.topics() || []); } catch (e) { return null; }
   const byId = rows.find((t) => String(t.id) === key);
   if (byId) return byId;
   const nz = (TOPICDB.api && typeof TOPICDB.api.normalizeName === "function") ? TOPICDB.api.normalizeName : ((x) => String(x == null ? "" : x).trim().toLowerCase());
@@ -3749,11 +3766,458 @@ function resolveTopicRefByStore(store, ref) {
   const loose = rows.filter((t) => nz(t.name).indexOf(nk) >= 0 && nk.length >= 2);
   return loose.length === 1 ? loose[0] : null;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// [4.5.2 笔记收敛] 共享判据 / 快照 / 指针 / pending / 收敛核心（模块级；迁移脚本与门可直测）
+//   设计依据：docs/方案-4.5.2-笔记收敛.md §13/§14（v4 收口版）+ docs/audit/452-note-compact_CRA_2026-11-06.md §6
+//   纪律：① 判据双格式（legacy「已提炼 → T-xxxx」+ 新指针行）；② 快照先行，只删快照内且 sha 匹配的句；
+//        ③ 指针 = 整主题覆盖的唯一事实（最后一句）；④ 失败不写 marker、留 pending；⑤ 绝不切半句。
+// ══════════════════════════════════════════════════════════════════════════════
+const NOTE_TOPIC_PREFIX_RE = /^笔记·/;
+// 双格式：legacy（dream 过去追加的「已提炼 → T-xxxx」）与新指针行（<日期> 已提炼 N 句 → T-…）。
+//   ⚠ 宽松判据只用于「是不是指针」的**识别**（候选过滤 / 幂等 / 统计 / 末句判据），
+//   **不能**用于「dream 给的 pointer 能否原样采用」——否则模型输出 legacy 文本会被原样写库（真机 T-0560 实证）。
+const NOTE_POINTER_RE = /(已提炼\s*→\s*T-\d+)|(^\d{4}-\d{2}-\d{2} 已提炼 \d+ 句 → T-\d+)/;
+// 严格判据（只认新格式；主体「日期 + N 句 + T-id」必须齐，sid8 段**可选**——无 sid8 主题也能是合法严格指针，
+//   见 ②「STRICT 与生成器不一致」修复）：用于校验插件重生成的指针 / 禁止静默降级。
+const NOTE_POINTER_STRICT_RE = /^\d{4}-\d{2}-\d{2} 已提炼 \d+ 句 → T-\d+(?:\/T-\d+)*(?:[（(][^）)]*sid8=[0-9a-f]{8}[^）)]*[）)])?$/;
+const NOTE_COMPACT_SENTINEL = "<!--DSH_MEMORY_COMPACT_JSON-->";
+const NOTE_COMPACT_TTL_MS = 30 * 60 * 1000;          // §14.1-4：pending TTL 30 分钟
+const NOTE_COMPACT_PENDING_INDEX = "noteCompact:pendingIndex";
+const NOTE_COMPACT_LOCK_MS = 5 * 60 * 1000;          // per-topic 处理锁
+const NOTE_COMPACT_MAX_ITEMS = 10;                    // 单轮 dream 最多收敛 10 个笔记主题
+const NOTE_COMPACT_LOCK = new Map();                  // topicId -> 加锁时间（进程内）
+const NOTE_COMPACT_STATS = { count: 0, last: null };  // dream 收敛轮统计（测试钩子/诊断用）
+function isNoteTopicName(name) { return NOTE_TOPIC_PREFIX_RE.test(String(name == null ? "" : name)); }
+function isNotePointerText(text) { return NOTE_POINTER_RE.test(String(text == null ? "" : text)); }
+/** 严格判据（只认新格式：日期 + N 句 + T-id；sid8 段可选）：插件重生成指针的唯一校验标准 */
+function isStrictNotePointer(text) { return NOTE_POINTER_STRICT_RE.test(String(text == null ? "" : text).trim()); }
+function notePointerTargets(pointer) {
+  const ids = String(pointer == null ? "" : pointer).match(/T-\d+/g) || [];
+  return [...new Set(ids.map(String))];
+}
+/** 新指针行格式（M4 定稿）：`<YYYY-MM-DD> 已提炼 <N> 句 → <T-id 列表>（原文 session_search sid8=<sid8> 可回溯）` */
+function noteFormatPointer(o) {
+  const opts = o || {};
+  const d = new Date(Number.isFinite(Number(opts.at)) ? Number(opts.at) : Date.now());
+  const day = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  const targets = [...new Set((Array.isArray(opts.targets) ? opts.targets : []).map(String).filter((x) => /^T-\d+$/.test(x)))];
+  const sid8 = String(opts.sid8 || "").trim();
+  return day + " 已提炼 " + Math.max(0, Math.floor(Number(opts.count) || 0)) + " 句 → " + (targets.join("/") || "T-0000")
+    + (sid8 ? "（原文 session_search sid8=" + sid8 + " 可回溯）" : "");
+}
+/** 读主题（只读；失败返回 {ok:false}） */
+function noteTopicState(store, topicRef) {
+  try {
+    if (!store || typeof store.readTopic !== "function") return { ok: false, error: "store-unavailable" };
+    const rt = store.readTopic(topicRef);
+    const sentences = (rt && rt.sentences) || [];
+    return { ok: true, id: String((rt && rt.id) || ""), name: String((rt && rt.name) || ""), state: String((rt && rt.state) || ""), sentences };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+/** 「已提炼完」唯一判据（C1'/C3'）：最后一句是指针行（双格式）。 */
+function noteTopicDistilled(store, topicRef) {
+  const st = noteTopicState(store, topicRef);
+  return !!(st.ok && st.sentences.length > 0 && isNotePointerText(st.sentences[st.sentences.length - 1].text));
+}
+/** 未提炼口径 **A**（M3 定稿）：最后一条指针之后的句数；无指针 ⇒ 全部句数。 */
+function noteUnrefinedCount(sentences) {
+  const ss = Array.isArray(sentences) ? sentences : [];
+  for (let i = ss.length - 1; i >= 0; i--) {
+    const s = ss[i];
+    const tx = (s && typeof s === "object") ? s.text : s;   // 兼容 readTopic().sentences 与纯文本数组
+    if (isNotePointerText(tx)) return ss.length - 1 - i;
+  }
+  return ss.length;
+}
+/** 全库笔记未提炼统计（面板 / dream 任务书 / memory_topics 共用；只读）
+ *  [D10 性能] rows 可选：调用方已取 store.topics() 时直接传入，避免 684ms/次 的整库重扫。 */
+function noteUnrefinedStats(store, rowsOpt) {
+  const out = { topics: 0, sentences: 0, total: 0, items: [] };
+  try {
+    if (!store) return out;
+    let rows = Array.isArray(rowsOpt) ? rowsOpt : null;
+    if (!rows) {
+      if (typeof store.topics !== "function") return out;
+      rows = store.topics() || [];
+    }
+    for (const t of rows) {
+      if (!t || !isNoteTopicName(t.name) || String(t.state || "") === "archived") continue;
+      const st = noteTopicState(store, t.id);
+      if (!st.ok) continue;
+      const n = noteUnrefinedCount(st.sentences);
+      if (n > 0) { out.topics += 1; out.sentences += n; out.items.push({ id: String(t.id), name: String(t.name), count: n }); }
+    }
+    out.total = out.items.length;
+    out.items.sort((a, b) => (b.count - a.count) || String(a.id).localeCompare(String(b.id)));
+    out.items = out.items.slice(0, 20);
+  } catch (e) { /* 统计失败返回零值，不阻断调用方 */ }
+  return out;
+}
+/** dream 启动前快照（C1 快照先行）：每笔记主题 {maxId,count,sha:{id:sha},createdAt}
+ *  [D10 性能] rows 可选：已取整库行时传入，避免重复 topics()。 */
+function noteTakeSnapshot(store, topicIds, rowsOpt) {
+  const snap = {};
+  try {
+    if (!store) return snap;
+    const ids = (Array.isArray(topicIds) && topicIds.length)
+      ? topicIds.map(String)
+      : (Array.isArray(rowsOpt) ? rowsOpt : (store.topics() || []))
+        .filter((t) => t && isNoteTopicName(t.name) && String(t.state || "") !== "archived").map((t) => String(t.id));
+    for (const id of ids) {
+      const st = noteTopicState(store, id);
+      if (!st.ok) continue;
+      let maxId = 0; const sha = {};
+      for (const s of st.sentences) {
+        const sid = Number(s && s.id);
+        if (!Number.isFinite(sid)) continue;
+        if (sid > maxId) maxId = sid;
+        sha[String(sid)] = String((s && s.sha) || "");
+      }
+      snap[id] = { topicName: st.name, maxId, count: st.sentences.length, sha, createdAt: Date.now() };
+    }
+  } catch (e) { /* 快照失败 ⇒ 本轮不收敛（调用方按空快照处理） */ }
+  return snap;
+}
+/** dream 启动前目标基线（C2' 判据）：全部主题 {name,state,writeCount,createdAt} */
+function noteTakeTargetBaseline(store) {
+  const base = {};
+  try {
+    if (!store || typeof store.topics !== "function") return base;
+    for (const t of (store.topics() || [])) {
+      if (!t || !t.id) continue;
+      base[String(t.id)] = {
+        name: String(t.name || ""), state: String(t.state || ""),
+        writeCount: Number(t.writeCount || 0), createdAt: Number(t.createdAt || 0), updatedAt: Number(t.updatedAt || 0),
+      };
+    }
+  } catch (e) { /* 基线失败 ⇒ 本轮不收敛（validate 会因无基线而拒新建目标，已存在目标走 writeCount 对比） */ }
+  return base;
+}
+/** [D10 性能] dream 启动前**一次**取齐：笔记快照 + 目标基线（整库 rows 只扫一次，684ms→1 次）
+ *  @returns {{snap:Object, baseline:Object, rows:Array, createdAt:number}} */
+function noteTakeDreamSnapshots(store) {
+  const out = { snap: {}, baseline: {}, rows: [], createdAt: Date.now() };
+  try {
+    if (!store || typeof store.topics !== "function") return out;
+    const rows = store.topics() || [];
+    out.rows = rows;
+    for (const t of rows) {
+      if (!t || !t.id) continue;
+      out.baseline[String(t.id)] = {
+        name: String(t.name || ""), state: String(t.state || ""),
+        writeCount: Number(t.writeCount || 0), createdAt: Number(t.createdAt || 0), updatedAt: Number(t.updatedAt || 0),
+      };
+    }
+    out.snap = noteTakeSnapshot(store, null, rows);
+  } catch (e) { /* 失败 ⇒ 空快照/空基线，本轮不收敛（调用方判空） */ }
+  return out;
+}
+/** 解析 dream 最终文本里的收敛通道（哨兵 + 最后一个平衡 {...} + schema 校验；任一失败 ⇒ 不收敛） */
+function parseNoteCompactPayload(outText) {
+  const s = String(outText == null ? "" : outText);
+  const at = s.lastIndexOf(NOTE_COMPACT_SENTINEL);
+  if (at < 0) return { ok: false, error: "no-sentinel", items: [] };
+  const tail = s.slice(at + NOTE_COMPACT_SENTINEL.length);
+  // 取哨兵之后**最后一个平衡的** {...}（括号配平 + 字符串感知，避免解释文字干扰）
+  let last = null;
+  for (let i = 0; i < tail.length; i++) {
+    if (tail[i] !== "{") continue;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let j = i; j < tail.length; j++) {
+      const c = tail[j];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === "\"") inStr = false; continue; }
+      if (c === "\"") { inStr = true; continue; }
+      if (c === "{") depth++;
+      else if (c === "}") { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end < 0) break;
+    last = tail.slice(i, end + 1);
+    i = end;
+  }
+  if (!last) return { ok: false, error: "no-json-object", items: [] };
+  let obj = null;
+  try { obj = JSON.parse(last); } catch (e) { return { ok: false, error: "json-parse:" + ((e && e.message) || e), items: [] }; }
+  if (!obj || !Array.isArray(obj.compact)) return { ok: false, error: "schema:compact-not-array", items: [] };
+  const items = [];
+  for (let i = 0; i < obj.compact.length; i++) {
+    const it = obj.compact[i] || {};
+    const topic = String(it.topic || "").trim();
+    const pointer = String(it.pointer || "").trim();
+    const targets = Array.isArray(it.targets) ? [...new Set(it.targets.map(String))] : [];
+    if (!topic) return { ok: false, error: "schema:item[" + i + "].topic 缺失", items: [] };
+    if (!pointer) return { ok: false, error: "schema:item[" + i + "].pointer 缺失", items: [] };
+    if (!targets.length || targets.some((x) => !/^T-\d+$/.test(x))) return { ok: false, error: "schema:item[" + i + "].targets 非法", items: [] };
+    items.push({ topic, pointer, targets });
+  }
+  return { ok: true, items, raw: last };
+}
+// ── pending（meta 表；索引 + 逐主题记录，避免依赖 listMeta）──
+function noteCompactBe(store) { try { return (store && store.be) || null; } catch (e) { return null; } }
+function noteCompactMetaGet(store, key) {
+  try { const be = noteCompactBe(store); return (be && typeof be.getMeta === "function") ? be.getMeta(key) : null; } catch (e) { return null; }
+}
+function noteCompactMetaSet(store, key, val) {
+  try { const be = noteCompactBe(store); if (be && typeof be.setMeta === "function") be.setMeta(key, String(val)); } catch (e) { /* 记账失败不阻断主流程 */ }
+}
+function noteCompactMetaDel(store, key) {
+  try { const be = noteCompactBe(store); if (be && typeof be.deleteMeta === "function") be.deleteMeta(key); } catch (e) { /* 同上 */ }
+}
+function notePendingKey(topicId) { return "noteCompact:pending:" + String(topicId); }
+function notePendingIndexList(store) {
+  try { const raw = noteCompactMetaGet(store, NOTE_COMPACT_PENDING_INDEX); const a = raw ? JSON.parse(raw) : []; return Array.isArray(a) ? a.map(String) : []; } catch (e) { return []; }
+}
+function notePendingIndexSet(store, ids) {
+  noteCompactMetaSet(store, NOTE_COMPACT_PENDING_INDEX, JSON.stringify([...new Set((ids || []).map(String))].slice(0, 200)));
+}
+function notePendingGet(store, topicId) {
+  try { const raw = noteCompactMetaGet(store, notePendingKey(topicId)); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+}
+function notePendingPut(store, topicId, rec) {
+  noteCompactMetaSet(store, notePendingKey(topicId), JSON.stringify(rec));
+  const ids = notePendingIndexList(store);
+  if (ids.indexOf(String(topicId)) < 0) { ids.push(String(topicId)); notePendingIndexSet(store, ids); }
+}
+function notePendingDel(store, topicId) {
+  noteCompactMetaDel(store, notePendingKey(topicId));
+  notePendingIndexSet(store, notePendingIndexList(store).filter((x) => x !== String(topicId)));
+}
+function notePendingList(store) {
+  const out = [];
+  for (const tid of notePendingIndexList(store)) {
+    const rec = notePendingGet(store, tid);
+    if (rec) out.push(rec);
+  }
+  return out;
+}
+/**
+ * C2' 判据（§14.1-2 收紧版）：targets 非空 / 与 pointer T-id 一致 / doneOk / 每个 target 本轮真实写过
+ *   （存在 ⇒ writeCount 增长且非 archived；新建 ⇒ createdAt > spawnAt）且非笔记主题。
+ */
+function noteCompactValidate(store, o) {
+  const opts = o || {};
+  const errors = [];
+  if (opts.doneOk !== true) errors.push("doneOk=false（本轮未成功落盘）");
+  const ptrTargets = notePointerTargets(opts.pointer);
+  const targets = [...new Set((Array.isArray(opts.targets) ? opts.targets : []).map(String))];
+  if (!targets.length) errors.push("targets 为空");
+  // [D3] 集合比较（顺序不敏感）；compact 侧传 allowPointerMismatch=true 时由插件按 targets 重生成 pointer（D2），不在此拒
+  const sameSet = targets.length === ptrTargets.length && targets.every((x) => ptrTargets.indexOf(x) >= 0);
+  if (!sameSet && opts.allowPointerMismatch !== true) {
+    errors.push("targets 与 pointer 的 T-id 不一致（pointer=" + (ptrTargets.join("/") || "-") + "；targets=" + (targets.join("/") || "-") + "）");
+  }
+  // [② CRA 2026-11-06] 用**严格**判据（旧版用宽松 isNotePointerText ⇒ 无 sid8 主题被静默写成非严格指针）
+  if (opts.requirePointerFormat !== false && !isStrictNotePointer(opts.pointer)) errors.push("pointer 不是严格指针行（需含「日期 + 已提炼 N 句 → T-…」，sid8 可选）");
+  // [D10 性能] rows 可选复用（调用方已取整库行）；缺失才 store.topics()
+  let rows = Array.isArray(opts.rows) ? opts.rows : null;
+  if (!rows) { try { rows = (store && typeof store.topics === "function") ? (store.topics() || []) : []; } catch (e) { rows = []; } }
+  const byId = new Map(rows.map((t) => [String(t.id), t]));
+  // 单个 target 取**当前**行（单行查询，避免每 target 重扫全库；写计数必须是当前值）
+  const freshRow = (tid) => {
+    try {
+      const be = store && store.be;
+      if (be && typeof be.getTopicById === "function") { const r = be.getTopicById(tid); if (r) return r; }
+    } catch (e) { /* 回落 rows */ }
+    return byId.get(tid) || null;
+  };
+  const baseline = (opts.baseline && typeof opts.baseline === "object") ? opts.baseline : {};
+  for (const tid of targets) {
+    const cur = freshRow(tid);
+    if (!cur) { errors.push(tid + " 不存在（指针目标必须真实存在）"); continue; }
+    if (isNoteTopicName(cur.name)) errors.push(tid + " 是笔记主题（禁止指针指向笔记主题）");
+    if (String(cur.state || "") === "archived") errors.push(tid + " 已归档（不能作为收敛目标）");
+    const base = baseline[tid];
+    if (base) {
+      if (!(Number(cur.writeCount || 0) > Number(base.writeCount || 0))) errors.push(tid + " writeCount 未增长（" + Number(base.writeCount || 0) + "→" + Number(cur.writeCount || 0) + "；delete/split 不 bump，必须真实 append/edit/replace）");
+    } else {
+      if (!(Number(cur.createdAt || 0) > Number(opts.spawnAt || 0))) errors.push(tid + " 非本轮新建（createdAt=" + Number(cur.createdAt || 0) + " ≤ spawnAt=" + Number(opts.spawnAt || 0) + "）");
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+/**
+ * 笔记主题收敛核心（P1-2）：C2' 校验 → 写 pending → append 指针 → 删快照内且 sha 匹配的句 →
+ *   三条硬断言（①快照内无 live 且 sha 匹配的句 ②存在且仅存在 1 条指针 ③快照外句未被删）→ 成功删 pending。
+ * 失败：回滚（删指针 + 按原文补回已删句），**不写 marker、不收敛**、保留 pending 待重试。
+ * @returns {{ok:boolean, code?:string, errors?:string[], deleted?:number[], skipped?:any[], pointerSentenceId?:any, pointerText?:string, targets?:string[]}}
+ */
+function noteTopicCompact(store, topicId, opts) {
+  const o = opts || {};
+  const tid = String(topicId || "");
+  const now = Number.isFinite(Number(o.now)) ? Number(o.now) : Date.now();
+  if (!tid) return { ok: false, code: "BAD_ARG", errors: ["topicId 为空"] };
+  const lockedAt = NOTE_COMPACT_LOCK.get(tid);
+  if (lockedAt && (now - lockedAt) < NOTE_COMPACT_LOCK_MS) return { ok: false, code: "LOCKED", errors: ["per-topic 处理锁未释放（" + (now - lockedAt) + "ms）"] };
+  NOTE_COMPACT_LOCK.set(tid, now);
+  try {
+    const st0 = noteTopicState(store, tid);
+    if (!st0.ok) return { ok: false, code: "READ_FAILED", errors: [st0.error || "readTopic 失败"] };
+    if (isNoteTopicName(st0.name) !== true) return { ok: false, code: "NOT_NOTE_TOPIC", errors: ["目标不是笔记主题：" + st0.name] };
+    // [D1 · §5 幂等前置] 主题只剩 1 行且就是指针 ⇒ 已经收敛完成：直接 skip（**不删既有指针**、不动正文、清掉残留 pending）
+    if (st0.sentences.length === 1 && isNotePointerText(st0.sentences[0].text)) {
+      notePendingDel(store, tid);
+      try { monitorEvent("note", "compact-skip-already-distilled " + tid); } catch (eM) { /* 忽略 */ }
+      return { ok: true, topicId: tid, skip: "already-distilled", deleted: [], skipped: [], pointerSentenceId: st0.sentences[0].id, pointerText: String(st0.sentences[0].text), targets: [] };
+    }
+    const snap = o.snapshot;
+    if (!snap || !Number.isFinite(Number(snap.maxId))) return { ok: false, code: "NO_SNAPSHOT", errors: ["缺少启动快照（dream 启动前未拍到该主题）"] };
+    // [D4 · §5 step2] 快照时 0 句 ⇒ 没有可收敛的旧句（新内容都在快照后）⇒ skip，不 append 指针
+    if (Number(snap.count) === 0) {
+      notePendingDel(store, tid);
+      return { ok: true, topicId: tid, skip: "empty-snapshot", deleted: [], skipped: [], targets: [] };
+    }
+    const targets = [...new Set((Array.isArray(o.targets) ? o.targets : []).map(String))];
+    // [① CRA 2026-11-06] **一律重生成**，不采纳模型 pointer 文本：严格判据只校格式不校内容，
+    //   模型可写 sid8=deadbeef / N=999 并原样入库 ⇒ 回溯指错会话、句数虚报。
+    //   插件按 targets + 主题名 sid8 + 快照句数重生成；模型文本只进 monitor 留痕（pointerRegenerated=true）。
+    let pointerText = "";
+    let regenerated = true;
+    try {
+      let sid8 = "";
+      try { const m = /^([^\s/\\]{1,200})\/([0-9a-f]{8})/.exec(String(st0.name)); if (m) sid8 = m[2]; } catch (eS) { /* 无 sid8 */ }
+      pointerText = noteFormatPointer({ count: Number(snap.count) || 0, targets: targets, sid8: sid8 });
+      try { monitorEvent("note", "compact-pointer-regen " + tid + " targets=" + targets.join("/") + " model=" + String(o.pointer || "").slice(0, 80)); } catch (eM) { /* 忽略 */ }
+    } catch (eG) { pointerText = ""; }
+    // [② 禁止静默降级] 写入前用严格判据再校验一次：不合法 ⇒ 不写、留痕、按失败处理（不得 append 非严格指针）
+    if (!pointerText || !isStrictNotePointer(pointerText)) {
+      try { monitorEvent("note", "compact-pointer-not-strict " + tid + " ptr=" + String(pointerText).slice(0, 100)); } catch (eM) { /* 忽略 */ }
+      return { ok: false, code: "POINTER_NOT_STRICT", errors: ["重生成的指针未通过严格判据（日期/N 句/T-id 主体缺失）：" + String(pointerText).slice(0, 120)] };
+    }
+    const v = noteCompactValidate(store, {
+      pointer: pointerText, targets: targets, baseline: o.baseline || {}, doneOk: o.doneOk, spawnAt: o.spawnAt,
+      rows: o.rows, allowPointerMismatch: true, requirePointerFormat: true,
+    });
+    if (!v.ok) {
+      try { monitorEvent("note", "compact-skip " + tid + " " + v.errors.join(" / ").slice(0, 180)); } catch (eM) { /* 监控失败不影响结果 */ }
+      return { ok: false, code: "VALIDATION_FAILED", errors: v.errors };
+    }
+    // 校验后重读（校验可能耗时；主 agent 可能刚又写了 note ⇒ 新句必须在快照外、必须幸存）
+    const live = (noteTopicState(store, tid).sentences || []);
+    // [D6] pending 只存 targets 子集的 baseline（全量 577 主题 ≈78KB/条；子集通常 <1KB）
+    const baselineSubset = {};
+    for (const t of targets) { const b = (o.baseline || {})[t]; if (b) baselineSubset[t] = b; }
+    // pending 先落盘（崩溃后可重放；成功才删）
+    const rec = {
+      topicId: tid,
+      snapshot: { maxId: Number(snap.maxId), count: Number(snap.count) || 0, sha: snap.sha || {}, createdAt: Number(snap.createdAt) || now },
+      pointer: pointerText, targets: targets, pointerRegenerated: regenerated,
+      baseline: baselineSubset,
+      spawnAt: Number(o.spawnAt) || 0,
+      createdAt: now, ttlMs: NOTE_COMPACT_TTL_MS,
+    };
+    notePendingPut(store, tid, rec);
+    // 幂等：同内容指针已存在（崩溃重放）⇒ 复用，不重复 append
+    let pointerSentenceId = null;
+    const existed = live.filter((s) => String((s && s.text) || "") === pointerText);
+    if (existed.length) pointerSentenceId = existed[existed.length - 1].id;
+    else {
+      const wr = store.appendSentence({ topic: tid, text: pointerText, src: "note-compact", actor: "runtime" });
+      pointerSentenceId = (wr && wr.sentenceId) || null;
+    }
+    // 快照外句子基线（③ 断言：未被本流程删除/改写）
+    const outside = new Map();
+    for (const s of live) { const sid = Number(s && s.id); if (Number.isFinite(sid) && sid > Number(snap.maxId)) outside.set(String(sid), String((s && s.sha) || "")); }
+    const deleted = []; const skipped = [];
+    for (const s of live) {
+      const sid = Number(s && s.id);
+      if (!Number.isFinite(sid) || sid > Number(snap.maxId)) continue;
+      if (pointerSentenceId != null && String(sid) === String(pointerSentenceId)) continue;
+      const wantSha = snap.sha ? snap.sha[String(sid)] : "";
+      if (!wantSha) { skipped.push({ id: sid, why: "no-sha-in-snapshot" }); continue; }   // H1' 补丁：缺 sha ⇒ 跳过不阻塞
+      if (String((s && s.sha) || "") !== String(wantSha)) { skipped.push({ id: sid, why: "sha-mismatch" }); continue; }   // M2：不匹配跳过留痕
+      try { store.deleteSentence(tid, { sentenceId: sid }, { actor: "runtime", reason: "note-compact" }); deleted.push(sid); }
+      catch (eD) {
+        const code = (eD && eD.code) || "";
+        skipped.push({ id: sid, why: code === "SENTENCE_NOT_FOUND" ? "already-missing" : ("delete-failed:" + (code || String(eD))) });
+      }
+    }
+    // 三条硬断言（§14.1-5 重定版）
+    const after = (noteTopicState(store, tid).sentences || []);
+    const errs = [];
+    const snapAlive = after.filter((s) => {
+      const sid = Number(s && s.id);
+      if (!Number.isFinite(sid) || sid > Number(snap.maxId)) return false;
+      const want = snap.sha ? snap.sha[String(sid)] : "";
+      return !!want && String((s && s.sha) || "") === String(want);
+    });
+    if (snapAlive.length) errs.push("断言①失败：快照内仍有 live 且 sha 匹配的句 " + snapAlive.map((s) => s.id).join(","));
+    const ptrs = after.filter((s) => isNotePointerText(s && s.text));
+    if (ptrs.length !== 1) errs.push("断言②失败：指针句数量=" + ptrs.length + "（应恰好 1 条）");
+    for (const [sid, sha] of outside) {
+      const cur = after.find((s) => String(s && s.id) === sid);
+      if (!cur || String((cur && cur.sha) || "") !== sha) { errs.push("断言③失败：快照外句被删/改 id=" + sid); break; }
+    }
+    if (errs.length) {
+      // 回滚（best-effort）：删指针 + 按原文补回已删句；pending 保留待重试
+      try { if (pointerSentenceId != null) store.deleteSentence(tid, { sentenceId: pointerSentenceId }, { actor: "runtime", reason: "note-compact-rollback" }); } catch (eR1) { /* 回滚失败留痕由 monitor 承担 */ }
+      for (const sid of deleted) {
+        const old = live.find((s) => Number(s && s.id) === sid);
+        if (!old) continue;
+        try { store.appendSentence({ topic: tid, text: String((old && old.text) || ""), src: "note-compact-rollback", actor: "runtime" }); } catch (eR2) { /* 同上 */ }
+      }
+      try { monitorEvent("note", "compact-rollback " + tid + " " + errs.join(" / ").slice(0, 180)); } catch (eM) { /* 忽略 */ }
+      return { ok: false, code: "ASSERT_FAILED", errors: errs, deleted: deleted, skipped: skipped };
+    }
+    notePendingDel(store, tid);
+    try { monitorEvent("note", "compact-ok " + tid + " deleted=" + deleted.length + " skipped=" + skipped.length + " ptr=" + pointerSentenceId + (regenerated ? " regen=1" : "")); } catch (eM) { /* 忽略 */ }
+    return { ok: true, topicId: tid, deleted: deleted, skipped: skipped, pointerSentenceId: pointerSentenceId, pointerText: pointerText, targets: targets, pointerRegenerated: regenerated };
+  } catch (e) {
+    cwarn("[dsh-memory] [4.5.2] 笔记收敛异常（保留 pending 待重试）：" + tid + " — " + ((e && e.message) || String(e)));
+    return { ok: false, code: "THROW", errors: [String((e && e.message) || e)] };
+  } finally {
+    NOTE_COMPACT_LOCK.delete(tid);
+  }
+}
+/** 启动/补偿重放：TTL 过期丢弃留痕；否则用 pending 里的快照做 CAS、用**当前**状态重过 C2' 校验后幂等重做
+ *  [D5] pending 只在 doneOk 通过后写 ⇒ 重放传 doneOk:true（不重验当轮落盘，属设计取舍，留痕见 monitor）
+ *  [D10] 整库 rows 只取一次，供本轮所有 pending 的 validate 复用 */
+function noteCompactReplayPending(store, opts) {
+  const o = opts || {};
+  const now = Number.isFinite(Number(o.now)) ? Number(o.now) : Date.now();
+  const res = { scanned: 0, redone: 0, expired: 0, failed: 0, details: [] };
+  if (!store || typeof store.topics !== "function") return res;
+  let rows = [];
+  try { rows = store.topics() || []; } catch (e) { rows = []; }
+  for (const rec of notePendingList(store)) {
+    res.scanned += 1;
+    const tid = String(rec.topicId || "");
+    const age = now - Number(rec.createdAt || 0);
+    if (!Number.isFinite(age) || age > Number(rec.ttlMs || NOTE_COMPACT_TTL_MS)) {
+      notePendingDel(store, tid); res.expired += 1;
+      try { monitorEvent("note", "compact-pending-expired " + tid + " age=" + age); } catch (eM) { /* 忽略 */ }
+      continue;
+    }
+    // 重放：target 校验用当前状态重算（baseline/spawnAt 取自 pending；baseline 只含 targets 子集）
+    const r = noteTopicCompact(store, tid, {
+      pointer: rec.pointer, targets: rec.targets, baseline: rec.baseline || {},
+      snapshot: rec.snapshot, doneOk: true, spawnAt: rec.spawnAt, now: now, rows: rows,
+    });
+    if (r.ok) { res.redone += 1; res.details.push({ topicId: tid, deleted: (r.deleted || []).length, skip: r.skip || "" }); }
+    else { res.failed += 1; res.details.push({ topicId: tid, code: r.code, errors: (r.errors || []).slice(0, 3) }); }
+  }
+  return res;
+}
+export {
+  noteTopicCompact as __noteTopicCompact, noteCompactReplayPending as __noteCompactReplayPending,
+  noteTakeSnapshot as __noteTakeSnapshot, noteTakeTargetBaseline as __noteTakeTargetBaseline,
+  noteTakeDreamSnapshots as __noteTakeDreamSnapshots,
+  noteUnrefinedStats as __noteUnrefinedStats, noteUnrefinedCount as __noteUnrefinedCount,
+  parseNoteCompactPayload as __parseNoteCompactPayload, noteFormatPointer as __noteFormatPointer,
+  noteCompactValidate as __noteCompactValidate, isNotePointerText as __isNotePointerText,
+  isNoteTopicName as __isNoteTopicName, notePendingList as __notePendingList,
+  NOTE_POINTER_RE as __NOTE_POINTER_RE, NOTE_POINTER_STRICT_RE as __NOTE_POINTER_STRICT_RE,
+  isStrictNotePointer as __isStrictNotePointer,
+  NOTE_COMPACT_SENTINEL as __NOTE_COMPACT_SENTINEL,
+  NOTE_COMPACT_TTL_MS as __NOTE_COMPACT_TTL_MS,
+};
 // [task-54] 库模式任务书：只列主题/人工稳定层；不读任何导出视图 md（D7 的确定性来源）
 function buildDreamPromptLibrary(extras) {
   const p = extras || {};
   const store = TOPICDB.store;
-  const overTopics = TOPICDB.enabled ? listOverLimitTopicsFromDb(store, { limit: PROJECT_CHAR_HARD }) : [];
+  // [D10 性能] 整库 rows 只取一次，候选池 / 笔记提炼块 / 未提炼统计 / 超限清单共用（原 4 次 ×684ms）
+  let _allRows = [];
+  try { _allRows = (store && typeof store.topics === "function") ? (store.topics() || []) : []; } catch (eR) { _allRows = []; }
+  const overTopics = TOPICDB.enabled ? listOverLimitTopicsFromDb(store, { limit: PROJECT_CHAR_HARD, rows: _allRows }) : [];
   let candTopics = [];
   try {
     // [CRA A+][2026-11-03] 候选主题改为「按最近变更排序」并排除自动索引类主题。
@@ -3767,10 +4231,13 @@ function buildDreamPromptLibrary(extras) {
     //   ⑤排除 INDEX_TOPIC_NAME_RE（T-0263 write_count=7578 会永久霸榜并饿死其他主题）
     //   ⑥日志带值（候选数/池大小/排除数/首位与时间戳），便于事后核对本轮 dream 看到的是谁。
     const _ts = (t) => { const n = Number(t && t.updatedAt); return Number.isFinite(n) ? n : 0; };
-    const _live = (store.topics() || []).filter((t) => String(t.state || "") !== "archived");
+    const _live = _allRows.filter((t) => String(t.state || "") !== "archived");
     // [2026-11-04 设计定稿 §5 · dream 职责收窄] 笔记主题单独成组：dream 的**主职责**是提炼会话笔记，
     //   其他活跃主题只作次要候选（防止笔记被 20 个热点主题挤掉）。命名 `笔记·<wsKey>/<sid8>`。
-    const _notePool = _live.filter((t) => /^笔记·/.test(String(t.name || "")));
+    // [4.5.2 P0 · CRA v4 §14.1-1] 笔记主题「已提炼完」的**唯一判据**：最后一句是指针行（双格式，模块级共享判据）。
+    //   只看最后一句，不看"有没有 marker" —— 后者会把"部分提炼"的主题误判成已完成。
+    const _noteDistilled = (t) => noteTopicDistilled(store, t && t.id);
+    const _notePool = _live.filter((t) => isNoteTopicName(t.name) && !_noteDistilled(t));
     // [审计 F7 修复 2026-11-04] 排除 P2.5 会话检查点主题（`<wsKey>/<sid8>`）：设计 §5 要求「dream 不再处理
     //   checkpoint」，而原候选池只排除了索引主题和笔记 ⇒ 检查点主题仍可能被 dream 当普通主题改写，
     //   破坏「恒 1 句覆盖」约束（memory_dream_patch 没接 p25SessionTopicWriteGuard）。
@@ -3808,14 +4275,16 @@ function buildDreamPromptLibrary(extras) {
   //   不能被 20 个热点主题挤掉。提炼规则照搬 checkpoint-writer.txt:41-58 的七类映射。
   let noteBlock = "";
   try {
-    const _noteRows = (store.topics() || []).filter((t) => String(t.state || "") !== "archived" && /^笔记·/.test(String(t.name || "")));
+    const _noteRows = _allRows.filter((t) => String(t.state || "") !== "archived" && isNoteTopicName(t.name) && !_noteDistilled(t));
     const _sortedNotes = _noteRows.slice().sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || String(a.id).localeCompare(String(b.id)));
     if (_sortedNotes.length) {
       let _nb = "## 会话笔记提炼（本轮**主职责** · 对齐 MiMo notes → MEMORY 的 reconcile）\n"
-        + "共 " + _sortedNotes.length + " 个笔记主题（按最近更新排序；每个会话一个）：\n";
+        + "共 " + _sortedNotes.length + " 个笔记主题（按最近更新排序；每个会话一个；未提炼口径 A = 最后一条指针之后的句数）：\n";
       for (const t of _sortedNotes.slice(0, 10)) {
         const _when = t.updatedAt ? new Date(Number(t.updatedAt)).toISOString().slice(0, 16).replace("T", " ") : "-";
-        _nb += "- " + t.id + "「" + String(t.name) + "」" + (Number(t.sentences) || 0) + " 条（更新 " + _when + "）\n";
+        let _unref = 0;
+        try { _unref = noteUnrefinedCount((store.readTopic(t.id) || {}).sentences || []); } catch (eU) { _unref = Number(t.sentences) || 0; }
+        _nb += "- " + t.id + "「" + String(t.name) + "」" + _unref + " 句未提炼（更新 " + _when + "）\n";
       }
       if (_sortedNotes.length > 10) _nb += "（其余 " + (_sortedNotes.length - 10) + " 个未列出，用 memory_search「笔记·」查）\n";
       _nb += "\n**怎么提炼**：memory_read 读笔记主题 → 逐条判断是否 durable → 按下列七类映射写入：\n"
@@ -3826,7 +4295,14 @@ function buildDreamPromptLibrary(extras) {
         + "  · 精确字面量（端口/路径/命令/ID/文号） → **逐字复制，绝不改写或概括**\n"
         + "  · 有长期价值的引文 → 对应主题\n"
         + "  · 不确定是否 durable → **保留原处，不要删**（笔记是 append-only）\n"
-        + "提炼完在该笔记主题追加一句「已提炼 → <目标topicId>」（memory_dream_patch 的 action:\"append\"），便于下轮跳过。\n";
+        + "\n**收敛交付（4.5.2，必读）**：提炼完成后，**不要**直接改笔记主题（笔记正文只能由插件收敛流程改写；"
+        + "对它调 memory_dream_patch 会被拒 NOTE_TOPIC_DREAM_FORBIDDEN）。改为在**最终文本**里输出一行哨兵 + 一行 JSON：\n"
+        + "```\n" + NOTE_COMPACT_SENTINEL + "\n"
+        + '{"compact":[{"topic":"<笔记主题ID>","pointer":"<YYYY-MM-DD> 已提炼 <N> 句 → <T-id 列表>（原文 session_search sid8=<sid8> 可回溯）","targets":["T-xxxx","T-yyyy"]}]}\n'
+        + "```\n"
+        + "规则：① `targets` 非空，且必须是你本轮**真实写入**（append/edit/replace 使 writeCount 增长）的长期主题；delete/split/review 不算；\n"
+        + "② pointer 里的 T-id 必须与 targets **完全一致**；③ 只列**已提炼完**的笔记主题（没提炼完/拿不准的不要列，下轮继续）；\n"
+        + "④ 插件会用启动快照 + 逐 target 校验（writeCount 增长/未归档/非笔记主题）后才删旧句；校验不过则不收敛、旧句保留（下轮重试）。\n";
       noteBlock = _nb;
     }
   } catch (eNB) { noteBlock = ""; }
@@ -3839,8 +4315,10 @@ function buildDreamPromptLibrary(extras) {
     + (candTopics.length ? "- 候选主题（库内非归档 · 按最近变更排序 · 已排除自动索引类主题，最多 20 个）：" + candTopics.map((t) => t.id + "「" + t.name + "」").join("、") + "\n" : "- 候选主题：（库内暂无）\n")
     + "- 人工稳定层：global.md / index.md（唯一例外；可 read，写入走 memory_dream_patch 的 file=global.md/index.md）。\n"
     + "- 硬约束：只处理上述候选主题、**待审队列主题**与人工稳定层。**主题超限时按语义分片**：先 memory_read 读全文 → 判断哪些句子构成一个独立子主题 → 调 memory_split_topic({ topic, name, sentence_texts, reason })。禁止按字符数机械切；只超 <本档上限 10% 时应优先删/精简。不要手工复制句子。\n";
+  const _noteStats = noteUnrefinedStats(store, _allRows);
   const prompt = "Run one automatic memory consolidation pass for the current DSH memory library (topic DB is the single source of truth; md files are export views).\n"
-    + "Consolidate only durable, VERIFIED information.\n\n" + scope + "\n"
+    + "Consolidate only durable, VERIFIED information.\n"
+    + "会话笔记未提炼：" + _noteStats.topics + " 个主题 / " + _noteStats.sentences + " 句（口径 A：最后一条指针之后的句数；笔记提炼是本轮主职责）\n\n" + scope + "\n"
     + "## Consolidate\n"
     + "1. 跨项目通用（用户偏好/踩坑/方法论）→ global.md（人工稳定层，可写）。\n"
     + "2. 项目专属事实/决策 → 用 memory_dream_patch({ patches: [{ topic: \"<主题ID或名字>\", action: \"append|edit|replace|delete\", ... }] }) 写入对应主题；不要新建 md 文件。\n"
@@ -8460,7 +8938,7 @@ function p25LifecycleSweep(store, opts) {
       try {
         decision = p25Topics.decideLifecycle({
           archivedAt: c.updatedAt,          // 只用最后更新时间（会话退役信号）
-          createdAt: undefined,             // 不拿 createdAt 顶替（防“刚建就归档”）
+          createdAt: undefined,             // 不拿 createdAt 顶替（防「刚建就归档」）
           now: now,
           indexInLine: c.indexInLine,
           policy: policy,
@@ -8697,6 +9175,8 @@ function topicDbStatsSnapshot() {
     upgrade: topicDbUpgradeSummary(),
     reviewQueue: [],         // 待审队列前 5 条（面板可点开；excerpt 即 memory_read 的前几句）
     health: { ok: 0, failed: 0, txDepthLeak: 0, lastWriteAt: null, lastImportAt: null, lastError: null },
+    // [4.5.2 P1-3] 会话笔记未提炼统计（口径 A：最后一条指针之后的句数；只读）
+    noteUnrefined: { topics: 0, sentences: 0, total: 0, items: [] },
     updatedAt: at,
   };
   if (!store) {
@@ -8807,6 +9287,8 @@ function topicDbStatsSnapshot() {
     }
     out.oldestPendingDays = oldest;
     if (out.needsReview > 0) out.pendingNote = "待归类 " + out.needsReview + " 条" + (oldest > 0 ? "（最早 " + oldest + " 天）" : "");
+    // [4.5.2 P1-3] 会话笔记未提炼统计（口径 A：最后一条指针之后的句数；只读，失败降级为零值）
+    try { out.noteUnrefined = noteUnrefinedStats(store, topics); } catch (eNU) { out.noteUnrefined = { topics: 0, sentences: 0, total: 0, items: [], error: String((eNU && eNU.message) || eNU) }; }
     out.health.lastWriteAt = lastWrite || TOPICDB_HEALTH.lastWriteAt || null;
     // 待审队列前 5 条（只读；excerpt = memory_read 会返回的前几句，供面板点开看内容）
     try {
@@ -8987,6 +9469,9 @@ function topicDbPanelBlock() {
   L.push('    h += "<div class=mono>总行 " + num(total) + " · 已合并源 " + num(t.mergedSources) + " · 物理句 " + num(t.physicalSentences) + "</div>";');
   L.push('    h += "<div class=mono>后端 " + esc(t.backend || "-") + " · 库 " + human(t.dbSizeBytes) + " · 库文件 " + esc(t.dbPath || "-") + "</div>";');
   L.push('    h += "<div class=mono>待归类 " + num(t.needsReview) + " 条" + (Number(t.oldestPendingDays || 0) > 0 ? "（最早 " + num(t.oldestPendingDays) + " 天）" : "") + " · dream 自动裁决</div>";');
+  // [4.5.2 P1-3] 会话笔记未提炼统计（口径 A：最后一条指针之后的句数；面板只读展示）
+  L.push('    var nu = t.noteUnrefined || { topics: 0, sentences: 0 };');
+  L.push('    h += "<div class=mono>会话笔记未提炼 " + num(nu.topics) + " 个主题 / " + num(nu.sentences) + " 句（口径 A：最后一条指针之后；dream 自动提炼+收敛）</div>";');
   L.push('    var gt = t.genericTriggers || { count: 0, top: [] };');
   L.push('    h += "<div class=mono>泛化 trigger " + num(gt.count) + " 个" + (gt.threshold != null ? "（覆盖率阈值 >" + num(gt.threshold) + " 主题）" : "") + "</div>";');
   // [topicdb][task-15] 升级状态一行（未迁移 / 版本过旧 / 中断于 <stage> / 就绪）+ 可复制的升级命令（**只读展示**）
@@ -11646,6 +12131,16 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
           out2.push("  " + (t ? rowLine(t) : (u.id + "「" + u.name + "」")));
         }
         if (hier.unmapped > umCap) out2.push("  … 另有 " + (hier.unmapped - umCap) + " 条未归类（limit 可调大，最多 20 条/次）");
+        // [4.5.2 P1-3] 尾部：会话笔记未提炼统计（口径 A = 最后一条指针之后的句数；dream 自动提炼+收敛）
+        try {
+          const _nu = noteUnrefinedStats(store, rows);   // [D10] 复用本函数已取的整库 rows
+          out2.push("");
+          out2.push("[会话笔记] 未提炼 " + _nu.topics + " 个主题 / " + _nu.sentences + " 句（口径 A：最后一条指针之后的句数；dream 整合时自动提炼+收敛）");
+          if (_nu.items.length) {
+            out2.push("  " + _nu.items.slice(0, 5).map((x) => x.id + "「" + String(x.name).replace(/^笔记·/, "") + "」" + x.count + " 句").join("；")
+              + (_nu.total > 5 ? "（…另 " + (_nu.total - 5) + " 个）" : ""));
+          }
+        } catch (eNU2) { /* 统计失败不影响清单 */ }
         return out2.join("\n");
       } catch (e) { return JSON.stringify(topicDbMemErr(e)); }
     },
@@ -12444,15 +12939,38 @@ export default {
       const hit = rows.find((x) => nz(x.name) === nb) || rows.find((x) => nz(x.name).indexOf(nb) >= 0 && nb.length >= 4) || null;
       return hit ? { topic: hit, how: "name" } : null;
     };
+    // [4.5.2 P0 · C4' 守卫] 解析 patch 的**目标主题**（不是入参字符串）：topic 寻址 → resolveTopic；
+    //   file 寻址 → dbPatchTopicFor 名字归一映射（global.md/index.md 属人工稳定层，不映射主题）。
+    //   用于「dream 不得写/删会话笔记主题」的拒绝闸——两条寻址分支都必须覆盖，否则 file 旁路可绕。
+    // [D10 性能] rows/srcMap/nz 由调用方预取一次（整批 patch 复用），避免每个 patch 重扫整库（684ms/次）。
+    const dbPatchGuardTopic = (p, rowsOpt, srcMapOpt, nzOpt) => {
+      try {
+        if (!TOPICDB.enabled || !TOPICDB.ready || !TOPICDB.store) return null;
+        const store = TOPICDB.store;
+        const tref = (p && typeof p.topic === "string" && p.topic.trim()) ? p.topic.trim() : "";
+        if (tref) return resolveTopicRefByStore(store, tref, rowsOpt);
+        const f = (p && typeof p.file === "string" && p.file.trim()) ? p.file.trim() : "";
+        if (!f) return null;
+        const rel0 = f.replace(/\\/g, "/");
+        if (/^(global|index)\.md$/.test(rel0)) return null;
+        const awp = assertMemoryWrite(f, p.action === "edit" ? (typeof p.new_string === "string" ? p.new_string : "") : (p.content || ""));
+        if (!awp.ok) return null;
+        const rows = Array.isArray(rowsOpt) ? rowsOpt : store.topics();
+        const nz = nzOpt || ((TOPICDB.api && typeof TOPICDB.api.normalizeName === "function") ? TOPICDB.api.normalizeName : ((s) => String(s == null ? "" : s).trim().toLowerCase()));
+        const hit = dbPatchTopicFor(awp.rel, rows, srcMapOpt || topicDbSrcMap(store), nz);
+        return hit ? hit.topic : null;
+      } catch (e) { return null; }   // 解析失败 ⇒ 不拦（后续写库会按原逻辑处理）
+    };
     const dbLiveTexts = (store, topicId) => (store.readTopic(topicId).sentences || []).map((s) => String(s.text));
-    const applyDreamPatchesToDb = (valid) => {
+    const applyDreamPatchesToDb = (valid, opts2) => {
       if (!TOPICDB.enabled) return { ok: false, reason: "flag off" };
       const store = TOPICDB.store;
       if (!TOPICDB.ready || !store) return { ok: false, reason: "主题库未就绪" };
       try {
         const be = store.be || {};
         const nz = (TOPICDB.api && typeof TOPICDB.api.normalizeName === "function") ? TOPICDB.api.normalizeName : ((s) => String(s == null ? "" : s).trim().toLowerCase());
-        const rows = store.topics();
+        // [D10 性能] 复用 applyPatches 预扫的 rows（一次 topics()）；兜底仍自行取
+        const rows = (opts2 && Array.isArray(opts2.rows)) ? opts2.rows : store.topics();
         const srcMap = topicDbSrcMap(store);
         // 幂等：整批内容 sha（与顺序无关）
         const sig = valid.map((v) => (v.topicRef ? "topic:" + v.topicRef : v.rel) + "|" + v.action + "|" + String(v.content == null ? "" : v.content) + "|" + String(v.old_string == null ? "" : v.old_string) + "|" + String(v.new_string == null ? "" : v.new_string)).sort().join("\n");
@@ -12470,8 +12988,10 @@ export default {
         for (const v of valid) {
           // [task-54] 寻址优先级：topic 引用 > 人工层例外(global/index 仍写 md) > file 映射
           if (v.topicRef) {
-            const t = resolveTopicRefByStore(store, v.topicRef);
+            const t = resolveTopicRefByStore(store, v.topicRef, rows);
             if (!t) { topicUnresolved.push(v.topicRef + "|" + v.action); continue; }
+            // [4.5.2 P0 · C4' 守卫（兜底）] 解析后的主题是笔记 ⇒ 该条拒写（正常路径在 applyPatches 已整批拒绝）
+            if (isNoteTopicName(t.name)) { conflicts.push({ file: "topic:" + v.topicRef, action: v.action, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "「" + String(t.name) + "」是会话笔记主题，dream 不得写/删（只由插件收敛流程改写）" }); continue; }
             const appliedBefore = applied.length;
             try {
               const live = dbLiveTexts(store, t.id);
@@ -12510,6 +13030,8 @@ export default {
           if (/^(global|index)\.md$/.test(v.rel)) { mdFallback.add(v); continue; }
           const hit = dbPatchTopicFor(v.rel, rows, srcMap, nz);
           if (!hit) { unmapped.push(v.rel + "|" + v.action); mdFallback.add(v); continue; }
+          // [4.5.2 P0 · C4' 守卫（兜底）] file 名归一映射到笔记主题同样拒写（防 file 寻址旁路）
+          if (isNoteTopicName(hit.topic.name)) { conflicts.push({ file: v.rel, action: v.action, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "「" + String(hit.topic.name) + "」是会话笔记主题（file 名归一命中），dream 不得写/删" }); continue; }
           if (/^(projects|knowledge|sessions|tools)\//.test(v.rel)) exportViews.add(v.rel);
           const tid = hit.topic.id;
           const appliedBefore0 = applied.length;
@@ -12629,6 +13151,38 @@ export default {
           }
         }
       }
+      // [4.5.2 P0 · C4' 守卫] dream 不得写/删**会话笔记主题**（笔记正文 append-only，只由插件收敛流程改写）。
+      //   判据用**解析后的 topic**（不是入参字符串）：topic 寻址 → resolveTopic；file 寻址 → 名字归一映射。
+      //   命中即整批拒绝（与 EXPORT_VIEW_READONLY 同模式，绝不半批落盘），返回 NOTE_TOPIC_DREAM_FORBIDDEN。
+      let _dbRowsCache = null;   // [D10] 本批 rows 缓存（守卫预扫与 applyDreamPatchesToDb 共用，一次 topics()）
+      if (TOPICDB.enabled) {
+        // [D10 性能] 整批预扫只取一次 rows/srcMap/nz（此前每个 patch 各取一次 ≈684ms/次）
+        let _gRows = null, _gSrcMap = null, _gNz = null;
+        try {
+          const _gs = TOPICDB.store;
+          if (_gs) {
+            _gRows = _gs.topics() || [];
+            _gSrcMap = topicDbSrcMap(_gs);
+            _gNz = (TOPICDB.api && typeof TOPICDB.api.normalizeName === "function") ? TOPICDB.api.normalizeName : ((s) => String(s == null ? "" : s).trim().toLowerCase());
+          }
+        } catch (eG) { _gRows = null; _gSrcMap = null; _gNz = null; }
+        _dbRowsCache = _gRows;
+        for (let _i = 0; _i < patches.length; _i++) {
+          const _p = patches[_i];
+          if (!_p || typeof _p !== "object") continue;
+          const _t = dbPatchGuardTopic(_p, _gRows, _gSrcMap, _gNz);
+          if (_t && isNoteTopicName(_t.name)) {
+            const _msg = "「" + String(_t.name) + "」（" + String(_t.id) + "）是会话笔记主题：笔记正文 append-only，只能由插件收敛流程改写；dream 不得 append/edit/replace/delete。";
+            try { monitorEvent("note", "dream-patch-note-denied " + String(_t.id)); } catch (eM) {}
+            return {
+              ok: false, mode: "rejected", error: "NOTE_TOPIC_DREAM_FORBIDDEN", wrote: 0, rejected: true,
+              message: _msg,
+              hint: "按任务书在最终文本输出 " + NOTE_COMPACT_SENTINEL + " + {\"compact\":[{\"topic\",\"pointer\",\"targets\"}]} 交给插件收敛；不要直接改笔记主题",
+              errors: ["patches[" + _i + "] " + _msg],
+            };
+          }
+        }
+      }
       const errors = []; const seen = new Set(); let valid = [];
       for (let i = 0; i < patches.length; i++) {
         const p = patches[i];
@@ -12740,7 +13294,7 @@ export default {
       };
       let DB_RES = null;
       if (TOPICDB.enabled && errors.length === 0) {
-        const dbTry = applyDreamPatchesToDb(valid);
+        const dbTry = applyDreamPatchesToDb(valid, { rows: _dbRowsCache });
         // ok:true=全成功；duplicate=幂等跳过；conflicts 数组存在=DB 已按条处理（冲突条目已回滚）——
         //   这三种都**不能**当"整体失败"再回落 md（否则冲突会被 md 静默忽略，语义就假了）。
         if (dbTry && (dbTry.ok === true || dbTry.duplicate === true || Array.isArray(dbTry.conflicts))) {
@@ -17782,6 +18336,9 @@ compatOn(ctx, "session/event", (session, event) => {
              if (!sents.length) return JSON.stringify({ ok: false, code: "EMPTY_TOPIC", message: "主题没有正文句子" });
              const st = String(rt.state || "");
              if (st === "archived") return JSON.stringify({ ok: false, code: "BAD_STATE", message: "归档主题不能拆分" });
+             // [4.5.2 P0 · C4' 守卫] 笔记主题不得作为 split **源**：splitTopic 会给源主题 append 拆分指针句 ⇒
+             //   笔记最后一句不再是 note pointer（P0-1 会当未提炼重新处理）⇒ 直接拒绝。
+             if (isNoteTopicName(rt.name)) return JSON.stringify({ ok: false, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "「" + String(rt.name) + "」是会话笔记主题：笔记正文 append-only，不能作为拆分源（只由插件收敛流程改写）" });
              if (st === "needs_review") { /* [2026-11-04 starry 裁决] 原实现在此硬拒（「人工裁决队列，dream 不得拆分」）⇒
                   但 needs_review 是**内容质量**判定（导入期 seed 按名字判近重复），超限是**容量**问题，两者正交；
                   真机实证 T-0436(93814/9000)、T-0481(47756/40000) 恰好两样都占 ⇒ 拆分被永久阻断、只能烂在队列里。
@@ -17896,6 +18453,8 @@ compatOn(ctx, "session/event", (session, event) => {
                const dstId = String(dst.id || "");
                if (dstId === srcId) return JSON.stringify({ ok: false, code: "BAD_TARGET", message: "into 不能是源主题自己" });
                if (String(dst.state || "") === "archived") return JSON.stringify({ ok: false, code: "BAD_TARGET", message: "目标主题已归档，不能并入" });
+               // [4.5.2 P0 · C4' 守卫] merge 的 into 不得是笔记主题（appendSentence 会真写入笔记、bump writeCount）
+               if (isNoteTopicName(dst.name)) return JSON.stringify({ ok: false, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "into 不能是会话笔记主题「" + String(dst.name) + "」（append-only，只由插件收敛流程改写）" });
                let dt = null;
                try { dt = store.readTopic(dstId); } catch (eD) { return JSON.stringify({ ok: false, code: "TARGET_NOT_FOUND", message: "目标主题读取失败：" + dstId }); }
                const dstSents = (dt && dt.sentences) || [];
@@ -17964,7 +18523,7 @@ compatOn(ctx, "session/event", (session, event) => {
              + "③ 跨项目观察（「X 项目也这么干过」）④ 给未来自己的上下文（几周后才重要）⑤ 精确字面量（端口/路径/命令/ID/文号）。"
              + "**不记**：任务内的普通进展、临时变量名、可从代码/日志直接查到的东西。"
              + "**宁可多记**：同内容重复追加会被自动跳过（不报错）——去重是工具的活，不是你的负担。"
-             + "dream 整合时会读本会话笔记并提炼进长期记忆库（提炼过的标「已提炼 → T-xxxx」）。",
+             + "dream 整合时会读本会话笔记并提炼进长期记忆库；提炼完成后由插件**收敛**（旧句压缩成一条指针行，笔记正文仍 append-only，你不需要也不要自己标 marker）。",
            parameters: {
              type: "object",
              properties: {
@@ -18027,7 +18586,8 @@ compatOn(ctx, "session/event", (session, event) => {
                // 去重：同文本已存在 ⇒ 不重复追加（对齐 MiMo「substantially similar 时写 see entry above」的纪律）
                let cur = [];
                try { cur = (store.readTopic(t.id).sentences || []); } catch (eR) { cur = []; }
-               const dup = cur.find((s) => String((s && s.text) || "").trim().endsWith(text));
+               // [4.5.2 C1'] 指针行不参与后缀判等（否则新 note 文本碰巧以指针结尾会被误判重复）
+               const dup = cur.find((s) => { const tx = String((s && s.text) || ""); return !isNotePointerText(tx) && tx.trim().endsWith(text); });
                if (dup) return JSON.stringify({ ok: true, duplicate: true, topicId: String(t.id), topicName: name, sentenceId: dup.id, note: "同内容已存在，未重复追加" });
                const d = new Date();
                const stamp = pad(d.getHours()) + ":" + pad(d.getMinutes());
@@ -19359,10 +19919,26 @@ lessonFeedText + "\n" +
         return "skipped";   // v2.4.33：区分「空轮跳过」与「已发起」（/dream 命令据此回不同文案）
       }
       const startedAt = Date.now();
+      // [4.5.2 P1-2] 笔记收敛：spawn 前快照（快照先行）——只删快照内且 sha 匹配的句，快照后主 agent 新写的 note 必然幸存。
+      let _noteSnap = null;
+      let _noteTargetBase = null;
+      let _noteSpawnAt = 0;
       // v2.5.1(P3-2b): writtenRels 无条件初始化——原初始化落在 lesson 投喂分支内，候选 0 条时保持 null，
       //   使「本轮落盘清单」在无候选轮（实证 09-08 真机）永远退化为「未落盘任何文件」，事实失真。
       DREAM_WRITTEN_RELS = new Set();
       DREAM_WRITTEN_TOPICS = new Set();
+      // [4.5.2 P1-2] 快照/目标基线（spawn 之前拍；store 不可用 ⇒ 空，本轮不收敛）
+      // [D10 性能] 整库 rows 只取一次（684ms/次 → 1 次），快照与基线同源
+      let _noteRows = null;
+      try {
+        if (TOPICDB.enabled && TOPICDB.ready && TOPICDB.store) {
+          const _ds = noteTakeDreamSnapshots(TOPICDB.store);
+          _noteSnap = _ds.snap;
+          _noteTargetBase = _ds.baseline;
+          _noteRows = _ds.rows;
+          _noteSpawnAt = Date.now();
+        }
+      } catch (eNS) { _noteSnap = null; _noteTargetBase = null; _noteRows = null; }
       let _drmCtrl = null;   // v2.4.28（D4）：dream controller 持引用（注册 SUBAGENT_GUARDS）
       try {
         _drmCtrl = new AbortController();
@@ -19416,6 +19992,42 @@ lessonFeedText + "\n" +
             // 不因 LAST_DREAM_WROTE_AT>=startedAt 误判 success；已落盘文件失败轮不记 hash → 漏写文件下轮仍在候选。
             try { const _g = SUBAGENT_GUARDS.get(String(run.id || "")); if (_g && _g.aborted) doneOk = false; } catch (eG) {}
             guardClear(String(run.id || ""));
+
+            // ═══ [4.5.2 P1-2] 笔记收敛通道（自建，不假设已有解析）═══
+            //   ① dream 最终文本里找哨兵 <!--DSH_MEMORY_COMPACT_JSON-->；② 取其后最后一个平衡 {...}；
+            //   ③ JSON.parse + schema 校验；任一失败 ⇒ 不收敛（只留 monitor 痕迹，笔记原样保留）。
+            //   每个 item 走 noteTopicCompact：C2' 全通过才写 pending + append 指针 + 删快照内 sha 匹配句；
+            //   失败不写 marker/不收敛/留 pending（TTL 30 分钟，启动时重放）。
+            try {
+              if (TOPICDB.enabled && TOPICDB.ready && TOPICDB.store && _noteSnap && _noteTargetBase) {
+                const _parsed = parseNoteCompactPayload(outText);
+                const _nc = { parsed: _parsed.ok, error: _parsed.error || "", applied: [], failed: [] };
+                if (_parsed.ok && _parsed.items.length) {
+                  for (const _it of _parsed.items.slice(0, NOTE_COMPACT_MAX_ITEMS)) {
+                    const _t = resolveTopicRefByStore(TOPICDB.store, _it.topic, _noteRows);   // [D10] 复用 spawn 前 rows
+                    if (!_t || !isNoteTopicName(_t.name)) { _nc.failed.push(String(_it.topic) + ":not-note-topic"); continue; }
+                    const _r = noteTopicCompact(TOPICDB.store, _t.id, {
+                      pointer: _it.pointer, targets: _it.targets, baseline: _noteTargetBase,
+                      snapshot: _noteSnap[String(_t.id)], doneOk: doneOk, spawnAt: _noteSpawnAt,
+                      rows: _noteRows,   // [D10] 复用 spawn 前整库 rows（validate 的 target 仍取单行当前值）
+                    });
+                    if (_r.ok) _nc.applied.push({ topicId: String(_t.id), deleted: (_r.deleted || []).length });
+                    else _nc.failed.push(String(_t.id) + ":" + String(_r.code || "fail") + (Array.isArray(_r.errors) && _r.errors.length ? "(" + String(_r.errors[0]).slice(0, 80) + ")" : ""));
+                  }
+                }
+                NOTE_COMPACT_STATS.last = { at: Date.now(), parsed: _nc.parsed, error: _nc.error, applied: _nc.applied, failed: _nc.failed };
+                NOTE_COMPACT_STATS.count += _nc.applied.length;
+                // 无哨兵 = 普通 dream 轮（不收敛）⇒ 不写 monitor（避免每轮噪音）；解析失败/收敛结果才留痕
+                if (_nc.parsed || _nc.error !== "no-sentinel") {
+                  try {
+                    monitorEvent("note", "dream-compact parsed=" + (_nc.parsed ? "1" : "0") + (_nc.error ? "(" + _nc.error + ")" : "")
+                      + " ok=" + _nc.applied.length + " fail=" + _nc.failed.length + (_nc.failed.length ? " " + _nc.failed.join("|").slice(0, 200) : ""));
+                  } catch (eM) { /* 监控失败不影响结算 */ }
+                }
+                if (_nc.applied.length) clog("[dsh-memory] [4.5.2] 笔记收敛完成：" + _nc.applied.map((x) => x.topicId + "(-" + x.deleted + "句)").join("、"));
+                if (_nc.failed.length) cwarn("[dsh-memory] [4.5.2] 笔记收敛未通过（旧句保留、下轮重试）：" + _nc.failed.join(" | ").slice(0, 300));
+              }
+            } catch (eNC) { cwarn("[dsh-memory] [4.5.2] 笔记收敛异常（不影响 dream 结算）：", (eNC && eNC.message) || String(eNC)); }
 
             // [P3-3 记账][2026-11-02] dream 一轮的真实消耗入账（u/startedAt/doneOk 全现成）。
             //   ⚠ 与 hostUsage 是同一批 token 的**归因副本**（子代理 usage 已被 hostUsage 记过），
@@ -20491,6 +21103,21 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       + " updateCheck=" + (PLUGIN_CFG.updateCheckEnabled ? "on(每日一次)" : "off")
       + "（memory_search / session_search / dsh_spiral_thresh / memory_onboard / /dream /memory-init /memory-update /memory-search /session-search /subagents-archive 已挂载，定时器运行中）");
 
+    // [4.5.2 P1-2] 启动时重放未完成的「笔记收敛」pending（TTL 30 分钟；重过 C2' 校验后用快照 CAS 幂等重做）。
+    //   错峰两次（10s / 120s）：首次可能主题库尚未就绪；失败只留痕，绝不阻塞启动。
+    try {
+      const _noteReplayRun = async (tag) => {
+        try {
+          const st = await topicDbEnsure();
+          if (!st) return;
+          const r = noteCompactReplayPending(st, {});
+          if (r.scanned) clog("[dsh-memory] [4.5.2] 笔记收敛 pending 重放（" + tag + "）：扫描 " + r.scanned + " / 重做 " + r.redone + " / 过期 " + r.expired + " / 失败 " + r.failed);
+        } catch (eR) { cwarn("[dsh-memory] [4.5.2] 笔记收敛 pending 重放异常（不影响主流程）：", (eR && eR.message) || String(eR)); }
+      };
+      setTimeout(() => { _noteReplayRun("启动+10s"); }, 10000);
+      setTimeout(() => { _noteReplayRun("启动+120s"); }, 120000);
+    } catch (eNR) { /* 定时器启动失败不影响主流程 */ }
+
     // v2.2.6：检索层启动自检——异步错峰执行不阻塞就绪；结果进监控汇总与零结果提示，失配必暴露
     setTimeout(() => { runRetrievalSelfCheck(); }, 3000);
 
@@ -20596,6 +21223,28 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       P4_TEST_HOOKS.compactOnce = compactOnce;
       P4_TEST_HOOKS.startSubagentCompat = startSubagentCompat;
       P4_TEST_HOOKS.getWriterPreset = () => String(PLUGIN_CFG.writerPreset || "");
+      // [4.5.2][note-compact] 笔记收敛测试钩子（模块级纯函数引用 + 内部状态探针）
+      NOTE_TEST_HOOKS.isNotePointerText = isNotePointerText;
+      NOTE_TEST_HOOKS.isNoteTopicName = isNoteTopicName;
+      NOTE_TEST_HOOKS.parseNoteCompactPayload = parseNoteCompactPayload;
+      NOTE_TEST_HOOKS.noteFormatPointer = noteFormatPointer;
+      NOTE_TEST_HOOKS.noteTakeSnapshot = noteTakeSnapshot;
+      NOTE_TEST_HOOKS.noteTakeTargetBaseline = noteTakeTargetBaseline;
+      NOTE_TEST_HOOKS.noteCompactValidate = noteCompactValidate;
+      NOTE_TEST_HOOKS.noteTopicCompact = noteTopicCompact;
+      NOTE_TEST_HOOKS.noteCompactReplayPending = noteCompactReplayPending;
+      NOTE_TEST_HOOKS.noteUnrefinedStats = noteUnrefinedStats;
+      NOTE_TEST_HOOKS.noteUnrefinedCount = noteUnrefinedCount;
+      NOTE_TEST_HOOKS.notePendingList = notePendingList;
+      NOTE_TEST_HOOKS.getLastCompact = () => (NOTE_COMPACT_STATS.last ? JSON.parse(JSON.stringify(NOTE_COMPACT_STATS.last)) : null);
+      NOTE_TEST_HOOKS.hasPending = (topicId) => !!notePendingGet(TOPICDB.store, String(topicId || ""));
+      NOTE_TEST_HOOKS.notePendingPut = (topicId, rec) => notePendingPut(TOPICDB.store, topicId, rec);
+      NOTE_TEST_HOOKS.notePendingGet = (topicId) => notePendingGet(TOPICDB.store, String(topicId || ""));
+      NOTE_TEST_HOOKS.notePendingDel = (topicId) => notePendingDel(TOPICDB.store, String(topicId || ""));
+      NOTE_TEST_HOOKS.notePendingIndexList = () => notePendingIndexList(TOPICDB.store);
+      NOTE_TEST_HOOKS.sentinel = NOTE_COMPACT_SENTINEL;
+      NOTE_TEST_HOOKS.ttlMs = NOTE_COMPACT_TTL_MS;
+      NOTE_TEST_HOOKS.pointerRe = NOTE_POINTER_RE;
     } catch (eP0Hooks) {
       try { cwarn("[dsh-memory] [P0] 测试钩子接线失败（不影响业务）：", (eP0Hooks && eP0Hooks.message) || String(eP0Hooks)); } catch (e2h) {}
     }

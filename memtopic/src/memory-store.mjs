@@ -1402,7 +1402,7 @@ export class MemoryStore {
    *   · readTopic/topics/topicCounts/export 全部按"已删"过滤（deleted.index）。
    * 返回 { ok, id, removedSha, topicId }
    */
-  deleteSentence(topicRef, selector = {}, { actor = 'runtime', claimedActor, actualActor } = {}) {
+  deleteSentence(topicRef, selector = {}, { actor = 'runtime', claimedActor, actualActor, reason = null } = {}) {
     const ident = resolveActor({ claimed: claimedActor == null ? actor : claimedActor, actual: actualActor });
     if (!can(ident.actor, 'write')) {
       this._audit('perm.denied', { actor: ident.actor, detail: { action: 'deleteSentence', topic: String(topicRef), claimed: ident.claimed } });
@@ -1435,7 +1435,12 @@ export class MemoryStore {
     this._audit('sentence.delete', {
       at: t0, topicId: t.id, sentenceId: target.id,
       oldSha: target.sha, oldText: target.text, newText: '', actor: ident.actor,
-      detail: { at: t0, by: ident.actor, removedSha: target.sha, historicRetained: true, dreamPatchDelete: true },
+      // [4.5.2] H5：独立 reason（如 note-compact）让审计可区分「dream patch 删除」与「笔记收敛删除」；
+      //   不传 reason 时保持旧口径 dreamPatchDelete:true（既有调用方零变化）。
+      detail: Object.assign(
+        { at: t0, by: ident.actor, removedSha: target.sha, historicRetained: true, dreamPatchDelete: reason ? false : true },
+        reason ? { reason: String(reason).slice(0, 120) } : {},
+      ),
     });
     return { ok: true, id: target.id, removedSha: target.sha, topicId: t.id };
   }
