@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let react = require("react");
 		let runtime_client = require("@deepseek-ai/dsh-client-store");
-		// [memory-ops-toast] Toast 原语（holdMs 2000 + 默认 1000ms 淡出 = 3s）；旧宿主缺该基线模块时降级为无 Toast（不影响设置页）
+		// [memory-ops-toast] Toast 原语（holdMs 5000 + 默认 1000ms 淡出 = 6s）；旧宿主缺该基线模块时降级为无 Toast（不影响设置页）
 		let primitives = null;
 		try { primitives = require("@deepseek-ai/dsh-client-ui-primitives"); } catch (ePrim) { primitives = null; }
 
@@ -575,13 +575,13 @@ window.__ModuleLoader__.load({
 		
 		// ═══ [memory-ops-toast 2026-11-08] 记忆类工具操作语义化 Toast ═══
 		//   数据源：GET /dsh-memory/ops.json?since=<ms>（host 内存环形缓冲，零 token 成本）。
-		//   形态：shell.overlay（kind:"list"，frame-wide 浮层，与 chat quota 提示互不顶掉）+ Toast（holdMs 2000 + 默认 1000 淡出 = 3s）。
+		//   形态：shell.overlay（kind:"list"，frame-wide 浮层，与 chat quota 提示互不顶掉）+ Toast（holdMs 5000 + 默认 1000 淡出 = 6s）。
 		//   防抖（严格）：合并键=工具名+成败；2s 窗口同类累加 ×N；同时只显示 1 条；队列上限 3（超丢最旧）；失败永不合并、永不丢弃。
 		//   状态放模块作用域（单模块闭包，跨工具调用天然共享同一队列）。
 		const OPS_POLL_MS = 2000;
 		const OPS_QUEUE_MAX = 3;
 		const OPS_MERGE_MS = 2000;
-		const OPS_HOLD_MS = 2000;   // Toast holdMs；+ 默认 1000ms 淡出 = 整条 3s
+		const OPS_HOLD_MS = 5000;   // Toast holdMs；+ 默认 1000ms 淡出 = 整条 6s
 		const OPS_ACTION = {
 			memory_search: "查询记忆",
 			memory_read: "读取记忆",

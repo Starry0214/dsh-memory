@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.4";
+const PLUGIN_VERSION = "4.5.6";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -3316,6 +3316,8 @@ export {
   INTENT_SECTIONS_8 as __intentSections8, INTENT_LEGACY_SECTIONS as __intentLegacySections,
   INTENT_TOTAL_BUDGET as __intentTotalBudget, INTENT_DELETE_ORDER as __intentDeleteOrder,
   // [memory-ops-toast] 自测钩子（只读/纯内存；生产行为不变）
+  topicDbHierarchy as __topicDbHierarchy, topicDbLevelMap as __topicDbLevelMap,   // [4.5.6] 口径自测钩子
+  topicDbPanelBlock as __topicDbPanelBlock,
   memoryOpsPayload as __memoryOpsPayload, MEMORY_OPS as __memoryOpsRing,
   MEMORY_OPS_MAX as __memoryOpsMax, recordMemoryOp as __recordMemoryOp,
 };
@@ -4309,6 +4311,12 @@ function noteTopicCompact(store, topicId, opts) {
     const st0 = noteTopicState(store, tid);
     if (!st0.ok) return { ok: false, code: "READ_FAILED", errors: [st0.error || "readTopic 失败"] };
     if (isNoteTopicName(st0.name) !== true) return { ok: false, code: "NOT_NOTE_TOPIC", errors: ["目标不是笔记主题：" + st0.name] };
+    // [4.5.6 ③] 归档主题拒绝收敛：archived 只读（写 note 时由 memory_note 先复活；收敛不复活）
+    if (String(st0.state || "") === "archived") {
+      notePendingDel(store, tid);
+      try { monitorEvent("note", "compact-reject-archived " + tid); } catch (eM) { /* 忽略 */ }
+      return { ok: false, code: "ARCHIVED", topicId: tid, errors: ["笔记主题已归档（archived 只读），拒绝收敛；实际写 note 时会先复活"] };
+    }
     // [D1 · §5 幂等前置] 主题只剩 1 行且就是指针 ⇒ 已经收敛完成：直接 skip（**不删既有指针**、不动正文、清掉残留 pending）
     if (st0.sentences.length === 1 && isNotePointerText(st0.sentences[0].text)) {
       notePendingDel(store, tid);
@@ -8597,7 +8605,18 @@ function topicDbHierarchy(store, rows, levelMap) {
   const domains = live.filter((t) => levelOfRow(t) === "domain").sort((a, b) => (a.id < b.id ? -1 : 1));
   const projectsAll = live.filter((t) => levelOfRow(t) === "project");
   const detailsAll = live.filter((t) => levelOfRow(t) === "detail" && t.parentId);
-  const unmappedAll = live.filter((t) => levelOfRow(t) === "detail" && !t.parentId);
+  // [4.5.6 ①] 系统主题（会话笔记 `笔记·*` / P2.5 会话检查点 `<wsKey>/<sid8>`）设计上就不挂项目树，
+  //   把它们算进「未归类」是指标失真（真机：未归类 15 个全是笔记主题，真实待归类=1）。
+  //   判据复用模块级既有函数：isNoteTopicName()（NOTE_TOPIC_PREFIX_RE）+ p25Topics.isSessionTopicName()。
+  const isSystemTopic = (t) => {
+    const nm = String((t && t.name) || "");
+    if (isNoteTopicName(nm)) return true;   // 笔记·（先判：笔记主题名也以 /sid8 结尾，会被会话正则命中）
+    try { return (typeof p25Topics.isSessionTopicName === "function") && p25Topics.isSessionTopicName(nm); } catch (eSys) { return false; }
+  };
+  const detailNoParent = live.filter((t) => levelOfRow(t) === "detail" && !t.parentId);
+  const systemAll = detailNoParent.filter(isSystemTopic);
+  const noteAll = systemAll.filter((t) => isNoteTopicName(String((t && t.name) || "")));
+  const unmappedAll = detailNoParent.filter((t) => !isSystemTopic(t));
   const domainsOut = domains.map((d) => {
     const projs = projectsAll.filter((p) => p.parentId === d.id);
     const direct = detailsAll.filter((x) => x.parentId === d.id);   // 直挂域的"单成员明细"
@@ -8618,12 +8637,16 @@ function topicDbHierarchy(store, rows, levelMap) {
     main: { domains: domains.length, projects: projectsAll.length, total: domains.length + projectsAll.length },
     details: detailsAll.length,
     unmapped: unmappedAll.length,
+    // [4.5.6 ①] 系统主题单列（面板/工具分开展示；noteTopics=会话笔记数，checkpointTopics=P2.5 检查点数）
+    systemTopics: systemAll.length,
+    noteTopics: noteAll.length,
+    checkpointTopics: systemAll.length - noteAll.length,
     // [task-27] 交叉校验用的"全库"口径（与 topicCounts() 同义：含 archived / 已合并源主题）
     sentences: rows.reduce((s, t) => s + Number(t.sentences || 0), 0),
     physicalSentences: rows.reduce((s, t) => s + Number(t.physicalSentences == null ? t.sentences : t.physicalSentences || 0), 0),
     archived: rows.filter((t) => t.state === "archived").length,
     merged: rows.filter((t) => t.mergedInto).length,
-    counts: { domains: domains.length, projects: projectsAll.length, directDetails: directAll, details: detailsAll.length, unmapped: unmappedAll.length },
+    counts: { domains: domains.length, projects: projectsAll.length, directDetails: directAll, details: detailsAll.length, unmapped: unmappedAll.length, system: systemAll.length, notes: noteAll.length },
     domains: domainsOut,
     unmappedItems: unmappedAll.slice(0, TOPICDB_HIER_UNMAPPED_CAP).map(pickIdName),
     caps: { detailPerProject: TOPICDB_HIER_DETAIL_CAP, unmapped: TOPICDB_HIER_UNMAPPED_CAP },
@@ -9225,6 +9248,63 @@ function p25LifecycleSweep(store, opts) {
   }
 }
 export { p25LifecycleSweep as __p25LifecycleSweep };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// [4.5.6 ③] 笔记主题归档出口（stale note sweep）
+//   背景：笔记主题按会话建（`笔记·<wsKey>/<sid8>`），会话结束后永不消失；已提炼完的笔记正文只剩
+//   1 行指针（内容早已进长期库），却仍留在 active 区/注册表/dream 候选。
+//   判据（CRA note-topic-archive §0.3）：state==="active" + readTopic **live==1** 且该句 isNotePointerText
+//   + now - updatedAt >= 30d + 无 noteCompact pending。⚠ 必须用 live 口径（readTopic().sentences，
+//   已过滤 deleted.index 墓碑），**不要用 raw 物理行数**（T-0493 教训：raw 3 / live 1，踩过两次）。
+//   ⚠ 用 updatedAt（最后内容 append/状态变更时间；markHit 不改它 ⇒ 读/搜不会续期），不用 stateSince/createdAt。
+//   取舍（CRA §4.8）：archived **默认不被 memory_search 检索**（topicDbSearchTopics/topicDbContentSearch
+//   都跳过 archived），只有 memory_read <id> / memory_topics{state:"archived"} 可定位；笔记归档时正文只剩
+//   1 行指针（内容已提炼进长期库）⇒ 可接受。
+//   纪律：每日一次（挂 p25LifecycleTick，不新增定时器）、单次 limit 20、幂等（archived 跳过）、单条失败不中断。
+// ═══════════════════════════════════════════════════════════════════════════
+const NOTE_ARCHIVE_DAYS = 30;
+const NOTE_ARCHIVE_LIMIT = 20;
+function archiveStaleNoteTopics(store, opts) {
+  const o = opts || {};
+  const out = { scanned: 0, candidates: 0, archived: 0, skipped: 0, details: [] };
+  try {
+    if (!store || typeof store.topics !== "function" || typeof store.readTopic !== "function") return Object.assign(out, { error: "store-unavailable" });
+    const now = Number.isFinite(Number(o.now)) ? Number(o.now) : Date.now();
+    const days = Number.isFinite(Number(o.days)) ? Number(o.days) : NOTE_ARCHIVE_DAYS;
+    const limit = Math.max(1, Math.min(NOTE_ARCHIVE_LIMIT, Math.floor(Number(o.limit) || NOTE_ARCHIVE_LIMIT)));
+    const cutoff = days * 86400000;
+    const rows = store.topics() || [];
+    const cands = rows.filter((t) => t && isNoteTopicName(String(t.name || "")) && String(t.state || "") === "active");
+    out.scanned = cands.length;
+    for (const t of cands) {
+      if (out.archived >= limit) break;
+      try {
+        const age = now - Number(t.updatedAt || 0);
+        if (!(age >= cutoff)) continue;
+        const live = (store.readTopic(t.id).sentences || []);
+        if (live.length !== 1) continue;                                     // live==1（不是 raw 物理行数）
+        if (!isNotePointerText(live[0] && live[0].text)) continue;           // 唯一一句必须是指针
+        let pend = null;
+        try { pend = notePendingGet(store, t.id); } catch (eP) { pend = null; }
+        if (pend) { out.skipped += 1; continue; }                            // 有 pending ⇒ 交给 dream，不归档
+        out.candidates += 1;
+        if (typeof store.archiveTopic !== "function") continue;
+        store.archiveTopic(t.id, { actor: "runtime", reason: "note-stale(>30d)", pointer: true });
+        out.archived += 1;
+        out.details.push({ id: t.id, name: String(t.name || ""), ageDays: Math.floor(age / 86400000), updatedAt: Number(t.updatedAt || 0) });
+        try { monitorEvent("note", "archive " + t.id + " age=" + Math.floor(age / 86400000) + "d live=1 pointer"); } catch (eM) { /* 忽略 */ }
+      } catch (e1) {
+        cwarn("[dsh-memory] [note-archive] 单条归档失败（跳过，不中断）：" + String(t && (t.id || t.name)) + " — " + ((e1 && e1.message) || String(e1)));
+      }
+    }
+    out.skipped = Math.max(out.skipped, out.scanned - out.archived);
+    return out;
+  } catch (e) {
+    cwarn("[dsh-memory] [note-archive] stale note sweep 异常（不影响主流程）：", (e && e.message) || String(e));
+    return Object.assign(out, { error: "throw:" + ((e && e.message) || String(e)) });
+  }
+}
+export { archiveStaleNoteTopics as __archiveStaleNoteTopics, NOTE_ARCHIVE_DAYS as __noteArchiveDays, NOTE_ARCHIVE_LIMIT as __noteArchiveLimit };
 // [P2.5][task-20] 生命周期测试钩子容器（模块级；apply 末尾把内部 tick 也挂上）
 const P25_TEST_HOOKS = {
   sweep: null,      // (fakeStore, opts) => p25LifecycleSweep(fakeStore, opts)
@@ -9402,7 +9482,10 @@ function topicDbStatsSnapshot() {
     //   ⚠️ effective* 是历史"无父非归档"口径（三级结构下只剩"域 + 未归类"，与主主题数无关）⇒ 已废弃。
     main: { domains: 0, projects: 0, total: 0 },
     details: 0,              // 已挂父的 L3 明细（= store.topicCounts().details 同义）
-    unmapped: 0,             // parent=null 的 detail（未归类，不进任何域树）
+    unmapped: 0,             // [4.5.6] 真实未归类 = parent=null 的 detail **且非系统主题**（笔记/会话检查点不计入）
+    systemTopics: 0,         // 系统主题总数（会话笔记 + P2.5 会话检查点；设计上无需归类）
+    noteTopics: 0,           // 会话笔记主题数（笔记·*）
+    checkpointTopics: 0,     // P2.5 会话检查点主题数（<wsKey>/<sid8>）
     archived: 0,             // 归档主题（= archivedTopics 的新名，前端优先用这个）
     effective: 0,            // ⚠️ 历史口径（= effectiveTopics），**deprecated**，前端不得当主数字
     effectiveDeprecated: true,
@@ -9490,6 +9573,9 @@ function topicDbStatsSnapshot() {
       const levelMap = topicDbLevelMap(store, topics);
       const hier = topicDbHierarchy(store, topics, levelMap);
       out.unmapped = hier.unmapped;          // 未归类：topicCounts 不提供 ⇒ 只用派生（并参与交叉校验的一致性说明）
+      out.systemTopics = hier.systemTopics || 0;   // [4.5.6 ①] 系统主题单列（笔记/检查点不计入未归类）
+      out.noteTopics = hier.noteTopics || 0;
+      out.checkpointTopics = hier.checkpointTopics || 0;
       out.effective = out.effectiveTopics;
       out.hierarchy = { counts: hier.counts, domains: hier.domains, unmappedItems: hier.unmappedItems, caps: hier.caps };
       if (counts) {
@@ -9708,6 +9794,7 @@ function topicDbPanelBlock() {
   L.push('    h += "<span><span class=k>主主题</span><b>" + num(mn.total) + "</b>（域 " + num(mn.domains) + " / 项目线 " + num(mn.projects) + "）</span>";');
   L.push('    h += "<span><span class=k>明细</span><b>" + num(t.details) + "</b></span>";');
   L.push('    h += "<span><span class=k>未归类</span><b>" + num(t.unmapped) + "</b></span>";');
+    L.push('    h += "<span><span class=k>会话笔记</span><b>" + num(t.noteTopics) + "</b> 个（系统主题，无需归类）</span>";');
   L.push('    h += "<span><span class=k>总行</span><b>" + num(total) + "</b></span>";');
   L.push('    h += "<span><span class=k>句子</span><b>" + num(t.sentences) + "</b></span>";');
   L.push('    h += "<span><span class=k>归档</span><b>" + num(t.archived) + "</b></span>";');
@@ -9721,7 +9808,10 @@ function topicDbPanelBlock() {
   L.push('    h += "<div class=tdb-col><div class=tdbh>状态分布</div>" + bars(t.topicsByState || {}, total) + "</div>";');
   L.push('    h += "<div class=tdb-col><div class=tdbh>账本口径</div>";');
   L.push('    h += "<div class=mono>主题 " + num(total) + " 个 · 句子 " + num(t.sentences) + " 条 · " + num(t.chars) + " 字</div>";');
-  L.push('    h += "<div class=mono>主主题 " + num(mn.total) + "（域 " + num(mn.domains) + " / 项目线 " + num(mn.projects) + "） · 明细 " + num(t.details) + " · 未归类 " + num(t.unmapped) + " · 归档 " + num(t.archived) + "</div>";');
+    L.push('    h += "<div class=mono>主主题 " + num(mn.total) + "（域 " + num(mn.domains) + " / 项目线 " + num(mn.projects) + "） · 明细 " + num(t.details) + " · 归档 " + num(t.archived) + "</div>";');
+    L.push('    h += "<div class=mono>未归类 " + num(t.unmapped) + " 个（parent=null，未挂进任何域树）</div>";');
+    L.push('    var nu0 = t.noteUnrefined || { topics: 0, sentences: 0 };');
+    L.push('    h += "<div class=mono>会话笔记 " + num(t.noteTopics) + " 个（系统主题，无需归类） · 待提炼 " + num(nu0.sentences) + " 句</div>";');
   L.push('    h += "<div class=mono>总行 " + num(total) + " · 已合并源 " + num(t.mergedSources) + " · 物理句 " + num(t.physicalSentences) + "</div>";');
   L.push('    h += "<div class=mono>后端 " + esc(t.backend || "-") + " · 库 " + human(t.dbSizeBytes) + " · 库文件 " + esc(t.dbPath || "-") + "</div>";');
   L.push('    h += "<div class=mono>待归类 " + num(t.needsReview) + " 条" + (Number(t.oldestPendingDays || 0) > 0 ? "（最早 " + num(t.oldestPendingDays) + " 天）" : "") + " · dream 自动裁决</div>";');
@@ -12342,7 +12432,8 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
         const hier = topicDbHierarchy(store, rows, levelMap);
         const archived = rows.filter((t) => t.state === "archived").length;
         const head = "主题清单（层级口径）：主主题 " + hier.main.total + "（域 " + hier.main.domains + " + 项目线 " + hier.main.projects + "）"
-          + " · 明细 " + hier.details + " · 未归类 " + hier.unmapped + " · 归档 " + archived + " · 总行 " + rows.length;
+          + " · 明细 " + hier.details + " · 未归类 " + hier.unmapped + " · 归档 " + archived + " · 总行 " + rows.length
+          + " · 会话笔记 " + hier.noteTopics + "（系统主题，无需归类）";
         const out2 = [head];
         // 域 + 项目线（每域一行，项目线挂在下面）
         out2.push("");
@@ -12380,7 +12471,7 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
         if (!detailGroups) out2.push("  （无已挂父的明细）");
         // 未归类单独一组（parent=null 的 detail）
         out2.push("");
-        out2.push("[未归类] parent=null 的明细 " + hier.unmapped + " 个（不进任何域树；用 memory_topics{like} 逐条查）");
+        out2.push("[未归类] parent=null 的明细 " + hier.unmapped + " 个（不进任何域树；会话笔记/会话检查点等系统主题不计入；用 memory_topics{like} 逐条查）");
         const umCap = Math.min(limit, 20);
         for (const u of hier.unmappedItems.slice(0, umCap)) {
           const t = rows.find((x) => x.id === u.id);
@@ -12391,7 +12482,7 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
         try {
           const _nu = noteUnrefinedStats(store, rows);   // [D10] 复用本函数已取的整库 rows
           out2.push("");
-          out2.push("[会话笔记] 未提炼 " + _nu.topics + " 个主题 / " + _nu.sentences + " 句（口径 A：最后一条指针之后的句数；dream 整合时自动提炼+收敛）");
+          out2.push("[会话笔记] " + hier.noteTopics + " 个（系统主题，无需归类） · 待提炼 " + _nu.sentences + " 句（口径 A：最后一条指针之后的句数；dream 整合时自动提炼+收敛）");
           if (_nu.items.length) {
             out2.push("  " + _nu.items.slice(0, 5).map((x) => x.id + "「" + String(x.name).replace(/^笔记·/, "") + "」" + x.count + " 句").join("；")
               + (_nu.total > 5 ? "（…另 " + (_nu.total - 5) + " 个）" : ""));
@@ -12503,6 +12594,20 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
             topic: _p25g.topicName, topicId: _p25g.topicId, message: _p25g.message,
           });
         }
+        // [4.5.6 ③] archived 只读：memory_write（dream）不得直接写归档主题（复活只给 memory_note 的实际写入；
+        //   archived 默认不被 memory_search 检索，memory_read 仍可读回原文）。
+        try {
+          const _stW = store.readTopic(topic);
+          if (_stW && String(_stW.state || "") === "archived") {
+            return JSON.stringify({ ok: false, code: "ARCHIVED_READONLY", op: op, actor: actor, topic: String(_stW.id || topic),
+              message: "主题已归档（archived 只读）：memory_read 仍可读回原文；归档语义对长期不写的主题生效，不因写入自动复活" });
+          }
+          // note 主题只由 memory_note/noteTopicCompact 维护（dream 直接 append/replace 会破坏「恒 1 句/指针」结构）
+          if (_stW && isNoteTopicName(String(_stW.name || ""))) {
+            return JSON.stringify({ ok: false, code: "NOTE_TOPIC_DREAM_FORBIDDEN", op: op, actor: actor, topic: String(_stW.id || topic),
+              message: "笔记主题由 memory_note / 收敛机制维护，dream 不得直接 memory_write（请提升到长期正式主题）" });
+          }
+        } catch (eStW) { /* 查状态失败不拦：让原路径报它自己的错 */ }
         if (op === "append") {
           // [相似度闸][2026-11-03 用户拍板] 同主题已有相近句 ⇒ **拦下要二次确认**（不静默放行）：
           //   · 非插件唤起的代理（主会话 / 普通子代理）命中即返回 code=SIMILAR_EXISTS，要求模型
@@ -18979,6 +19084,23 @@ compatOn(ctx, "session/event", (session, event) => {
                // [4.5.2 C1'] 指针行不参与后缀判等（否则新 note 文本碰巧以指针结尾会被误判重复）
                const dup = cur.find((s) => { const tx = String((s && s.text) || ""); return !isNotePointerText(tx) && tx.trim().endsWith(text); });
                if (dup) return JSON.stringify({ ok: true, duplicate: true, topicId: String(t.id), topicName: name, sentenceId: dup.id, note: "同内容已存在，未重复追加" });
+               // [4.5.6 ③] archived 主题：**写路径先复活再 append**（方案 B；读/搜不复活）。
+               //   为什么：memory_note 是默认动作，archived 在 TRANSITIONS 里是终点、无公开恢复路径 ⇒
+               //   直接拒绝会把用户卡死在只读。这里只在实际 append 前复活；失败则 fail-closed 绝不写进 archived。
+               if (String(t.state || "") === "archived") {
+                 try {
+                   const rv = store.reviveTopic(t.id, { actor: "runtime", reason: "session-note-write" });
+                   if (!rv || rv.ok === false) {
+                     return JSON.stringify({ ok: false, code: "NOTE_TOPIC_ARCHIVED", topicId: String(t.id), topicName: name,
+                       message: "本会话笔记主题已归档，复活失败，未写入（可 memory_read " + t.id + " 读回原文）：" + ((rv && rv.why) || "unknown") });
+                   }
+                   try { monitorEvent("note", "revive " + String(t.id) + " " + (rv.from || "archived")); } catch (eM) { /* 忽略 */ }
+                   t = Object.assign({}, t, { state: "active" });   // 复活已重置 updatedAt/stateSince（30 天计时重新开始）
+                 } catch (eRv) {
+                   return JSON.stringify({ ok: false, code: "NOTE_TOPIC_ARCHIVED", topicId: String(t.id), topicName: name,
+                     message: "本会话笔记主题已归档，复活异常，未写入（可 memory_read " + t.id + " 读回原文）：" + String((eRv && eRv.message) || eRv) });
+                 }
+               }
                const d = new Date();
                const stamp = pad(d.getHours()) + ":" + pad(d.getMinutes());
                const body = "[" + stamp + "]" + (a.kind ? "(" + String(a.kind) + ") " : " ") + text;
@@ -21241,10 +21363,13 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
         const lastAt = Math.max(last, P25_LIFE_LAST_RUN_MEM);
         if (lastAt && t - lastAt < 24 * 3600000) return null;   // 每天最多一次
         const r = p25LifecycleSweep(TOPICDB.store, { now: t, limit: P25_LIFE_SWEEP_LIMIT });
+        // [4.5.6 ③] 笔记主题归档出口（每日一次，与 p25 sweep 同频；limit 20、幂等、失败静默）
+        let _noteArc = null;
+        try { _noteArc = archiveStaleNoteTopics(TOPICDB.store, { now: t }); } catch (eNA) { cwarn("[dsh-memory] [note-archive] tick 调用失败（不影响主流程）：", (eNA && eNA.message) || String(eNA)); }
         P25_LIFE_LAST_RUN_MEM = t;
         try {
           const st2 = readIntegrateState() || {};
-          st2.p25LifeLastRun = { at: t, lines: r.lines, scanned: r.scanned, archived: r.archived, candidates: r.candidates, skipped: r.skipped };
+          st2.p25LifeLastRun = { at: t, lines: r.lines, scanned: r.scanned, archived: r.archived, candidates: r.candidates, skipped: r.skipped, noteArchived: (_noteArc && _noteArc.archived) || 0, noteScanned: (_noteArc && _noteArc.scanned) || 0 };
           writeIntegrateState(st2);
         } catch (eW) { /* 标记落盘失败 ⇒ 内存标记仍防同日重复 */ }
         if (r.archived > 0) {
@@ -21252,6 +21377,10 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
           try { monitorEvent("p25", "lifecycle archived=" + r.archived + " scanned=" + r.scanned + " candidates=" + r.candidates); } catch (eM) {}
         } else {
           try { monitorEvent("p25", "lifecycle idle scanned=" + r.scanned + (r.error ? " err=" + r.error : "")); } catch (eM2) {}
+        }
+        if (_noteArc && _noteArc.archived > 0) {
+          clog("[dsh-memory] 笔记主题归档：本次归档 " + _noteArc.archived + " 条（扫描 " + _noteArc.scanned + "，候选 " + _noteArc.candidates + "；单次上限 " + NOTE_ARCHIVE_LIMIT + "）");
+          try { monitorEvent("note", "archive-sweep archived=" + _noteArc.archived + " scanned=" + _noteArc.scanned + " candidates=" + _noteArc.candidates); } catch (eM3) { /* 忽略 */ }
         }
         return r;
       } catch (e) {

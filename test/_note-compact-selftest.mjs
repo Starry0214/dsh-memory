@@ -311,7 +311,7 @@ function mkTargetWithWrite() {
   const topicsTool = findTool(fx.captured, "memory_topics");
   if (topicsTool) {
     const out = await topicsTool.execute({}, { agent: { session: { id: "selftest-main-" + rand() } } });
-    ok(typeof out === "string" && out.indexOf("[会话笔记] 未提炼") >= 0, "H2 memory_topics 尾部含「[会话笔记] 未提炼」统计");
+    ok(typeof out === "string" && out.indexOf("[会话笔记] ") >= 0 && out.indexOf("系统主题，无需归类") >= 0 && out.indexOf("待提炼 ") >= 0, "H2 memory_topics 尾部含「[会话笔记] N 个（系统主题，无需归类） · 待提炼 M 句」（4.5.6）");
   } else { ok(false, "H2 memory_topics 工具未注册"); }
   ok(SRC.indexOf("会话笔记未提炼 ") >= 0 && SRC.indexOf("noteUnrefined") >= 0, "H3 面板区块渲染行存在（会话笔记未提炼 N 个主题 / M 句）");
 }

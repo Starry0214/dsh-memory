@@ -8,7 +8,7 @@
 //   ③ 合并键（工具名+成败）/ 合并窗口 2s（同类累加 ×N；超窗新开一条）
 //   ④ 队列上限 3（成功条目超限丢最旧）
 //   ⑤ 失败永不合并、永不丢弃
-//   ⑥ 静态接线（Toast / holdMs 2000 / shell.overlay / 2s 轮询 / 隐藏页暂停 / 端点接线）
+//   ⑥ 静态接线（Toast / holdMs 5000 / shell.overlay / 2s 轮询 / 隐藏页暂停 / 端点接线）
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -90,7 +90,7 @@ try {
   const cli = loadClient();
   const T = cli.__opsTest;
   ok(!!T && typeof T.enqueue === "function" && Array.isArray(T.queue), "C1 client __opsTest 钩子可用", "");
-  ok(T.holdMs === 2000 && T.pollMs === 2000 && T.mergeMs === 2000 && T.queueMax === 3, "C2 常量：holdMs/poll/merge=2000、queueMax=3", JSON.stringify({ holdMs: T.holdMs, pollMs: T.pollMs, mergeMs: T.mergeMs, queueMax: T.queueMax }));
+  ok(T.holdMs === 5000 && T.pollMs === 2000 && T.mergeMs === 2000 && T.queueMax === 3, "C2 常量：holdMs/poll/merge=2000、queueMax=3", JSON.stringify({ holdMs: T.holdMs, pollMs: T.pollMs, mergeMs: T.mergeMs, queueMax: T.queueMax }));
   // 固定时间轴
   const realNow = Date.now;
   let fake = realNow();
@@ -150,7 +150,7 @@ try {
 try {
   const has = (src, s) => src.includes(s);
   ok(has(CLIENT_SRC, 'require("@deepseek-ai/dsh-client-ui-primitives")'), "D1 client require Toast 原语（已声明依赖）");
-  ok(has(CLIENT_SRC, "holdMs: OPS_HOLD_MS") && has(CLIENT_SRC, "const OPS_HOLD_MS = 2000"), "D2 Toast holdMs=2000（+默认 1000 淡出 = 3s）");
+  ok(has(CLIENT_SRC, "holdMs: OPS_HOLD_MS") && has(CLIENT_SRC, "const OPS_HOLD_MS = 5000"), "D2 Toast holdMs=50000（+默认 1000 淡出 = 3s）");
   ok(has(CLIENT_SRC, 'name: "shell.overlay"') && has(CLIENT_SRC, 'ctx.slots.inject("shell.overlay"'), "D3 挂 shell.overlay（kind:list，可多条目）");
   ok(has(CLIENT_SRC, "const OPS_POLL_MS = 2000") && has(CLIENT_SRC, "/dsh-memory/ops.json?since="), "D4 轮询 ops.json 间隔 2s");
   ok(has(CLIENT_SRC, 'document.visibilityState === "hidden"') && has(CLIENT_SRC, "stopOpsPolling()"), "D5 隐藏页暂停 + 卸载清 timer");

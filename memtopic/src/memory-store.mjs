@@ -2002,6 +2002,30 @@ export class MemoryStore {
   }
 
   /**
+   * [4.5.6 ③] 复活已归档主题（**唯一** archived→active 路径；不改全局 TRANSITIONS 表）。
+   *   为什么需要：memory_note 是默认动作，而 archived 在 TRANSITIONS 里是终点、无公开恢复路径 ⇒
+   *   若直接拒绝写入会把用户卡死在只读；方案 B = 只在**实际写 note** 时复活（读/搜不复活），
+   *   归档对「长期不写的会话」仍然生效，不会每次读都复活。
+   *   权限 can(actor,'setState')；只允许 archived→active；走 _restoreState（已重置 updatedAt 与
+   *   state.since ⇒ 30 天计时重新开始）并写审计 topic.revive；非 archived 直接 unchanged 返回（幂等）。
+   * @returns {{ok:boolean,id:string,from:string,to:string,unchanged?:boolean}}
+   */
+  reviveTopic(topicRef, { actor = 'runtime', claimedActor, actualActor, reason = null } = {}) {
+    const ident = resolveActor({ claimed: claimedActor == null ? actor : claimedActor, actual: actualActor });
+    if (!can(ident.actor, 'setState')) {
+      this._audit('perm.denied', { actor: ident.actor, detail: { action: 'reviveTopic', topic: String(topicRef), claimed: ident.claimed } });
+      throw new MemError('PERM_DENIED', `身份「${ident.actor}」不能复活主题`, { actor: ident.actor, action: 'reviveTopic' });
+    }
+    const t = this.be.getTopicById(this.resolveTopic(topicRef).id);
+    if (!t) throw new MemError('NOT_FOUND', '主题不存在: ' + String(topicRef));
+    if (t.state !== 'archived') return { ok: true, id: t.id, from: t.state, to: t.state, unchanged: true };
+    const r = this._restoreState(t.id, 'active', { actor: ident.actor, why: reason || 'revive' });
+    if (!r || r.ok === false) return { ok: false, id: t.id, from: 'archived', to: 'archived', why: (r && r.why) || 'restore-failed' };
+    // 专用审计（_restoreState 已写 topic.state；这里再记一条便于观测「写 note 触发复活」）
+    this._audit('topic.revive', { at: this.nowMs(), topicId: t.id, actor: ident.actor, detail: { from: 'archived', to: 'active', reason: reason || 'revive' } });
+    return { ok: true, id: t.id, from: 'archived', to: 'active' };
+  }
+  /**
    * 簇合并（参考式）：建/复用主主题 → 保留句视图迁入（原序逐字）→ 其余转明细子主题（dormant+parent）
    * → 源主题 archived（不删原文）→ 写 merge 记录（可逆）。**单事务；失败整簇回滚。**
    *

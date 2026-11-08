@@ -1,6 +1,6 @@
 {
-  "version": "4.5.4",
-  "generatedAt": "2026-11-07T20:27:23.895Z",
+  "version": "4.5.6",
+  "generatedAt": "2026-11-08T04:44:31.999Z",
   "files": [
     {
       "path": "AGENTS.template.md",
@@ -10,7 +10,7 @@
     {
       "path": "client/lib/client.js",
       "bytes": 51699,
-      "sha256": "f1bbe7211dd74b87465301aa59236063e8ba07a794e9c28e741da5b7e940c3d2"
+      "sha256": "0ffa37749e0e2f5f38a40691ac702d17101efd6f423542d66e7db7a9d1658caa"
     },
     {
       "path": "client/lib/index.js",
@@ -24,8 +24,8 @@
     },
     {
       "path": "index.js",
-      "bytes": 1561152,
-      "sha256": "4b004a4e071038c6626cdc5355f7e7ddf81643e5fceb0ef3b1a4dec5764a1401"
+      "bytes": 1572490,
+      "sha256": "d9663647e775fa29d32175c76d0faf3c8d1e2f0679413feed66ba864b92b3103"
     },
     {
       "path": "memtopic/src/backend-ledger.mjs",
@@ -69,8 +69,8 @@
     },
     {
       "path": "memtopic/src/memory-store.mjs",
-      "bytes": 130040,
-      "sha256": "090dcf30980b1fa0aaf4a48f58f3c5faadbf928011fd178003b740bc2f677ff9"
+      "bytes": 132206,
+      "sha256": "323b49c871b980fc43758688bb919edf8be6d0beadaec9c5701dc2bc751bc057"
     },
     {
       "path": "memtopic/src/migrate.mjs",
@@ -95,7 +95,7 @@
     {
       "path": "package.json",
       "bytes": 651,
-      "sha256": "30164a88204ef80c96fb8bfea55964249d25dfcc8b38fbafa920aec5e5a6688b"
+      "sha256": "f4b08e1f0a37d99dace880673b3c57aab81bf730257837abc33fa8c3f365c725"
     },
     {
       "path": "tools/session-search.mjs",
@@ -106,12 +106,12 @@
     {
       "path": "version.txt",
       "bytes": 5,
-      "sha256": "cfefa693692e9b79f804536487b57552b3fda6e22b2dd5194a7c0a990f645f76"
+      "sha256": "b5413b4e68035f97ea0eb808127f0fd1236c79ec25b32b186ffcef71747f4677"
     }
   ],
   "zip": {
-    "name": "dsh-memory-4.5.4.zip",
-    "bytes": 772682,
-    "sha256": "0e36751fd3b92504d707db5ec566f48563ff793b354eec39a15c7a1b71910d7e"
+    "name": "dsh-memory-4.5.6.zip",
+    "bytes": 776486,
+    "sha256": "504b0c306acb9575d869d96def26a0a3624495be3aaaa01466f0881149d8bd24"
   }
 }
