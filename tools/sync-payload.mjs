@@ -102,7 +102,7 @@ function walk(root, relDir, out) {
 
 function collect() {
   const files = [];
-  for (const rel of ['index.js', 'package.json', 'version.txt', 'AGENTS.template.md']) {
+  for (const rel of ['index.js', 'package.json', 'version.txt', 'AGENTS.template.md', 'tools/session-search.mjs']) {
     const abs = path.join(ROOT, rel);
     if (!fs.existsSync(abs)) fail(`missing required input: ${rel}`);
     files.push(rel);
@@ -250,7 +250,15 @@ function build(stamp) {
   const version = readVersion();
   const rels = collect();
   const entries = rels.map((rel) => ({ path: rel, data: fs.readFileSync(path.join(ROOT, rel)) }));
-  const files = entries.map((e) => ({ path: e.path, bytes: e.data.length, sha256: sha256(e.data) }));
+  const files = entries.map((e) => {
+    const rec = { path: e.path, bytes: e.data.length, sha256: sha256(e.data) };
+    // [2026-11-08 分发修复] CLI 条目附 version：安装器 CheckOnly / 覆盖判断用（旧安装器忽略未知字段，兼容）
+    if (e.path === 'tools/session-search.mjs') {
+      const m = e.data.toString('utf8').match(/const CLI_VERSION = "([^"]+)"/);
+      if (m) rec.version = m[1];
+    }
+    return rec;
+  });
   const zipBuf = buildZip(entries);
   const zipName = `dsh-memory-${version}.zip`;
   const generatedAt = stamp === 'now' ? new Date().toISOString() : new Date(stamp).toISOString();

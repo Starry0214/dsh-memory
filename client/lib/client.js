@@ -7,6 +7,9 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let react = require("react");
 		let runtime_client = require("@deepseek-ai/dsh-client-store");
+		// [memory-ops-toast] Toast 原语（holdMs 2000 + 默认 1000ms 淡出 = 3s）；旧宿主缺该基线模块时降级为无 Toast（不影响设置页）
+		let primitives = null;
+		try { primitives = require("@deepseek-ai/dsh-client-ui-primitives"); } catch (ePrim) { primitives = null; }
 
 		// 设置命名空间（与宿主插件 installSettingsSection 注册的一致）
 		const NS = "dsh-memory";
@@ -54,6 +57,39 @@ window.__ModuleLoader__.load({
 
 		// [2026-09-23 dsh 升级适配] settingsScope 服务已被删除，改用 configForms
 		const inject = ["slots", "configForms"];
+
+		// [settings-note-stat 2026-11-07] 设置页「会话笔记未提炼」一行（CRA: docs/audit/settings-note-stat_CRA_2026-11-07.md）
+		//   数据源 GET /dsh-memory/note-stat.json（host 侧极小端点 ~25ms/~100B；不用 stats.json：1.4s/461KB）。
+		//   降级纪律：fetch 失败 / 3s 超时 / ok!==true / disabled:true / ready:false / 零值 ⇒ 整行不渲染（绝不显示 undefined/报错）。
+		function noteStatFmt(n) { try { return Number(n).toLocaleString("zh-CN"); } catch (e) { return String(n); } }
+		function NoteStatRow(props) {
+			const p = props || {};
+			const [txt, setTxt] = react.useState("");
+			react.useEffect(() => {
+				let alive = true;
+				const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+				const timer = setTimeout(() => { try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } }, 3000);
+				try {
+					fetch("/dsh-memory/note-stat.json", { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+						.then((r) => (r && r.ok ? r.json() : null))
+						.then((j) => {
+							if (!alive || !j || j.ok !== true || j.disabled === true || j.ready === false) return;
+							const n = Number(j.topics), m = Number(j.sentences);
+							if (!Number.isFinite(n) || !Number.isFinite(m)) return;
+							if (n <= 0 && m <= 0) return;
+							setTxt(noteStatFmt(n) + " 个主题 / " + noteStatFmt(m) + " 句");
+						})
+						.catch(() => { /* 静默：旧版桌面端/无 webServer/网络错误一律隐藏 */ })
+						.finally(() => { try { clearTimeout(timer); } catch (e) { /* 忽略 */ } });
+				} catch (e) { try { clearTimeout(timer); } catch (e2) { /* 忽略 */ } }
+				return () => { alive = false; try { clearTimeout(timer); } catch (e) { /* 忽略 */ } try { ctrl && ctrl.abort(); } catch (e) { /* 忽略 */ } };
+			}, []);
+			if (!txt) return null;
+			return react.createElement("div", { style: p.rowStyle },
+				react.createElement("div", { style: p.labelStyle }, "会话笔记未提炼"),
+				react.createElement("div", { style: p.descStyle }, txt)
+			);
+		}
 
 		// 通用设置 → 记忆（一行一项：每个配置项独立一行，左标签右控件 + 分割线）
 		function MemorySettingsRow(props) {
@@ -157,10 +193,10 @@ window.__ModuleLoader__.load({
 				// 行：统计面板入口（v2.4.3 起设置页不再内嵌汇总文本，详情由面板实时展示）
 				react.createElement("div", { style: rowStyle },
 					react.createElement("div", { style: labelStyle }, "记忆使用统计"),
-					// [logpane 20260930] 桌面端（dsh-app://）里 `<a target="_blank">` 被 Electron 的 setWindowOpenHandler
-					//   拦掉，且页面 fetch /dsh-memory/* 也到不了插件路由（协议处理器只服务 app 文档/资源，实测 HTTP 400）
-					//   ⇒ 桌面端只能由宿主进程拉起系统浏览器，入口是宿主命令 /memory-panel（见插件 index.js）。
-					//   此处链接只服务 web 端；桌面端点击给可执行指引。
+					// [settings-note-stat 2026-11-07] 桌面端（dsh-app://app）的 fetch 经 Electron 协议处理器**转发给已认证 Host**
+					//   （asar lib/main.js#20617-20626 / forwardWebRequest#15877-15907）⇒ /dsh-memory/* 可达；
+					//   旧注释「桌面端 fetch 实测 400」是过期结论，已失效。
+					//   仍保留：`<a target="_blank">` 被 setWindowOpenHandler 拦 ⇒ 桌面端点击给 /memory-panel 指引（链接只服务 web 端）。
 					react.createElement("a", {
 						href: "/dsh-memory/stats",
 						target: "_blank",
@@ -169,12 +205,14 @@ window.__ModuleLoader__.load({
 							try {
 								if (typeof location === "undefined" || location.protocol !== "dsh-app:") return;   // web 端走原生新标签页
 								e.preventDefault();
-								setSaveState(false, "桌面端请发 /memory-panel 打开（宿主调用系统浏览器；dsh-app:// 源访问不到插件路由，实测 400）");
+								setSaveState(false, "桌面端请发 /memory-panel 打开（宿主调用系统浏览器；dsh-app 里 target=_blank 会被拦）");
 							} catch (err) { /* 非浏览器环境忽略 */ }
 						},
 						style: { fontSize: "13px", color: "var(--dsw-alias-link, #3b82f6)", textDecoration: "underline", cursor: "pointer", whiteSpace: "nowrap" }
 					}, "📊 打开详细统计面板")
 				),
+				// [settings-note-stat 2026-11-07] 会话笔记未提炼（只读一行；失败/未就绪/flag 关/零值 ⇒ 静默隐藏）
+				react.createElement(NoteStatRow, { rowStyle: rowStyle, labelStyle: labelStyle, descStyle: descStyle }),
 				// [P3-3 消耗记账] 「消耗」页签（追加段；只读，上方既有行与逻辑零改动）
 				react.createElement(CostPanel, null)
 			);
@@ -391,57 +429,291 @@ window.__ModuleLoader__.load({
 			return react.createElement("div", { style: { display: "flex", flexDirection: "column", width: "100%" } }, children);
 		}
 
-		// ═══════════ [R2 等待浮层] 压缩后等检查点写入时右下角显示进度 ═══════════
-		// 用户原话（2026-11-02）：「等待的时候能不能弹一个悬浮窗告诉用户？不然用户以为卡死了」。
-		// 数据源：GET /dsh-memory/wait.json（插件侧 R2_WAIT_STATE，每 2s 轮询）；只读、失败静默、零依赖。
-		function mountWaitHud() {
+		// ═══ [header-memory-indicator 2026-11-07] 会话标题栏「本会话记忆状态」单枚胶囊 ═══
+		//   形态（CRA 定稿 docs/audit/header-memory-indicator_CRA_2026-11-07.md）：正常态**整枚隐藏**；
+		//   压缩等待 `⏳ 整理中 12s`（蓝，秒数递增 + 呼吸动画）；待整理积压 `30 句待整理`（黄）；优先级 等待 > 积压 > 隐藏。
+		//   tooltip 用原生 title；点击 web 端新标签开 /dsh-memory/stats，桌面端（dsh-app:）给 /memory-panel 指引。
+		//   数据源：GET /dsh-memory/wait.json（2s；仅 active 且 sid8 匹配当前会话才显示，别的会话压缩不串）/
+		//           GET /dsh-memory/note-stat.json?sid=<sessionId>（15s；per-session 未提炼句数 ≥ 阈值才显示）。
+		//   纪律：失败静默隐藏；sessionId 变化 ⇒ abort 旧请求 + 清旧值 + 立即重取；卸载必清 timer；页面隐藏暂停轮询。
+		const HEADER_NOTE_MIN = 10;     // 积压阈值：<10 句不焦虑，避免标题栏常驻（CRA §6.4）
+		const HEADER_WAIT_MS = 2000;
+		const HEADER_NOTE_MS = 15000;
+		function headerSid8(sessionId) {
+			const s = String(sessionId || "").replace(/^session-/, "");
+			const m = /^([0-9a-f]{8})/.exec(s);
+			return m ? m[1] : "";
+		}
+		let headerStyleInjected = false;
+		function ensureHeaderStyle() {
 			try {
-				if (typeof document === "undefined" || !document.body) return;
-				if (document.getElementById("dsh-memory-wait-hud")) return;
-				const el = document.createElement("div");
-				el.id = "dsh-memory-wait-hud";
-				el.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:2147483000;min-width:264px;max-width:348px;padding:12px 14px;border-radius:14px;"
-					+ "background:rgba(18,22,38,.86);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);"
-					+ "border:1px solid rgba(120,160,255,.28);box-shadow:0 10px 32px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);"
-					+ "color:#e8eefc;font:12.5px/1.55 system-ui,'Microsoft YaHei',sans-serif;display:none;pointer-events:none;";
-				document.body.appendChild(el);
-				const fmt = (ms) => String(Math.max(0, Math.round((Number(ms) || 0) / 1000)));
-				const render = (j) => {
-					if (!j || !j.active) {
-						// 结束后保留 2.5s 结果提示（超时/成功两种口径）
-						if (j && j.result && j.doneAt && (Date.now() - j.doneAt) < 2500) {
-							el.style.display = "block";
-							el.innerHTML = '<div style="font-weight:600;margin-bottom:2px">记忆检查点已就绪</div>'
-								+ '<div style="opacity:.72">' + (j.result === "timeout" ? "等待超时，已用最近一份检查点续接" : "已写入并完成压缩后重灌") + "</div>";
-							return;
-						}
-						el.style.display = "none";
+				if (headerStyleInjected || typeof document === "undefined" || !document.head) return;
+				if (document.getElementById("dsh-memory-header-style")) { headerStyleInjected = true; return; }
+				const st = document.createElement("style");
+				st.id = "dsh-memory-header-style";
+				st.textContent = "@keyframes dsh-memory-wait-breathe{0%,100%{opacity:.65}50%{opacity:1}}";
+				document.head.appendChild(st);
+				headerStyleInjected = true;
+			} catch (e) { /* 忽略 */ }
+		}
+		function HeaderMemoryIndicator(props) {
+			const sessionId = props && props.sessionId;
+			const sid8 = headerSid8(sessionId);
+			const [waitMs, setWaitMs] = react.useState(0);   // >0 = 正在等检查点（已等 ms）
+			const [noteN, setNoteN] = react.useState(0);     // >0 = 本会话待提炼句数
+			const [hint, setHint] = react.useState(false);   // 桌面端点击后的 /memory-panel 指引
+			const [hovered, setHovered] = react.useState(false);   // hover 高亮（内联样式无 :hover）
+			const genRef = react.useRef(0);
+			const hintTimerRef = react.useRef(null);   // 桌面端指引自动消失（跨 effect 生命周期）
+			react.useEffect(() => {
+				ensureHeaderStyle();
+				if (!sessionId) { setWaitMs(0); setNoteN(0); return undefined; }
+				const gen = genRef.current + 1;
+				genRef.current = gen;
+				setWaitMs(0); setNoteN(0);   // 切会话：立即清旧值，不许显示上个会话残留
+				let waitTimer = null, noteTimer = null, waitCtrl = null, noteCtrl = null;
+				const alive = () => genRef.current === gen;
+				const abortAll = () => {
+					try { waitCtrl && waitCtrl.abort(); } catch (e) { /* 忽略 */ }
+					try { noteCtrl && noteCtrl.abort(); } catch (e) { /* 忽略 */ }
+				};
+				const hidden = () => (typeof document !== "undefined" && document.visibilityState === "hidden");
+				const tickWait = () => {
+					if (hidden()) return;
+					try {
+						waitCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+						const ctrl = waitCtrl;
+						fetch("/dsh-memory/wait.json", { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+							.then((r) => (r && r.ok ? r.json() : null))
+							.then((j) => {
+								if (!alive() || !j || j.ok !== true) return;
+								const s8 = String(j.sid8 || "");
+								if (j.active === true && s8 && s8 === sid8) setWaitMs(Math.max(0, Number(j.elapsedMs) || 0));
+								else setWaitMs(0);
+							})
+							.catch(() => { if (alive()) setWaitMs(0); });
+					} catch (e) { /* 静默 */ }
+				};
+				const tickNote = () => {
+					if (hidden()) return;
+					try {
+						noteCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+						const ctrl = noteCtrl;
+						fetch("/dsh-memory/note-stat.json?sid=" + encodeURIComponent(String(sessionId)), { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+							.then((r) => (r && r.ok ? r.json() : null))
+							.then((j) => {
+								if (!alive() || !j || j.ok !== true || j.disabled === true || j.ready === false) return;
+								const n = Number(j.sentences);
+								setNoteN(Number.isFinite(n) && n >= HEADER_NOTE_MIN ? n : 0);
+							})
+							.catch(() => { if (alive()) setNoteN(0); });
+					} catch (e) { /* 静默 */ }
+				};
+				const start = () => { abortAll(); tickWait(); tickNote(); };
+				start();
+				waitTimer = setInterval(tickWait, HEADER_WAIT_MS);
+				noteTimer = setInterval(tickNote, HEADER_NOTE_MS);
+				const onVis = () => { if (!hidden()) start(); };
+				try { if (typeof document !== "undefined" && document.addEventListener) document.addEventListener("visibilitychange", onVis); } catch (e) { /* 忽略 */ }
+				return () => {
+					genRef.current = gen + 1;   // 丢弃在途响应（generation）
+					abortAll();
+					try { clearInterval(waitTimer); } catch (e) { /* 忽略 */ }
+					try { clearInterval(noteTimer); } catch (e) { /* 忽略 */ }
+					try { clearTimeout(hintTimerRef.current); } catch (e) { /* 忽略 */ }
+					try { if (typeof document !== "undefined" && document.removeEventListener) document.removeEventListener("visibilitychange", onVis); } catch (e) { /* 忽略 */ }
+				};
+			}, [sessionId, sid8]);
+			const waiting = waitMs > 0;
+			if (!waiting && !(noteN > 0)) return null;   // 正常态：整枚隐藏（不留灰点噪音）
+			const isWait = waiting;
+			const secs = Math.max(0, Math.round(waitMs / 1000));
+			const label = isWait ? ("⏳ 整理中 " + secs + "s") : (noteN + " 句待整理");
+			const title = isWait
+				? ("记忆：正在写入检查点 " + secs + "s / 上限 120s，完成后本会话记忆会刷新")
+				: ("记忆：本会话有 " + noteN + " 句笔记尚未整理进长期记忆，建议跑 /dream");
+			const onClick = (e) => {
+				try {
+					if (typeof location !== "undefined" && location.protocol === "dsh-app:") {
+						e && e.preventDefault && e.preventDefault();
+						setHint(true);   // 桌面端：不导航，给 /memory-panel 指引（dsh-app 里 target=_blank 会被拦）
+						try { clearTimeout(hintTimerRef.current); } catch (e2) { /* 忽略 */ }
+						hintTimerRef.current = setTimeout(() => { try { setHint(false); } catch (e3) { /* 忽略 */ } }, 5000);
 						return;
 					}
-					el.style.display = "block";
-					const pct = (Number(j.maxMs) > 0) ? Math.min(100, Math.round((Number(j.elapsedMs) || 0) / Number(j.maxMs) * 100)) : 0;
-					const phaseTxt = (j.phase === "rehydrate") ? "压缩后重灌上下文" : ("等 writer 落库（最多 " + fmt(j.maxMs) + "s）");
-					el.innerHTML = '<div style="font-weight:600;margin-bottom:4px">正在写入记忆检查点…</div>'
-						+ '<div style="opacity:.72;margin-bottom:6px">' + phaseTxt + "</div>"
-						+ '<div style="height:6px;border-radius:3px;background:rgba(255,255,255,.12);overflow:hidden">'
-						+ '<div style="height:100%;width:' + pct + '%;background:linear-gradient(90deg,#5b8cff,#7ee7d8);transition:width .3s"></div></div>'
-						+ '<div style="opacity:.55;margin-top:5px">已等 ' + fmt(j.elapsedMs) + "s" + (Number(j.remainingMs) > 0 ? " · 剩 " + fmt(j.remainingMs) + "s" : "") + "</div>";
-				};
-				const tick = () => {
-					Promise.resolve(fetch("/dsh-memory/wait.json", { cache: "no-store" }))
-						.then((r) => r.json())
-						.then(render)
-						.catch(() => { /* 宿主未就绪 / 端点不存在 ⇒ 静默 */ });
-				};
-				tick();
-				setInterval(tick, 2000);
-			} catch (e) {
-				console.warn("[dsh-memory-client] 等待浮层挂载失败（忽略）:", e && e.message ? e.message : String(e));
-			}
+					if (typeof window !== "undefined" && window.open) window.open("/dsh-memory/stats", "_blank", "noopener");
+				} catch (err) { /* 静默 */ }
+			};
+			const style = {
+				display: "inline-flex", alignItems: "center", gap: 4, justifyContent: "center",
+				borderRadius: 999, padding: "0 8px", fontSize: 12, lineHeight: "18px",
+				whiteSpace: "nowrap", userSelect: "none", fontVariantNumeric: "tabular-nums", cursor: "pointer",
+				// 主题变量（浅/深色自适应）：等待=蓝 business、积压=黄 warn-label（DSH 专为文字场景准备，浅色下对比更稳）
+				color: isWait ? "var(--dsw-alias-state-business-primary, #3b82f6)" : "var(--dsw-alias-state-warn-label, #b45309)",
+				background: hovered ? "var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.20))" : "var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.14))",
+				border: "1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.28))",
+				animation: isWait ? "dsh-memory-wait-breathe 1.6s ease-in-out infinite" : "none"
+			};
+			const capsule = react.createElement("span", {
+				"data-dsh-memory-status": "1",
+				"data-session-id": String(sessionId || ""),
+				"data-mode": isWait ? "wait" : "note",
+				title: title,
+				"aria-label": title,
+				onClick: onClick,
+				onMouseEnter: () => setHovered(true),
+				onMouseLeave: () => setHovered(false),
+				style: style
+			}, label);
+			if (!hint) return capsule;
+			return react.createElement("span", { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
+				capsule,
+				react.createElement("span", { style: { fontSize: "11px", color: "var(--dsw-alias-label-tertiary)", whiteSpace: "nowrap" } }, "请发 /memory-panel 打开")
+			);
 		}
 
+		
+		// ═══ [memory-ops-toast 2026-11-08] 记忆类工具操作语义化 Toast ═══
+		//   数据源：GET /dsh-memory/ops.json?since=<ms>（host 内存环形缓冲，零 token 成本）。
+		//   形态：shell.overlay（kind:"list"，frame-wide 浮层，与 chat quota 提示互不顶掉）+ Toast（holdMs 2000 + 默认 1000 淡出 = 3s）。
+		//   防抖（严格）：合并键=工具名+成败；2s 窗口同类累加 ×N；同时只显示 1 条；队列上限 3（超丢最旧）；失败永不合并、永不丢弃。
+		//   状态放模块作用域（单模块闭包，跨工具调用天然共享同一队列）。
+		const OPS_POLL_MS = 2000;
+		const OPS_QUEUE_MAX = 3;
+		const OPS_MERGE_MS = 2000;
+		const OPS_HOLD_MS = 2000;   // Toast holdMs；+ 默认 1000ms 淡出 = 整条 3s
+		const OPS_ACTION = {
+			memory_search: "查询记忆",
+			memory_read: "读取记忆",
+			memory_note: "写入笔记",
+			memory_topics: "浏览主题树",
+			session_search: "检索会话原文",
+			memory_onboard: "记忆自检"
+		};
+		const opsQueue = [];           // 待显示：{key, tool, ok, base, count, at}
+		const opsListeners = new Set();
+		let opsActive = null;         // 正在显示的 item（同一时刻只 1 条）
+		let opsPollTimer = null, opsPollCtrl = null, opsLastTs = 0, opsStarted = false;
+		function opsEmit() { opsListeners.forEach((fn) => { try { fn(); } catch (e) { /* 忽略 */ } }); }
+		function opsActionName(tool) { return OPS_ACTION[String(tool || "")] || "记忆操作"; }
+		function opsBaseText(op) {
+			const tool = String((op && op.tool) || "");
+			const ok = !(op && op.ok === false);
+			const summary = String((op && op.summary) || "").trim();
+			if (!ok) return "❌ " + opsActionName(tool) + "失败" + (summary ? " · " + summary : "");
+			if (tool === "memory_search") return "🔍 已查询记忆" + (summary ? " · " + summary : "");
+			if (tool === "memory_read") return "📖 已读取" + (summary ? " " + summary : "");
+			if (tool === "memory_note") return "📝 已写入笔记" + (summary ? " · " + summary : "");
+			if (tool === "memory_topics") return "🗂 已浏览主题树";
+			if (tool === "session_search") return "🔎 已检索会话原文";
+			if (tool === "memory_onboard") return "⚙️ 记忆自检";
+			return "🧠 记忆操作";
+		}
+		function opsItemText(it) { return it.count > 1 ? (it.base + " ×" + it.count) : it.base; }
+		function opsTrim() {
+			// 队列上限只约束成功条目；失败条目永不丢弃（可能超上限，属于有意为之）
+			let okN = 0;
+			for (const it of opsQueue) if (it.ok) okN += 1;
+			while (okN > OPS_QUEUE_MAX) {
+				const idx = opsQueue.findIndex((x) => x.ok);
+				if (idx < 0) break;
+				opsQueue.splice(idx, 1);
+				okN -= 1;
+			}
+		}
+		function opsPump() {
+			if (opsActive || !opsQueue.length) return;
+			opsActive = opsQueue.shift();
+			opsEmit();
+		}
+		function opsDone() {
+			opsActive = null;
+			opsEmit();
+			setTimeout(() => { try { opsPump(); } catch (e) { /* 忽略 */ } }, 120);   // 两条之间留一口气，避免视觉粘连
+		}
+		function opsEnqueue(op) {
+			try {
+				const tool = String((op && op.tool) || "");
+				const ok = !(op && op.ok === false);
+				const base = opsBaseText(op);
+				const now = Date.now();
+				if (!ok) {   // 失败：永远单独提示（不合并、不丢弃、不参与队列上限淘汰）
+					opsQueue.push({ key: tool + "|err", tool: tool, ok: false, base: base, count: 1, at: now });
+					opsPump();
+					return;
+				}
+				const key = tool + "|ok";
+				const mergeTarget = (opsActive && opsActive.key === key && (now - opsActive.at) <= OPS_MERGE_MS)
+					? opsActive
+					: (opsQueue.length && opsQueue[opsQueue.length - 1].key === key && (now - opsQueue[opsQueue.length - 1].at) <= OPS_MERGE_MS)
+						? opsQueue[opsQueue.length - 1] : null;
+				if (mergeTarget) {
+					mergeTarget.count += 1;
+					mergeTarget.at = now;
+					opsEmit();
+					return;
+				}
+				opsQueue.push({ key: key, tool: tool, ok: true, base: base, count: 1, at: now });
+				opsTrim();
+				opsPump();
+			} catch (e) { /* 静默 */ }
+		}
+		function opsTick() {
+			try {
+				if (typeof document !== "undefined" && document.visibilityState === "hidden") return;   // 隐藏页暂停
+				opsPollCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+				const ctrl = opsPollCtrl;
+				fetch("/dsh-memory/ops.json?since=" + encodeURIComponent(String(opsLastTs)), { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+					.then((r) => (r && r.ok ? r.json() : null))
+					.then((j) => {
+						if (!j || j.ok !== true || !Array.isArray(j.ops)) return;
+						for (const op of j.ops) {
+							const ts = Number(op && op.ts) || 0;
+							if (ts > opsLastTs) opsLastTs = ts;
+							opsEnqueue(op);
+						}
+					})
+					.catch(() => { /* 静默：旧版桌面端/无 webServer 一律无提示 */ });
+			} catch (e) { /* 静默 */ }
+		}
+		function startOpsPolling() {
+			if (opsStarted) return;
+			opsStarted = true;
+			if (!opsLastTs) opsLastTs = Date.now();   // 只看页面加载后的新操作（不把历史 50 条一次弹完）
+			opsTick();
+			opsPollTimer = setInterval(opsTick, OPS_POLL_MS);
+			try {
+				if (typeof document !== "undefined" && document.addEventListener) {
+					document.addEventListener("visibilitychange", () => { if (document.visibilityState !== "hidden") opsTick(); });
+				}
+			} catch (e) { /* 忽略 */ }
+		}
+		function stopOpsPolling() {
+			opsStarted = false;
+			try { clearInterval(opsPollTimer); } catch (e) { /* 忽略 */ }
+			opsPollTimer = null;
+			try { opsPollCtrl && opsPollCtrl.abort(); } catch (e) { /* 忽略 */ }
+			opsPollCtrl = null;
+		}
+		// shell.overlay（kind:"list"）：一次注册、常驻；队列里没东西时返回 null（不占位、不遮挡 chat）
+		function MemoryOpsToast() {
+			if (!primitives || typeof primitives.Toast !== "function") return null;
+			const [item, setItem] = react.useState(opsActive);
+			react.useEffect(() => {
+				const fn = () => setItem(opsActive);
+				opsListeners.add(fn);
+				fn();
+				return () => { opsListeners.delete(fn); };
+			}, []);
+			if (!item) return null;
+			return react.createElement(primitives.Toast, {
+				key: String(item.seq || item.at),
+				text: opsItemText(item),
+				holdMs: OPS_HOLD_MS,
+				onDone: () => { opsDone(); }
+			});
+		}
 		function apply(ctx) {
-			mountWaitHud();   // [R2 等待浮层] 与设置行解耦：失败也不影响设置面板
 			const store = createMemoryStore();
 			let revision = 0;
 			let boundActions = null;
@@ -540,9 +812,48 @@ window.__ModuleLoader__.load({
 				store: store,
 				inject: injected
 			}, MemorySettingsRow));
+			// [header-memory-indicator 2026-11-07] 会话标题栏动作区（slot scope:session，props 带 sessionId）
+			//   id 必须唯一（契约 registerOptions 要求），order 小、排在 shipped actions 之后，不抢标题。
+			try {
+				ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({
+					name: "conversation.session.header.actions",
+					id: "dsh-memory-status",
+					order: 20,
+					label: "记忆状态"
+				}, HeaderMemoryIndicator));
+			} catch (eHeader) {
+				console.warn("[dsh-memory-client] 标题栏记忆状态注册失败（忽略，不影响设置页）:", eHeader && eHeader.message ? eHeader.message : String(eHeader));
+			}
+
+			// [memory-ops-toast 2026-11-08] shell.overlay（kind:"list"）：记忆操作 Toast 常驻浮层
+			try {
+				if (primitives && typeof primitives.Toast === "function") ctx.slots.inject("shell.overlay", () => ctx.slots.register({
+					name: "shell.overlay",
+					id: "dsh-memory-ops-toast"
+				}, MemoryOpsToast));
+			} catch (eToast) {
+				console.warn("[dsh-memory-client] 记忆操作 Toast 注册失败（忽略，不影响设置页/标题栏）:", eToast && eToast.message ? eToast.message : String(eToast));
+			}
+			// 轮询 ops.json（2s；隐藏页暂停；apply 卸载时清 timer）
+			try { ctx.effect(() => { startOpsPolling(); return () => { stopOpsPolling(); }; }); } catch (ePoll) { /* 静默 */ }
 
 			console.log("[dsh-memory-client] 设置行已注册（设置 → 通用设置 → 记忆）");
 		}
+
+		// [memory-ops-toast] 自测钩子（纯内存队列，生产行为不变；仅供 test/_memory-toast-selftest.mjs）
+		exports.__opsTest = {
+			enqueue: opsEnqueue,
+			queue: opsQueue,
+			active: () => opsActive,
+			done: opsDone,
+			baseText: opsBaseText,
+			itemText: opsItemText,
+			reset: () => { opsQueue.length = 0; opsActive = null; opsLastTs = 0; },
+			mergeMs: OPS_MERGE_MS,
+			queueMax: OPS_QUEUE_MAX,
+			holdMs: OPS_HOLD_MS,
+			pollMs: OPS_POLL_MS
+		};
 
 		exports.inject = inject;
 		exports.apply = apply;

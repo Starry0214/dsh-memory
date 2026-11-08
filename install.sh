@@ -80,6 +80,15 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 # primitives
 # ---------------------------------------------------------------------------
+# [2026-11-08 分发修复] session-search CLI：版本读取 / 版本比较 / 目标路径（随 payload 分发到 DSH_HOME/tools/session-search/）
+cli_version_of() {
+  [ -f "$1" ] || { echo ""; return 0; }
+  grep -oE 'const CLI_VERSION = "[^"]+"' "$1" 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)"/\1/'
+}
+cli_target_path() { printf '%s/tools/session-search/session-search.mjs' "$DSH_HOME"; }
+ver_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN{n=split(a,A,".");m=split(b,B,".");for(i=1;i<=n||i<=m;i++){x=(i<=n)?A[i]+0:0;y=(i<=m)?B[i]+0:0;if(x>y){exit 0}if(x<y){exit 1}}exit 1}'
+}
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
@@ -126,13 +135,13 @@ PY
 manifest_files() { # file -> "sha256<TAB>bytes<TAB>path"
   file="$1"
   if [ "$JSON_TOOL" = "node" ]; then
-    node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));for(const f of j.files)console.log(f.sha256+"\t"+f.bytes+"\t"+f.path)' "$file" 2>/dev/null
+    node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));for(const f of j.files)console.log(f.sha256+"\t"+f.bytes+"\t"+f.path+"\t"+(f.version||""))' "$file" 2>/dev/null
   elif [ "$JSON_TOOL" = "python3" ]; then
     python3 - "$file" <<'PY'
 import json,sys
 j=json.load(open(sys.argv[1],encoding="utf-8"))
 for f in j["files"]:
-    print('%s\t%s\t%s' % (f["sha256"], f["bytes"], f["path"]))
+    print('%s\t%s\t%s\t%s' % (f["sha256"], f["bytes"], f["path"], f.get("version", "")))
 PY
   else return 1; fi
 }
@@ -310,12 +319,22 @@ if [ "$MODE" = "check" ]; then
   if [ "$manifest_ok" = "yes" ]; then
     for n in $TARGETS; do
       pdir="$(plugin_dir_of "$n")"; miss=0; badsha=0; total=0
-      while IFS="$(printf '\t')" read -r sh bytes rel; do
+      while IFS="$(printf '\t')" read -r sh bytes rel ver; do
         total=$((total+1))
-    case "$rel" in client/*) f="$(dirname "$pdir")/dsh-memory-client/${rel#client/}" ;; *) f="$pdir/$rel" ;; esac
+        case "$rel" in
+          client/*) f="$(dirname "$pdir")/dsh-memory-client/${rel#client/}" ;;
+          tools/session-search.mjs) f="$(cli_target_path)" ;;
+          *) f="$pdir/$rel" ;;
+        esac
         if [ ! -f "$f" ]; then miss=$((miss+1)); continue; fi
         got="$(sha256_of "$f")" || got=""
-        [ "$got" = "$sh" ] || badsha=$((badsha+1))
+        if [ "$got" != "$sh" ]; then
+          if [ "$rel" = "tools/session-search.mjs" ] && [ -n "$ver" ]; then
+            dstv="$(cli_version_of "$f")"
+            if [ -n "$dstv" ] && ver_gt "$dstv" "$ver"; then ok "[$n] session-search CLI 保留更新版本 v$dstv（payload v$ver）"; continue; fi
+          fi
+          badsha=$((badsha+1))
+        fi
       done < <(manifest_files "$manifest")
       if [ "$miss" -eq 0 ] && [ "$badsha" -eq 0 ]; then ok "[$n] $total/$total 个文件 sha256 全部匹配"
       else warn "[$n] 缺失 $miss / 不一致 $badsha / 共 $total（重跑安装器）"; fi
@@ -558,16 +577,28 @@ for n in $TARGETS; do
   fi
   # [BUG-6] payload 的 client/** 是「设置界面半区」，宿主按 ./plugins/dsh-memory-client/lib/index.js 加载
   #   ⇒ 必须落到 <plugins>/dsh-memory-client/（写进 <pluginDir>/client/ 没人引用，新用户看不到设置界面）
-  while IFS="$(printf '\t')" read -r sh bytes rel; do
+  while IFS="$(printf '\t')" read -r sh bytes rel ver; do
     case "$rel" in
       client/*) dst="$(dirname "$pdir")/dsh-memory-client/${rel#client/}" ;;
+      tools/session-search.mjs) dst="$(cli_target_path)" ;;
       *)        dst="$pdir/$rel" ;;
     esac
-    mkdir -p "$(dirname "$dst")"; cp -f "$stage/$rel" "$dst"
+    mkdir -p "$(dirname "$dst")"
+    if [ "$rel" = "tools/session-search.mjs" ] && [ -f "$dst" ]; then
+      srcv="$(cli_version_of "$stage/$rel")"; dstv="$(cli_version_of "$dst")"
+      if [ -n "$srcv" ] && [ -n "$dstv" ] && ver_gt "$dstv" "$srcv"; then
+        warn "保留更新版本的 session-search CLI（已装 v$dstv > payload v$srcv）：$dst"; continue
+      fi
+    fi
+    cp -f "$stage/$rel" "$dst"
   done < <(manifest_files "$manifest")
   cnt="$(ls "$pdir/memtopic/src"/*.mjs 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$cnt" -ge 12 ]; then ok "写入完成；memtopic $cnt 个 .mjs 模块就位"; else bad "memtopic 模块不足（$cnt）"; fi
 done
+
+# ---- session-search CLI（共享，不随 profile）----
+cli_dst="$(cli_target_path)"
+if [ -f "$cli_dst" ]; then say "  session-search CLI：v$(cli_version_of "$cli_dst") · $cli_dst"; else warn "session-search CLI 未就位：session_search 将不可用（payload 不完整？重跑安装器）"; fi
 
 # ---- memory skeleton + config ----
 sect "[6/8] 初始化记忆库骨架并按迁移状态决定主题库开关"

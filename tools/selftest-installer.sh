@@ -70,18 +70,19 @@ MAN_VER="$(json_val "$MANIFEST" version)"
 assert_eq "$(cat "$PA/version.txt" 2>/dev/null | tr -d '\r\n')" "$MAN_VER" 'A2 version.txt matches manifest version'
 # 逐文件 sha（用 manifest 里 path+sha256 成对出现）
 MF="$MANIFEST"
-node - "$MF" "$PA" <<'NODE' >/dev/null 2>&1
+node - "$MF" "$PA" "$A" <<'NODE' >/dev/null 2>&1
 const fs=require('fs'),crypto=require('crypto');
-const [mf,dir]=process.argv.slice(2);
+const [mf,dir,home]=process.argv.slice(2);
 const m=JSON.parse(fs.readFileSync(mf,'utf8'));
 let bad=[];
-const path=require('path');for(const f of m.files){const p=f.path.startsWith('client/')?path.join(path.dirname(dir),'dsh-memory-client',f.path.slice(7)):path.join(dir,f.path);const h=fs.existsSync(p)?crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'):'';if(h!==String(f.sha256).toLowerCase())bad.push(f.path);}
+const path=require('path');for(const f of m.files){const p=f.path==='tools/session-search.mjs'?path.join(home,'tools','session-search','session-search.mjs'):(f.path.startsWith('client/')?path.join(path.dirname(dir),'dsh-memory-client',f.path.slice(7)):path.join(dir,f.path));const h=fs.existsSync(p)?crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'):'';if(h!==String(f.sha256).toLowerCase())bad.push(f.path);}
 process.exit(bad.length?1:0);
 NODE
 assert_eq "$?" "0" 'A3 all payload files match manifest sha256'
 MODS_A=$(ls "$PA/memtopic/src"/*.mjs 2>/dev/null | wc -l | tr -d ' ')
 if [ "$MODS_A" -ge "$MODS_MIN" ]; then ok 'A4 memtopic/src modules installed' "$MODS_A"; else bad 'A4 memtopic/src modules installed' "got=$MODS_A"; fi
 assert_file "$PA/memtopic/src/migrate.mjs" 'A5 migrate.mjs installed'
+assert_file "$A/tools/session-search/session-search.mjs" 'A5b session-search CLI installed to DSH_HOME/tools/session-search/'
 AG="$(cat "$A/AGENTS.md" 2>/dev/null)"
 assert_has "$AG" 'dsh-memory-agents-template: v4' 'A6 AGENTS.md is v4 template'
 CFG="$(cat "$A/memory/.config.json" 2>/dev/null)"

@@ -306,6 +306,29 @@ function Get-Sha256File([string]$Path) {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+# [2026-11-08 分发修复] session-search CLI：版本读取 / 版本比较 / 目标路径（随 payload 分发到 DSH_HOME/tools/session-search/）
+function Get-CliVersion([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+  try {
+    $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $m = [regex]::Match([string]$text, 'const CLI_VERSION = "([^"]+)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+  } catch { }
+  return ''
+}
+function Compare-CliVersion([string]$A, [string]$B) {
+  # A > B ⇒ 1；相等/无法比较 ⇒ 0；A < B ⇒ -1（按数字段比较）
+  $pa = @(([string]$A) -split '\.' | ForEach-Object { [int](($_ -replace '\D', '0')) })
+  $pb = @(([string]$B) -split '\.' | ForEach-Object { [int](($_ -replace '\D', '0')) })
+  for ($i = 0; $i -lt [Math]::Max($pa.Count, $pb.Count); $i++) {
+    $x = if ($i -lt $pa.Count) { $pa[$i] } else { 0 }
+    $y = if ($i -lt $pb.Count) { $pb[$i] } else { 0 }
+    if ($x -gt $y) { return 1 }; if ($x -lt $y) { return -1 }
+  }
+  return 0
+}
+function Get-CliTargetPath { return (Join-Path (Join-Path $DSH_HOME 'tools\session-search') 'session-search.mjs') }
+
 function Get-Sha256Text([string]$Text) {
   $enc = New-Object System.Text.UTF8Encoding($false)
   $bytes = $enc.GetBytes([string]$Text)
@@ -902,7 +925,19 @@ function Copy-PayloadToPlugin([string]$StageDir, [string]$PluginDir, $Manifest) 
     # [BUG-6] payload 的 client/** 是「设置界面半区」，宿主按 ./plugins/dsh-memory-client/lib/index.js 加载，
     #   所以必须落到 <plugins>/dsh-memory-client/ 并单独注册；写进 <pluginDir>/client/ 的话没人引用（死文件），
     #   新用户会看不到「通用设置 → 记忆」半区。
-    if ($rel -like 'client\*') {
+    if ($rel -eq 'tools\session-search.mjs') {
+      # [2026-11-08] 共享 CLI（不是 per-profile）：装到 $DSH_HOME/tools/session-search/；目标更新则保留
+      $dst = Get-CliTargetPath
+      $srcV = Get-CliVersion $src
+      if (Test-Path -LiteralPath $dst -PathType Leaf) {
+        $dstV = Get-CliVersion $dst
+        if ($dstV -and $srcV -and ((Compare-CliVersion $dstV $srcV) -gt 0)) {
+          Write-Warn2 ('保留更新版本的 session-search CLI（已装 v' + $dstV + ' > payload v' + $srcV + '）：' + $dst)
+          $count++
+          continue
+        }
+      }
+    } elseif ($rel -like 'client\*') {
       $dst = Join-Path $clientRoot ($rel.Substring('client\'.Length))
     } else {
       $dst = Join-Path $PluginDir $rel
@@ -1675,6 +1710,10 @@ function Invoke-InstallMode {
       $installRows += @{ Name = $c.Name; Backup = $backup.Created; Patch = $c.PatchFile; PluginDir = $c.PluginDir }
     }
 
+    $cliTarget = Get-CliTargetPath
+    if (Test-Path -LiteralPath $cliTarget -PathType Leaf) { Write-Fact 'session-search CLI' ('v' + (Get-CliVersion $cliTarget) + ' · ' + $cliTarget) }
+    else { Write-Warn2 'session-search CLI 未就位：session_search 将不可用（payload 不完整？重跑安装器）' }
+
     # ---- 5. memory skeleton + flag decision (shared <DSH_HOME>/memory) ----
     Write-Head '[6/8] 初始化记忆库骨架并按迁移状态决定主题库开关'
     $created = Initialize-MemoryRoot $ctx.MemRoot
@@ -1971,13 +2010,24 @@ function Invoke-CheckMode {
         $total++
         $rel = ([string]$f.path) -replace '/', '\'
         # [BUG-6] client/** 实际落在 <plugins>/dsh-memory-client/（宿主按该路径加载），不在 <pluginDir>/client/
-        if ($rel -like 'client\*') {
+        # [2026-11-08] tools/session-search.mjs 落在共享的 $DSH_HOME/tools/session-search/（不是 per-profile）
+        if ($rel -eq 'tools\session-search.mjs') {
+          $abs = Get-CliTargetPath
+        } elseif ($rel -like 'client\*') {
           $abs = Join-Path (Join-Path (Split-Path -Parent $c.PluginDir) 'dsh-memory-client') ($rel.Substring('client\'.Length))
         } else {
           $abs = Join-Path $c.PluginDir $rel
         }
         if (-not (Test-Path -LiteralPath $abs -PathType Leaf)) { $missing += [string]$f.path; continue }
-        if ((Get-Sha256File $abs) -ne ([string]$f.sha256).ToLowerInvariant()) { $mismatch += [string]$f.path; continue }
+        if ((Get-Sha256File $abs) -ne ([string]$f.sha256).ToLowerInvariant()) {
+          # CLI 特例：安装器不覆盖更新版本 ⇒ 目标版本 > payload 版本时算 OK（不是损坏）
+          if ($rel -eq 'tools\session-search.mjs') {
+            $dstV = Get-CliVersion $abs
+            $srcV = if ($null -ne $f.PSObject.Properties['version']) { [string]$f.version } else { '' }
+            if ($dstV -and $srcV -and ((Compare-CliVersion $dstV $srcV) -gt 0)) { $okCount++; continue }
+          }
+          $mismatch += [string]$f.path; continue
+        }
         $okCount++
       }
       if ($missing.Count -eq 0 -and $mismatch.Count -eq 0) {
@@ -1995,6 +2045,27 @@ function Invoke-CheckMode {
     }
   }
   if (-not $manifest) { Write-Warn2 '无 manifest：只做目录/关键文件检查，未做逐文件 sha 校验' }
+
+  # ---- 2b. session-search CLI（共享，不随 profile；session_search 的单一实现）----
+  Write-Head '[2b/11] session-search CLI（会话原文检索单一实现）'
+  $cliTarget = Get-CliTargetPath
+  if ($manifest) {
+    $cliFile = @($manifest.files | Where-Object { [string]$_.path -eq 'tools/session-search.mjs' })
+    if ($cliFile.Count -gt 0) {
+      $cf = $cliFile[0]
+      if (-not (Test-Path -LiteralPath $cliTarget -PathType Leaf)) {
+        Write-Bad ('缺失：' + $cliTarget + ' → 重跑安装器（session_search 依赖它）')
+        $badProfiles += 'session-search-cli'
+      } else {
+        $cv = Get-CliVersion $cliTarget
+        $sv = if ($null -ne $cf.PSObject.Properties['version']) { [string]$cf.version } else { '' }
+        $shaOk = ((Get-Sha256File $cliTarget) -eq ([string]$cf.sha256).ToLowerInvariant())
+        if ($shaOk) { Write-Ok ('存在且 sha256 与 manifest 一致（v' + $cv + '）：' + $cliTarget) }
+        elseif ($sv -and $cv -and ((Compare-CliVersion $cv $sv) -gt 0)) { Write-Item ('保留更新版本 v' + $cv + '（payload v' + $sv + '），未覆盖：' + $cliTarget) }
+        else { Write-Bad ('版本/sha 不一致（已装 v' + $cv + '，payload v' + $sv + '）→ 重跑安装器：' + $cliTarget); $badProfiles += 'session-search-cli' }
+      }
+    } else { Write-Warn2 'manifest 未包含 tools/session-search.mjs（旧版发布）⇒ session_search 将不可用，请升级安装器/插件' }
+  } else { Write-Warn2 '无 manifest：跳过 session-search CLI 校验' }
 
   # ---- 3. memtopic modules (per profile) ----
   Write-Head '[3/11] memtopic 运行时模块'

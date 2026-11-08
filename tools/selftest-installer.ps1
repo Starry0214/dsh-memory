@@ -81,8 +81,12 @@ function Get-JsonProp($Obj, [string]$Name) {
 }
 
 # [BUG-6] payload 的 client/** 落在 <plugins>/dsh-memory-client/，其余落在 <pluginDir>/
-function Get-PayloadAbs([string]$PluginDir, [string]$Rel) {
+function Get-PayloadAbs([string]$PluginDir, [string]$Rel, [string]$DshHomeDir = '') {
   $rel = $Rel -replace '/', '\'
+  if ($rel -eq 'tools\session-search.mjs') {
+    # [2026-11-08] CLI 是共享件：装到 <DSH_HOME>/tools/session-search/，不是 per-profile
+    return (Join-Path (Join-Path $DshHomeDir 'tools\session-search') 'session-search.mjs')
+  }
   if ($rel -like 'client\*') {
     return (Join-Path (Join-Path (Split-Path -Parent $PluginDir) 'dsh-memory-client') ($rel.Substring('client\'.Length)))
   }
@@ -137,7 +141,7 @@ Assert-That ($r.Code -eq 0) 'A0 install exit code 0' ("exit=" + $r.Code)
 $filesOk = 0; $fileTotal = 0; $badFiles = @()
 foreach ($f in @($manifest.files)) {
   $fileTotal++
-  $abs = Get-PayloadAbs $pluginDir ([string]$f.path)
+  $abs = Get-PayloadAbs $pluginDir ([string]$f.path) $homeA
   if ((Get-Sha $abs) -eq ([string]$f.sha256).ToLowerInvariant()) { $filesOk++ } else { $badFiles += [string]$f.path }
 }
 Assert-That ($filesOk -eq $fileTotal) 'A1 all payload files match manifest sha256' ($filesOk.ToString() + '/' + $fileTotal + ' bad=' + ($badFiles -join ','))
@@ -164,18 +168,24 @@ Assert-That (Test-Path -LiteralPath (Join-Path $clientDir 'lib\index.js') -PathT
 Assert-That (Test-Path -LiteralPath (Join-Path $clientDir 'package.json') -PathType Leaf) 'A12 client package.json 已装'
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $pluginDir 'client'))) 'A13 不再往 memory/client 写死文件'
 Assert-That ((Get-PatchIdRows2 $patchA 'dsh-memory-client') -eq 1) 'A14 client 已注册（1 行）' ('rows=' + (Get-PatchIdRows2 $patchA 'dsh-memory-client'))
+$cliA = Join-Path (Join-Path $homeA 'tools\session-search') 'session-search.mjs'
+Assert-That (Test-Path -LiteralPath $cliA -PathType Leaf) 'A15 session-search CLI installed to DSH_HOME/tools/session-search/'
+$cliManifest = @($manifest.files | Where-Object { [string]$_.path -eq 'tools/session-search.mjs' })
+if ($cliManifest.Count -gt 0 -and $null -ne $cliManifest[0].PSObject.Properties['version']) {
+  Assert-That ((Get-Sha $cliA) -eq ([string]$cliManifest[0].sha256).ToLowerInvariant()) 'A16 installed CLI sha256 matches manifest' $cliA
+}
 
 # ===========================================================================
 # B. 二次安装幂等
 # ===========================================================================
 Write-Host '[B] re-install idempotency'
 $hashBefore = @{}
-foreach ($f in @($manifest.files)) { $rel = [string]$f.path; $hashBefore[$rel] = (Get-Sha (Get-PayloadAbs $pluginDir $rel)) }
+foreach ($f in @($manifest.files)) { $rel = [string]$f.path; $hashBefore[$rel] = (Get-Sha (Get-PayloadAbs $pluginDir $rel $homeA)) }
 $backupDirsBefore = @(Get-ChildItem -LiteralPath $pluginDir -Directory -Filter '_backup-*' -ErrorAction SilentlyContinue).Count
 $r2 = Invoke-Installer $homeA @('-LocalPayload', $Payload, '-ProfileName', 'web')
 Assert-That ($r2.Code -eq 0) 'B0 re-install exit code 0' ("exit=" + $r2.Code)
 $same = 0
-foreach ($f in @($manifest.files)) { $rel = [string]$f.path; if ((Get-Sha (Get-PayloadAbs $pluginDir $rel)) -eq $hashBefore[$rel]) { $same++ } }
+foreach ($f in @($manifest.files)) { $rel = [string]$f.path; if ((Get-Sha (Get-PayloadAbs $pluginDir $rel $homeA)) -eq $hashBefore[$rel]) { $same++ } }
 Assert-That ($same -eq $fileTotal) 'B1 installed files unchanged after re-install' ($same.ToString() + '/' + $fileTotal)
 Assert-That ((Get-PatchIdRows $patchA) -eq 1) 'B2 no duplicate registration row' ('rows=' + (Get-PatchIdRows $patchA))
 $backupDirsAfter = @(Get-ChildItem -LiteralPath $pluginDir -Directory -Filter '_backup-*' -ErrorAction SilentlyContinue).Count

@@ -1,6 +1,6 @@
 {
-  "version": "4.5.2",
-  "generatedAt": "2026-11-07T06:45:38.415Z",
+  "version": "4.5.4",
+  "generatedAt": "2026-11-07T20:27:23.895Z",
   "files": [
     {
       "path": "AGENTS.template.md",
@@ -9,8 +9,8 @@
     },
     {
       "path": "client/lib/client.js",
-      "bytes": 36035,
-      "sha256": "4b21da3bb2dd6ec18b9e3e240d22a39ce91859317f9644ae94c9585e2811f49a"
+      "bytes": 51699,
+      "sha256": "f1bbe7211dd74b87465301aa59236063e8ba07a794e9c28e741da5b7e940c3d2"
     },
     {
       "path": "client/lib/index.js",
@@ -24,8 +24,8 @@
     },
     {
       "path": "index.js",
-      "bytes": 1514370,
-      "sha256": "54a1b21186ff10e69a836dec788e23aaf6f5ef62bad7104b2df53af75ab7bd6a"
+      "bytes": 1561152,
+      "sha256": "4b004a4e071038c6626cdc5355f7e7ddf81643e5fceb0ef3b1a4dec5764a1401"
     },
     {
       "path": "memtopic/src/backend-ledger.mjs",
@@ -95,17 +95,23 @@
     {
       "path": "package.json",
       "bytes": 651,
-      "sha256": "3176736ed805d9a9d77bed67f28c0872d28bd973e39bb8fcd91f7eb9271172ba"
+      "sha256": "30164a88204ef80c96fb8bfea55964249d25dfcc8b38fbafa920aec5e5a6688b"
+    },
+    {
+      "path": "tools/session-search.mjs",
+      "bytes": 63364,
+      "sha256": "9fb79a6ed3e5188df340c5c319187dc37bc6fb0bc7744dd7d2eaa7794716712b",
+      "version": "5.0.0"
     },
     {
       "path": "version.txt",
       "bytes": 5,
-      "sha256": "657ea451a53199cc010d98f41c0e476f9d12d7956f9804455520bbce68d979ea"
+      "sha256": "cfefa693692e9b79f804536487b57552b3fda6e22b2dd5194a7c0a990f645f76"
     }
   ],
   "zip": {
-    "name": "dsh-memory-4.5.2.zip",
-    "bytes": 728615,
-    "sha256": "b57d759b07e1fdd6bc57a7585f262937bb49c4ae368d0258098b7155c626b4b7"
+    "name": "dsh-memory-4.5.4.zip",
+    "bytes": 772682,
+    "sha256": "0e36751fd3b92504d707db5ec566f48563ff793b354eec39a15c7a1b71910d7e"
   }
 }
