@@ -1,6 +1,6 @@
 {
-  "version": "4.5.7",
-  "generatedAt": "2026-11-09T01:41:38.020Z",
+  "version": "4.5.8",
+  "generatedAt": "2026-11-09T01:48:32.519Z",
   "files": [
     {
       "path": "AGENTS.template.md",
@@ -24,8 +24,8 @@
     },
     {
       "path": "index.js",
-      "bytes": 1587984,
-      "sha256": "e4525258806ac9ccb8894fd82241cf93713a1dc7901780c9ce011911cbb5c8e6"
+      "bytes": 1589078,
+      "sha256": "f59f689263032b08812cbbda0495c014759518ac01d3fe083879a6794983b20b"
     },
     {
       "path": "memtopic/src/backend-ledger.mjs",
@@ -95,7 +95,7 @@
     {
       "path": "package.json",
       "bytes": 651,
-      "sha256": "22ce669ed83a5c3ba7cc881ed1a3ed47c023f77f70413e441bf95ecdb04c62f0"
+      "sha256": "c6cf238b70cc3142ba1532b15934fdfffa96a3ba686cf092a10f4c8101ee5869"
     },
     {
       "path": "tools/session-search.mjs",
@@ -106,12 +106,12 @@
     {
       "path": "version.txt",
       "bytes": 5,
-      "sha256": "f90bb38ff4621387a2dc9558baab34f9668c81c3f905c0118f82a47f5930cbd3"
+      "sha256": "fbdd20aa7b5d0f432e35f3c5cce18d5e9577a2b26182a66dd52f3254b44d4ab7"
     }
   ],
   "zip": {
-    "name": "dsh-memory-4.5.7.zip",
-    "bytes": 784565,
-    "sha256": "38bf731f4974afd69f7fa783a943c1dc3bae5fb8dda1f6674966d30cb668a112"
+    "name": "dsh-memory-4.5.8.zip",
+    "bytes": 785142,
+    "sha256": "87281679325e581e54e7931109fa69261c383a78be41e16f1732c227196dbb78"
   }
 }
