@@ -152,6 +152,49 @@ export class LedgerBackend {
   listSentences(topicId) {
     return (this.ordIndex.get(topicId) || []).map((id) => clone(this.sentences.get(id)));
   }
+  /** [perf 2026-11-09] 与 SqliteBackend 同签名：内存版一次分组（零 IO）。 */
+  listSentencesByTopic() {
+    const map = new Map();
+    for (const s of this.sentences.values()) {
+      const row = { id: s.id, topicId: s.topicId, ord: s.ord, sha: s.sha, text: s.text, chars: s.chars, src: s.src, createdAt: s.createdAt, updatedAt: s.updatedAt };
+      if (!map.has(row.topicId)) map.set(row.topicId, []);
+      map.get(row.topicId).push(row);
+    }
+    for (const arr of map.values()) arr.sort((a, b) => a.ord - b.ord);
+    return map;
+  }
+  /** [perf 2026-11-09] 与 SqliteBackend 同签名：全部 meta。 */
+  listMeta() { return [...this.metaMap.entries()].map(([key, value]) => ({ key, value })); }
+  /** [perf 2026-11-09] 与 SqliteBackend 同签名：正文 token 预过滤（内存版）。 */
+  searchSentencesByTokens(tokens) {
+    const uniq = [...new Set((Array.isArray(tokens) ? tokens : []).map((x) => String(x == null ? '' : x)).filter((x) => x.trim()))];
+    const map = new Map();
+    if (!uniq.length) return map;
+    for (const s of this.sentences.values()) {
+      const low = String(s.text == null ? '' : s.text).toLowerCase();
+      if (!uniq.some((t) => low.includes(t))) continue;
+      if (!map.has(s.topicId)) map.set(s.topicId, []);
+      map.get(s.topicId).push({ id: s.id, text: s.text, src: s.src || '' });
+    }
+    for (const [tid, arr] of map) { const ordOf = new Map([...this.sentences.values()].filter((x) => x.topicId === tid).map((x) => [x.id, x.ord])); arr.sort((a, b) => (ordOf.get(a.id) || 0) - (ordOf.get(b.id) || 0)); }
+    return map;
+  }
+  /** [perf 2026-11-09] 与 SqliteBackend 同签名：每主题句数/字数和。 */
+  sentenceStatsByTopic() {
+    const m = new Map();
+    for (const s of this.sentences.values()) {
+      const cur = m.get(s.topicId) || { topicId: s.topicId, n: 0, chars: 0 };
+      cur.n += 1; cur.chars += Number(s.chars || 0);
+      m.set(s.topicId, cur);
+    }
+    return [...m.values()];
+  }
+  /** [perf 2026-11-09] 与 SqliteBackend 同签名：按 id 批量取句。 */
+  sentencesByIds(ids) {
+    const out = [];
+    for (const id of (Array.isArray(ids) ? ids : [])) { const s = this.sentences.get(Number(id)); if (s) out.push({ id: s.id, topicId: s.topicId, chars: s.chars }); }
+    return out;
+  }
   nextOrd(topicId) {
     const arr = this.ordIndex.get(topicId) || [];
     return arr.length ? this.sentences.get(arr[arr.length - 1]).ord + 1 : 1;

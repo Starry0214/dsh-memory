@@ -143,6 +143,58 @@ export class SqliteBackend {
     return this.db.prepare('SELECT * FROM sentences WHERE topic_id=? ORDER BY ord').all(topicId)
       .map((r) => ({ id: r.id, topicId: r.topic_id, ord: r.ord, sha: r.sha, text: r.body, chars: r.chars, src: r.src, createdAt: r.created_at, updatedAt: r.updated_at }));
   }
+  /**
+   * [perf 2026-11-09] 一条 SQL 取全库句子并按 topic 分组（消除 topics()/检索的 N+1）。
+   *   保留每主题 ord 升序；墓碑过滤仍由 store 的 _deletedSentenceIds 统一做（不在 backend 新造过滤逻辑）。
+   *   @returns {Map<string, Array<object>>}
+   */
+  listSentencesByTopic() {
+    const map = new Map();
+    const rows = this.db.prepare('SELECT id,topic_id,ord,sha,body,chars,src,created_at,updated_at FROM sentences ORDER BY topic_id, ord').all();
+    for (const r of rows) {
+      const row = { id: r.id, topicId: r.topic_id, ord: r.ord, sha: r.sha, text: r.body, chars: r.chars, src: r.src, createdAt: r.created_at, updatedAt: r.updated_at };
+      if (!map.has(row.topicId)) map.set(row.topicId, []);
+      map.get(row.topicId).push(row);
+    }
+    return map;
+  }
+  /** [perf 2026-11-09] 一次取全部 meta（key→value），供 topics() 单遍读，替代每主题多次 getMeta。 */
+  listMeta() {
+    const rows = this.db.prepare('SELECT key,value FROM meta').all();
+    return rows.map((r) => ({ key: r.key, value: r.value }));
+  }
+  /**
+   * [perf 2026-11-09] 正文预过滤下推 SQL：body LIKE 任一 token（OR），只回匹配行（按 topic_id, ord 排序）。
+   *   LIKE 对 ASCII 大小写不敏感（与 JS 侧 toLowerCase+includes 同语义；中文无大小写）。token 里的 %/_/\\ 已转义。
+   *   @returns {Map<string, Array<{id:number,text:string,src:string}>>}
+   */
+  searchSentencesByTokens(tokens) {
+    const uniq = [...new Set((Array.isArray(tokens) ? tokens : []).map((x) => String(x == null ? '' : x)).filter((x) => x.trim()))];
+    const map = new Map();
+    if (!uniq.length) return map;
+    const esc = (t) => t.replace(/[\\%_]/g, (m) => '\\' + m);
+    const where = uniq.map(() => "body LIKE ? ESCAPE '\\'").join(' OR ');
+    const params = uniq.map((t) => '%' + esc(t) + '%');
+    const rows = this.db.prepare('SELECT id,topic_id,body,src FROM sentences WHERE ' + where + ' ORDER BY topic_id, ord').all(...params);
+    for (const r of rows) {
+      if (!map.has(r.topic_id)) map.set(r.topic_id, []);
+      map.get(r.topic_id).push({ id: r.id, text: r.body, src: r.src || '' });
+    }
+    return map;
+  }
+  /** [perf 2026-11-09] 每主题句数/字数和（一条聚合 SQL；topics() 只需计数，不必拉全量行）。 */
+  sentenceStatsByTopic() {
+    const rows = this.db.prepare('SELECT topic_id AS tid, COUNT(*) AS n, COALESCE(SUM(chars),0) AS c FROM sentences GROUP BY topic_id').all();
+    return rows.map((r) => ({ topicId: r.tid, n: Number(r.n) || 0, chars: Number(r.c) || 0 }));
+  }
+  /** [perf 2026-11-09] 按 id 批量取句（墓碑计数用；deleted.index 通常只有个位数/几十条）。 */
+  sentencesByIds(ids) {
+    const list = (Array.isArray(ids) ? ids : []).map((x) => Number(x)).filter((x) => Number.isFinite(x));
+    if (!list.length) return [];
+    const ph = list.map(() => '?').join(',');
+    const rows = this.db.prepare('SELECT id,topic_id,chars FROM sentences WHERE id IN (' + ph + ')').all(...list);
+    return rows.map((r) => ({ id: r.id, topicId: r.topic_id, chars: r.chars }));
+  }
   nextOrd(topicId) {
     const r = this.db.prepare('SELECT COALESCE(MAX(ord),0) AS m FROM sentences WHERE topic_id=?').get(topicId);
     return r.m + 1;

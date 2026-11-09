@@ -103,6 +103,7 @@ export class MemoryStore {
     this.govCfg = { ...DEFAULT_GOVERNANCE, ...(options.governance || {}) };
     this.lifeCfg = { ...DEFAULT_LIFECYCLE_CONFIG, ...(options.lifecycle || {}) };
     this._txDepth = 0;   // store 级事务嵌套深度（Lead 裁决B）
+    this._metaOverride = null;   // [perf 2026-11-09] topics() 单遍读时临时挂全量 meta Map（读路径只读，无写风险）
   }
 
   // ======================================================================
@@ -221,7 +222,24 @@ export class MemoryStore {
     });
   }
 
-  _metaGet(k) { return typeof this.be.getMeta === 'function' ? this.be.getMeta(k) : null; }
+  _metaGet(k) {
+    // [perf 2026-11-09] topics() 期间挂全量 meta（一次 SQL 代替每主题多次 getMeta）；只读窗口内不会写入
+    if (this._metaOverride) { const v = this._metaOverride.get(String(k)); return v === undefined ? null : v; }
+    return typeof this.be.getMeta === 'function' ? this.be.getMeta(k) : null;
+  }
+  /** [perf 2026-11-09] 全量 meta → Map（后端支持 listMeta 才生效；否则 null ⇒ 走原逐键路径） */
+  _metaAll() {
+    try {
+      const be = this.be;
+      if (be && typeof be.listMeta === 'function') {
+        const rows = be.listMeta() || [];
+        const m = new Map();
+        for (const r of rows) if (r && r.key != null) m.set(String(r.key), r.value == null ? '' : String(r.value));
+        return m;
+      }
+    } catch (e) { /* 回退逐键 */ }
+    return null;
+  }
   _metaSet(k, v) { if (typeof this.be.setMeta === 'function') this.be.setMeta(k, String(v)); }
   _jsonMeta(k, dflt) {
     const raw = this._metaGet(k);
@@ -368,6 +386,13 @@ export class MemoryStore {
   topics() {
     const at = this.nowMs();
     const rows0 = this.be.listTopics();
+    // [perf 2026-11-09] 单遍批量读：①全量 meta 一次（_metaOverride）②全库句子一条 SQL 分组（_liveSentencesByTopic）。
+    //   原实现每个主题各查一次 sentences + 多次 meta（593 主题 ≈ 1564ms）；现在 ~1 次 SQL + 1 次 meta 查询。
+    //   只读窗口：覆盖期间不做任何写操作（topics() 纯读），退出时恢复，绝不把缓存泄漏到写路径。
+    const prevMeta = this._metaOverride;
+    const metaAll = this._metaAll();
+    if (metaAll) this._metaOverride = metaAll;
+    try {
     // [2026-10-29 P0 修复] 泛化 trigger（覆盖率 > genericTriggerMaxTopics）：保留存储，
     //   但在判定/检索加权里忽略；这里一次性算覆盖率，避免每个主题重复计算。
     const g = genericTriggersOf(
@@ -375,10 +400,11 @@ export class MemoryStore {
       this.govCfg,
     );
     const mi = this._mergeViewIndex();   // [task-13/L2] 视图索引一次算好，供每行标注/有效口径使用
+    const statsByTopic = this._liveSentenceStatsByTopic();   // [perf] 一次聚合（墓碑已扣减）
     return rows0.map((t) => {
-      const rows = this._liveSentences(t.id);
-      const physicalSentences = rows.length;
-      const physicalChars = rows.reduce((a, s) => a + (s.chars || 0), 0);
+      const st = statsByTopic.get(t.id) || { count: 0, chars: 0 };
+      const physicalSentences = st.count;
+      const physicalChars = st.chars;
       const since = this._stateSince(t);
       const active = this.activeTriggersOf(t);
       const genNames = active.filter((x) => g.norms.has(normalizeName(x)));
@@ -415,7 +441,8 @@ export class MemoryStore {
         mergeId: view ? view.rec.mergeId : (mi.sourceMerge.get(t.id) || null),
         mergeRole: role,
         viewSentences: view ? sentences : 0,
-        retiredTriggers: this.retiredTriggersOf(t.id),
+        // [perf] 用本行 triggers 直接算，避免 retiredTriggersOf 内部再 getTopicById（593 次多余查询）
+        retiredTriggers: (() => { const retired = new Set(this._retiredNorms(t.id)); return (t.triggers || []).filter((x) => retired.has(normalizeName(x))); })(),
         stateSince: since,
         daysInState: daysBetween(since, at),
         hitCount: this._hitCount(t.id),
@@ -423,6 +450,7 @@ export class MemoryStore {
         promoteWrites: this._promoteWrites(t),
       };
     });
+    } finally { this._metaOverride = prevMeta; }
   }
 
   /** task-41：已删除句索引（物理行保留以守住历史 sha；readTopic/topics/计数一律视作不存在） */
@@ -450,6 +478,100 @@ export class MemoryStore {
     return { ids, legacyByTopic };
   }
 
+  /**
+   * [perf 2026-11-09] 全库活句批量 Map（一条 SQL / 一次内存分组）——消除 topics()/检索的 N+1。
+   *   墓碑过滤与 _liveSentences 完全同源（_deletedSentenceIds：sentenceId 行级 + legacy sha/topicId 兜底）。
+   */
+  _liveSentencesByTopic() {
+    const be = this.be;
+    let map = null;
+    try { if (be && typeof be.listSentencesByTopic === 'function') map = be.listSentencesByTopic(); } catch (e) { map = null; }
+    if (!map) {
+      map = new Map();
+      for (const t of (be.listTopics() || [])) map.set(t.id, be.listSentences(t.id) || []);
+    }
+    const { ids, legacyByTopic } = this._deletedSentenceIds();
+    if (ids.size || legacyByTopic.size) {
+      for (const [tid, rows] of map) {
+        const legacy = legacyByTopic.get(tid);
+        map.set(tid, rows.filter((x) => !ids.has(x.id) && !(legacy && legacy.has(x.sha))));
+      }
+    }
+    return map;
+  }
+  /**
+   * [perf 2026-11-09] 每主题「活句数/活字数和」批量 Map（topics() 只用到计数 ⇒ 不必拉 33k 行对象）。
+   *   语义与 _liveSentences(t.id).length / chars 之和**完全等价**：
+   *   · 后端聚合 SQL 出物理 count/chars → 扣掉 sentenceId 墓碑（按 id 反查归属主题）；
+   *   · legacy sha 墓碑（无 sentenceId）走该主题逐行过滤（数量极少）；
+   *   · 后端无聚合能力 ⇒ 回落 _liveSentencesByTopic。
+   */
+  _liveSentenceStatsByTopic() {
+    const be = this.be;
+    const stats = new Map();   // tid -> { count, chars }
+    let usedAgg = false;
+    try {
+      if (be && typeof be.sentenceStatsByTopic === 'function') {
+        for (const r of (be.sentenceStatsByTopic() || [])) stats.set(r.topicId, { count: Number(r.n) || 0, chars: Number(r.chars) || 0 });
+        usedAgg = true;
+      }
+    } catch (e) { usedAgg = false; }
+    if (!usedAgg) {
+      for (const [tid, rows] of this._liveSentencesByTopic()) stats.set(tid, { count: rows.length, chars: rows.reduce((a, x) => a + (x.chars || 0), 0) });
+      return stats;
+    }
+    const { ids, legacyByTopic } = this._deletedSentenceIds();
+    if (ids.size) {
+      let located = [];
+      try { located = (typeof be.sentencesByIds === 'function') ? (be.sentencesByIds([...ids]) || []) : []; } catch (e) { located = []; }
+      if (located.length) {
+        for (const r of located) { const cur = stats.get(r.topicId); if (cur) { cur.count -= 1; cur.chars -= Number(r.chars || 0); } }
+      } else {
+        // 无法定位墓碑归属 ⇒ 安全回退到逐行过滤（等价优先）
+        stats.clear();
+        for (const [tid, rows] of this._liveSentencesByTopic()) stats.set(tid, { count: rows.length, chars: rows.reduce((a, x) => a + (x.chars || 0), 0) });
+        return stats;
+      }
+    }
+    for (const tid of legacyByTopic.keys()) {
+      const rows = this._liveSentences(tid);
+      stats.set(tid, { count: rows.length, chars: rows.reduce((a, x) => a + (x.chars || 0), 0) });
+    }
+    return stats;
+  }
+  /** [perf 2026-11-09] 合并视图主题 id 集合（main/child：正文需走 readTopic 聚合，不能用物理行快路径） */
+  mergeViewTopicIds() {
+    try { return new Set(this._mergeViewIndex().byTopic.keys()); } catch (e) { return new Set(); }
+  }
+  /**
+   * [perf 2026-11-09] 正文 token 预过滤：返回 Map<topicId, rows[]>（只含命中行、按 ord 升序、已过滤墓碑）。
+   *   后端无 SQL 预过滤时回落「批量活句 + JS includes」；语义与逐行 toLowerCase().includes 一致。
+   */
+  searchSentencesByTokens(tokens) {
+    const list = (Array.isArray(tokens) ? tokens : []).map((x) => String(x == null ? '' : x)).filter((x) => x.trim());
+    const be = this.be;
+    try {
+      if (be && typeof be.searchSentencesByTokens === 'function') {
+        const raw = be.searchSentencesByTokens(list) || new Map();
+        const { ids, legacyByTopic } = this._deletedSentenceIds();
+        const out = new Map();
+        for (const [tid, rows] of raw) {
+          const legacy = legacyByTopic.get(tid);
+          const kept = rows.filter((x) => !ids.has(x.id) && !(legacy && legacy.has(x.sha)));
+          if (kept.length) out.set(tid, kept);
+        }
+        return out;
+      }
+    } catch (e) { /* 回落 JS 扫描 */ }
+    const lowTokens = list.map((t) => t.toLowerCase());
+    const out = new Map();
+    for (const [tid, rows] of this._liveSentencesByTopic()) {
+      const kept = [];
+      for (const r of rows) { const low = String(r.text == null ? '' : r.text).toLowerCase(); if (lowTokens.some((t) => low.includes(t))) kept.push(r); }
+      if (kept.length) out.set(tid, kept);
+    }
+    return out;
+  }
   /** 取主题的"有效"句子（过滤已删除 tombstone；传入 rows 时按同样规则过滤） */
   _liveSentences(topicId, rows) {
     const base = Array.isArray(rows) ? rows : (this.be.listSentences(topicId) || []);
