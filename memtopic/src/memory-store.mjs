@@ -18,6 +18,23 @@ import {
   pickOverflowVictim, shouldAutoPromote,
 } from './lifecycle.mjs';
 
+// [4.5.7] rename 保护名（store 层兜底，tool 层还有完整判据；命中返回 SYSTEM_TOPIC_READONLY）：
+//   笔记主题（笔记·*）、P2.5 会话主题（<wsKey>/<sid8>）、会话检查点线/域（会话检查点·* / 日记忆（按天流水））、
+//   索引类主题（精确字面量索引/记忆索引）。改这些名字会让 note 归档扫描 / memory_note / p25 写读 / 结构注入按名精确查找断掉。
+const RENAME_PROTECTED_RE = /^(?:笔记·|会话检查点)/;
+const RENAME_INDEX_RE = /(?:精确)?字面量索引|记忆索引/;
+const RENAME_D8_DOMAIN_NAME = '日记忆（按天流水）';
+const RENAME_SESSION_TOPIC_RE = /^[^\s/\\]{1,200}\/[0-9a-f]{8}(?:\s*[·・][\s\S]*)?$/;
+function isRenameProtectedName(name) {
+  const n = String(name == null ? '' : name).trim();
+  if (!n) return false;
+  if (RENAME_PROTECTED_RE.test(n)) return true;
+  if (n === RENAME_D8_DOMAIN_NAME) return true;
+  if (RENAME_INDEX_RE.test(n)) return true;
+  if (RENAME_SESSION_TOPIC_RE.test(n)) return true;
+  return false;
+}
+
 // 阶段 1 的公共 API 保持原样导出（既有调用方与契约测试依赖它）
 export { normalizeName };
 export { STATES as LIFECYCLE_STATES };
@@ -927,6 +944,10 @@ export class MemoryStore {
     // --- 4.2 已存在（归一化精确命中）⇒ 直接返回，不新建
     const exist = this.be.getTopicByNorm(norm);
     if (exist) return { id: exist.id, name: exist.name, how: 'exact', state: exist.state };
+    // [4.5.7 P0] 旧名可能已在 aliases（rename 把旧名放进 aliases）：必须把 alias 命中当「已存在」，
+    //   否则 rename 后 `createTopic(旧名)` 会重建一个重复主题（norm 查不到、alias 又不查）。
+    const aliasExist = this._findTopicByAliasNorm(norm);
+    if (aliasExist) return { id: aliasExist.id, name: aliasExist.name, how: 'alias', state: aliasExist.state };
 
     // --- 4.3 分档
     const existing = this.be.listTopics().map((t) => ({
@@ -1136,6 +1157,94 @@ export class MemoryStore {
   }
 
   // ======================================================================
+  // 4.9 [4.5.7] 主题演进：rename（只改 name/norm/aliases/updatedAt；不动 id/trigger/parent/state）
+  // ======================================================================
+  /** 别名上限 10：FIFO 淘汰最旧；每次淘汰写 topic.alias.evicted 审计（历史旧名仍在 topic.rename 审计）。
+   *  存量说明：当前真库 1306 个 aliases、单主题最大 15（T-0263）已超上限 ⇒ **不批量裁剪**，
+   *  等该主题下次 addAlias/rename 写入时按 FIFO 自然收敛到 10。 */
+  _capAliases(topic, list, { actor = 'runtime', reason = 'alias-cap' } = {}) {
+    const arr = Array.isArray(list) ? list.slice() : [];
+    const max = 10;
+    const evicted = arr.length > max ? arr.slice(0, arr.length - max) : [];
+    const aliases = arr.length > max ? arr.slice(arr.length - max) : arr;
+    const at = this.nowMs();
+    for (const a of evicted) {
+      try { this._audit('topic.alias.evicted', { at, topicId: topic.id, actor, detail: { alias: String(a), evictedAt: at, reason } }); } catch (e) { /* 审计失败不影响写入 */ }
+    }
+    return { aliases, evicted };
+  }
+  /** 按 alias 精确（normalize 后）查主题：createTopic/_freeTopicName/rename 冲突检测共用 */
+  _findTopicByAliasNorm(norm) {
+    const n = String(norm == null ? '' : norm);
+    if (!n) return null;
+    for (const t of this.be.listTopics()) {
+      if ((t.aliases || []).some((a) => normalizeName(a) === n)) return t;
+    }
+    return null;
+  }
+  /** 名字是否已被任何主题占用（norm 精确或别人的 alias） */
+  _nameTakenByAny(norm, exceptId) {
+    const n = String(norm == null ? '' : norm);
+    if (!n) return null;
+    const direct = this.be.getTopicByNorm(n);
+    if (direct && String(direct.id) !== String(exceptId || '')) return direct;
+    const alias = this._findTopicByAliasNorm(n);
+    if (alias && String(alias.id) !== String(exceptId || '')) return alias;
+    return null;
+  }
+  /**
+   * [4.5.7] 重命名主题（dream 卫生节 / 人工显式；只改 name/norm/aliases/updatedAt）。
+   *   · 权限 can(actor,'rename')；系统名（笔记/P2.5/线/域/索引）⇒ SYSTEM_TOPIC_READONLY；archived ⇒ ARCHIVED_READONLY；
+   *   · 新名 norm 撞别的主题 norm **或别的主题 alias** ⇒ NAME_CONFLICT（同名本质应 merge）；
+   *   · 旧名进 aliases（若旧名已是别的主题 alias ⇒ 只审计不写，避免 resolveTopic AMBIGUOUS）；
+   *   · aliases 上限 10 FIFO（_capAliases，淘汰写审计）；
+   *   · 审计 topic.rename（from/to/reason）+ meta renamed.from；不改 id/trigger/parent/state。
+   */
+  renameTopic(topicRef, newName, { actor = 'runtime', claimedActor, actualActor, reason = null } = {}) {
+    const ident = resolveActor({ claimed: claimedActor == null ? actor : claimedActor, actual: actualActor });
+    if (!can(ident.actor, 'rename')) {
+      this._audit('perm.denied', { actor: ident.actor, detail: { action: 'renameTopic', topic: String(topicRef), claimed: ident.claimed } });
+      throw new MemError('PERM_DENIED', `身份「${ident.actor}」不能重命名主题`, { actor: ident.actor, action: 'renameTopic' });
+    }
+    const raw = String(newName == null ? '' : newName).trim();
+    if (!raw) throw new MemError('EMPTY_NAME', '新主题名不能为空');
+    const targetNorm = normalizeName(raw);
+    if (!targetNorm) throw new MemError('EMPTY_NAME', '新主题名归一化后为空');
+    const t = this.be.getTopicById(this.resolveTopic(topicRef).id);
+    if (!t) throw new MemError('NOT_FOUND', '主题不存在: ' + String(topicRef));
+    const oldName = String(t.name || '');
+    const oldNorm = normalizeName(oldName);
+    if (t.state === 'archived') throw new MemError('ARCHIVED_READONLY', `主题「${oldName}」已归档（archived 只读），不能重命名；需先恢复`, { id: t.id });
+    if (isRenameProtectedName(oldName) || isRenameProtectedName(raw)) {
+      throw new MemError('SYSTEM_TOPIC_READONLY', `「${isRenameProtectedName(oldName) ? oldName : raw}」是系统/结构主题（笔记/P2.5/会话检查点/索引），禁止重命名`, { id: t.id });
+    }
+    if (targetNorm === oldNorm) return { ok: true, id: t.id, from: oldName, to: oldName, unchanged: true, aliasesAdded: 0, evicted: null };
+    // 冲突：新名 norm 撞别人的主题 norm，或撞别人的 alias（新名是别人 alias ⇒ 放行会造成 shadow/歧义）
+    const conflict = this._nameTakenByAny(targetNorm, t.id);
+    if (conflict) {
+      throw new MemError('NAME_CONFLICT', `新名「${raw}」已存在（${conflict.id}「${conflict.name}」）——同名本质应合并，请走 merge`, { id: t.id, conflictId: conflict.id, conflictName: conflict.name });
+    }
+    // 旧名进 aliases：若旧名已是**别的**主题的 alias ⇒ 只审计不写（避免 resolveTopic 多命中 AMBIGUOUS）
+    let aliases = (t.aliases || []).slice();
+    let aliasesAdded = 0;
+    const oldAliasOwner = this._findTopicByAliasNorm(oldNorm);
+    if (oldNorm && oldNorm !== targetNorm && !aliases.some((a) => normalizeName(a) === oldNorm)) {
+      if (oldAliasOwner && String(oldAliasOwner.id) !== String(t.id)) {
+        this._audit('topic.alias.skipped', { at: this.nowMs(), topicId: t.id, actor: ident.actor, detail: { alias: oldName, reason: 'alias-owned-by-other', otherId: oldAliasOwner.id } });
+      } else {
+        aliases.push(oldName);
+        aliasesAdded = 1;
+      }
+    }
+    const capped = this._capAliases(t, aliases, { actor: ident.actor, reason: 'rename-cap' });
+    const at = this.nowMs();
+    // 走 backend.updateTopic（4.5.7 P0 已修：patch.norm 会持久化）；ledger 同路径同步 normIndex
+    this.be.updateTopic(t.id, { name: raw, norm: targetNorm, aliases: capped.aliases, updatedAt: at });
+    try { this._metaSet('renamed.from:' + t.id, oldName); } catch (eM) { /* meta 失败不阻塞 */ }
+    this._audit('topic.rename', { at, topicId: t.id, actor: ident.actor, oldText: oldName, newText: raw, detail: { reason, aliasesAdded, evicted: capped.evicted } });
+    return { ok: true, id: t.id, from: oldName, to: raw, aliasesAdded, evicted: capped.evicted[0] || null, aliases: capped.aliases };
+  }
+  // ======================================================================
   // 5. 别名 / triggers（只增不删；删除走 retired 标记）
   // ======================================================================
   addAlias(topicRef, alias, { actor = 'runtime', claimedActor, actualActor } = {}) {
@@ -1144,9 +1253,10 @@ export class MemoryStore {
     const norm = normalizeName(alias);
     if (!norm) return { added: false, id: t.id };
     if ((t.aliases || []).some((a) => normalizeName(a) === norm)) return { added: false, id: t.id };
-    this.be.updateTopic(t.id, { aliases: [...(t.aliases || []), String(alias).trim()], updatedAt: this.nowMs() });
-    this._audit('topic.alias', { topicId: t.id, newText: String(alias).trim(), actor: ident.actor });
-    return { added: true, id: t.id };
+    const capped = this._capAliases(t, [...(t.aliases || []), String(alias).trim()], { actor: ident.actor, reason: 'add-alias' });
+    this.be.updateTopic(t.id, { aliases: capped.aliases, updatedAt: this.nowMs() });
+    this._audit('topic.alias', { topicId: t.id, newText: String(alias).trim(), actor: ident.actor, detail: capped.evicted.length ? { evicted: capped.evicted } : undefined });
+    return { added: true, id: t.id, evicted: capped.evicted[0] || null };
   }
 
   /**
@@ -1792,15 +1902,16 @@ export class MemoryStore {
   /** 新主题名撞名时加日期后缀（同日再撞加序号） */
   _freeTopicName(base) {
     const norm = normalizeName(base);
-    if (!this.be.getTopicByNorm(norm)) return base;
+    // [4.5.7] 同时查 aliases：新主题名不能等于已有主题的旧名（否则 resolveTopic 歧义）
+    if (!this._nameTakenByAny(norm)) return base;
     const d = new Date(this.nowMs());
     const p = (n) => String(n).padStart(2, '0');
     const stamp = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
     const cand = base + '（' + stamp + '）';
-    if (!this.be.getTopicByNorm(normalizeName(cand))) return cand;
+    if (!this._nameTakenByAny(normalizeName(cand))) return cand;
     for (let n = 2; n <= 20; n += 1) {
       const c = cand + ' ' + n;
-      if (!this.be.getTopicByNorm(normalizeName(c))) return c;
+      if (!this._nameTakenByAny(normalizeName(c))) return c;
     }
     return cand + ' ' + this.nowMs();
   }

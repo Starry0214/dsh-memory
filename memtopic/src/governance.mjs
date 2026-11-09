@@ -242,10 +242,10 @@ export const ACTORS = Object.freeze(['user', 'lead', 'dream', 'plugin', 'runtime
  *   真正的身份判定在插件边界（spawn 记录/会话 id/是否子代理），store 只接受插件传入的结论。
  */
 export const PERMISSIONS = Object.freeze({
-  user:    Object.freeze({ createStates: ['draft', 'active'], merge: true,  split: true,  delete: true,  setState: true,  retireTrigger: true,  addTrigger: true, write: true, seed: false }),
-  lead:    Object.freeze({ createStates: ['draft', 'active'], merge: true,  split: true,  delete: true,  setState: true,  retireTrigger: true,  addTrigger: true, write: true, seed: false }),
-  runtime: Object.freeze({ createStates: ['draft', 'active'], merge: true,  split: true,  delete: true,  setState: true,  retireTrigger: true,  addTrigger: true, write: true, seed: false }),
-  dream:   Object.freeze({ createStates: ['draft'],           merge: false, split: false, delete: false, setState: false, retireTrigger: false, addTrigger: true, write: true, seed: false }),
+  user:    Object.freeze({ createStates: ['draft', 'active'], merge: true,  split: true,  delete: true,  setState: true,  rename: true,  retireTrigger: true,  addTrigger: true, write: true, seed: false }),
+  lead:    Object.freeze({ createStates: ['draft', 'active'], merge: true,  split: true,  delete: true,  setState: true,  rename: true,  retireTrigger: true,  addTrigger: true, write: true, seed: false }),
+  runtime: Object.freeze({ createStates: ['draft', 'active'], merge: true,  split: true,  delete: true,  setState: true,  rename: true,  retireTrigger: true,  addTrigger: true, write: true, seed: false }),
+  dream:   Object.freeze({ createStates: ['draft'],           merge: false, split: false, delete: false, setState: false, rename: true,  retireTrigger: false, addTrigger: true, write: true, seed: false }),
   plugin:  Object.freeze({ createStates: ['draft'],           merge: false, split: false, delete: false, setState: false, retireTrigger: false, addTrigger: true, write: true, seed: true }),
 });
 

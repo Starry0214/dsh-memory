@@ -88,7 +88,7 @@ try {
     const h = hierFn(store, rows, mod.__topicDbLevelMap(store, rows));
     const nu = mod.__noteUnrefinedStats(store, rows);
     ok(h.unmapped <= 3, "D1 真实库未归类已收敛（排除系统主题后 ≤3；实测 " + h.unmapped + "）", "unmapped=" + h.unmapped);
-    ok(h.noteTopics === 15 && h.systemTopics === 15, "D2 真实库系统主题 = 15 个会话笔记（笔记主题不计入未归类）", "system=" + h.systemTopics + " notes=" + h.noteTopics + " cp=" + h.checkpointTopics);
+    ok(h.noteTopics >= 15 && h.systemTopics === h.noteTopics + h.checkpointTopics && h.checkpointTopics === 0, "D2 真实库系统主题全部是会话笔记（≥15、无检查点混入；笔记主题不计入未归类）", "system=" + h.systemTopics + " notes=" + h.noteTopics + " cp=" + h.checkpointTopics);
     ok(h.unmappedItems.every((x) => !/^笔记·/.test(x.name) && !/\/[0-9a-f]{8}$/.test(x.name)), "D3 unmappedItems 里没有系统主题名", JSON.stringify(h.unmappedItems.map((x) => x.name)));
     ok(typeof nu.sentences === "number", "D4 待提炼句数可读（面板同源）", JSON.stringify(nu));
     try { be.close(); } catch (e) {}

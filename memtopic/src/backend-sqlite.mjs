@@ -130,8 +130,11 @@ export class SqliteBackend {
     const cur = this.getTopicById(id);
     if (!cur) throw new Error('topic not found: ' + id);
     const next = { ...cur, ...patch };
-    this.db.prepare('UPDATE topics SET name=?,aliases=?,triggers=?,state=?,updated_at=?,last_hit_at=?,write_count=? WHERE id=?')
-      .run(next.name, JSON.stringify(next.aliases), JSON.stringify(next.triggers), next.state,
+    // [4.5.7 P0] patch 带 norm 时必须持久化：原 SQL 不写 norm ⇒ rename 后新名 exact 不中、旧名 exact 仍中、
+    //   冲突检测失真（sqlite/ledger 行为分叉）。不带 norm 的既有调用方沿用当前值（零行为变化）。
+    const nextNorm = next.norm != null ? String(next.norm) : String(cur.norm || '');
+    this.db.prepare('UPDATE topics SET name=?,norm=?,aliases=?,triggers=?,state=?,updated_at=?,last_hit_at=?,write_count=? WHERE id=?')
+      .run(next.name, nextNorm, JSON.stringify(next.aliases), JSON.stringify(next.triggers), next.state,
         next.updatedAt, next.lastHitAt || null, next.writeCount || 0, id);
   }
 

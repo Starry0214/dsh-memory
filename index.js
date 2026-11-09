@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.6";
+const PLUGIN_VERSION = "4.5.7";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -2082,10 +2082,13 @@ function noteRemindCheck(sid, totalTokens) {
 }
 /** 压缩后清零档位（下一轮重新从 15% 开始提醒）。 */
 function noteRemindReset(sid) { try { noteRemindState.delete(String(sid || "")); } catch (e) { } }
-/** 统一的提醒文案（两处复用：跨档提醒 / 压缩后重灌） */
+/** 统一的提醒文案（两处复用：跨档提醒 / 压缩后重灌）
+ *  [2026-11-08 用户口径] 提醒文案**不再告知 Agent 上下文用了多少**（原「上下文已用约 N%（第 M 档）」已删）。
+ *  档位/占比仍写 monitor（`note remind lvl/ratio`）供内部观测，只是不进模型上下文。 */
 function noteRemindText(tag) {
-  return "<system-reminder>\n【会话笔记提醒】(dsh-memory) "
-    + tag + "\n"
+  return "<system-reminder>\n【会话笔记提醒】(dsh-memory)"
+    + (tag ? " " + tag : "")
+    + "\n"
     + "这期间有「三个月后可能还有用」的东西吗——用户原话/口径（逐字）、未解问题、跨项目观察、"
     + "精确字面量（端口/路径/命令/ID/文号）？有就 memory_note 记一笔（同内容重复会被自动跳过，宁可多记）；"
     + "没有就忽略本条。\n</system-reminder>";
@@ -2816,6 +2819,135 @@ const PROJECT_CHAR_SOFT = 6000;              // v2.4.20：提取目标上限（�
 const DETAIL_TOPIC_CHAR_LIMIT = 40000;
 const INDEX_TOPIC_CHAR_LIMIT = 200000;
 const INDEX_TOPIC_NAME_RE = /(?:精确)?字面量索引|记忆索引/;
+
+// ═══ [4.5.7] 主题演进：rename 保护名 + 体检指标（模级；纯函数 + 5min 缓存）═══
+//   rename 工具层完整判据（store 层还有一份兜底）：笔记/P2.5 会话主题/会话检查点线·域/索引类 一律禁改。
+function isRenameProtectedTopicName(name) {
+  const n = String(name == null ? "" : name).trim();
+  if (!n) return false;
+  try {
+    if (isNoteTopicName(n)) return true;                       // 笔记·*
+    if (typeof p25Topics.isSessionTopicName === "function" && p25Topics.isSessionTopicName(n)) return true;   // <wsKey>/<sid8>
+    if (n.indexOf("会话检查点") === 0) return true;            // 会话检查点·* 线 / 会话检查点（已归档…）
+    if (n === (p25Topics.D8_DOMAIN_NAME || "日记忆（按天流水）")) return true;
+    if (INDEX_TOPIC_NAME_RE.test(n)) return true;              // 精确字面量索引 / 记忆索引
+  } catch (e) { return false; }
+  return false;
+}
+// 指标用归一化（与 governance.normalizeName 同口径：NFKC + 小写 + 去分隔符/空白）—— 不能改成别的，否则与库内 norm 漂移
+function topicNormName(s) {
+  try { return String(s == null ? "" : s).normalize("NFKC").toLowerCase().replace(/[\s_\-·・,，.。:：/\\()（）\[\]【】]/g, ""); } catch (e) { return String(s == null ? "" : s).toLowerCase(); }
+}
+function topicLev(a, b) {
+  const A = String(a == null ? "" : a), B = String(b == null ? "" : b);
+  if (A === B) return 0;
+  const m = A.length, n = B.length;
+  if (!m) return n; if (!n) return m;
+  let prev = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (A.charCodeAt(i - 1) === B.charCodeAt(j - 1) ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+}
+const TOPIC_HEALTH_TTL_MS = 5 * 60 * 1000;
+const TOPIC_HEALTH_CACHE = { at: 0, sig: "", data: null };
+/**
+ * [4.5.7] 主题卫生体检（dupTriggers / fragments / orphans / nearDupPairs / oversized）。
+ *   · 复用 stats snapshot 已取的 `store.topics()` 一份 rows（不要为指标再扫全库）；
+ *   · nearDup 只对候选对算（trigger 倒排 shared>=2 + 名字包含/Levenshtein<=2），结果 TTL 5min；
+ *   · oversized 排除索引类（T-0474/0475 是 200K 上限，否则永远 2 个假阳性）；
+ *   · orphans 由调用方传 hier.unmapped（parent=null 且非系统主题的 detail），口径与 4.5.6 一致。
+ */
+function topicHealthMetrics(rows, opts) {
+  const o = opts || {};
+  const now = Number.isFinite(Number(o.now)) ? Number(o.now) : Date.now();
+  const list = Array.isArray(rows) ? rows : [];
+  // 缓存签名：行数 + 最大 updatedAt（rename/写入会更新 updatedAt ⇒ 自然失效；5min 兜底）
+  let maxUpd = 0;
+  for (const t of list) maxUpd = Math.max(maxUpd, Number((t && (t.updatedAt || t.updated_at)) || 0));
+  const sig = list.length + ":" + maxUpd;
+  if (TOPIC_HEALTH_CACHE.data && TOPIC_HEALTH_CACHE.sig === sig && (now - TOPIC_HEALTH_CACHE.at) < TOPIC_HEALTH_TTL_MS) {
+    return Object.assign({}, TOPIC_HEALTH_CACHE.data, { cached: true });
+  }
+  const active = list.filter((t) => t && String(t.state || "") === "active" && !t.mergedInto);
+  const isSys = (t) => { try { return isNoteTopicName(String((t && t.name) || "")) || (typeof p25Topics.isSessionTopicName === "function" && p25Topics.isSessionTopicName(String((t && t.name) || ""))); } catch (e) { return false; } };
+  const isIdx = (t) => INDEX_TOPIC_NAME_RE.test(String((t && t.name) || ""));
+  // ① 重复 trigger：同一个 trigger 挂 ≥2 个 active 主题（trigger 归一后比较）
+  const trigMap = new Map();
+  for (const t of active) {
+    const trigs = Array.isArray(t.activeTriggers) ? t.activeTriggers : (Array.isArray(t.triggers) ? t.triggers : []);
+    for (const tr of new Set(trigs.map((x) => topicNormName(x)).filter(Boolean))) {
+      if (!trigMap.has(tr)) trigMap.set(tr, new Set());
+      trigMap.get(tr).add(String(t.id));
+    }
+  }
+  let dupTriggers = 0;
+  for (const set of trigMap.values()) if (set.size >= 2) dupTriggers += 1;
+  // ② 碎片：active、非系统/索引、live/effective 句数 <3
+  const fragments = active.filter((t) => !isSys(t) && !isIdx(t) && Number(t.sentences || 0) < 3).length;
+  // ③ 未归类：优先用调用方传入的 hier.unmapped（4.5.6 口径）；否则用 parentId 近似
+  const hasChild = new Set(list.filter((t) => t && t.parentId).map((t) => String(t.parentId)));
+  const orphans = (o.orphans != null) ? Number(o.orphans) : list.filter((t) => t && String(t.state || "") === "active" && !t.parentId && !hasChild.has(String(t.id)) && !isSys(t) && !isIdx(t)).length;
+  // ④ 超限：active 非索引 live 字符 >40000
+  const oversized = active.filter((t) => !isIdx(t) && Number(t.chars || 0) > 40000).length;
+  // ⑤ 近重复对：trigger 倒排候选（shared>=2）+ 名字包含（min norm len>=4）/Levenshtein<=2；shared>=3 直接入选
+  const cand = active.filter((t) => !isSys(t) && !isIdx(t));
+  const byTrig = new Map();
+  for (const t of cand) {
+    const trigs = Array.isArray(t.activeTriggers) ? t.activeTriggers : (Array.isArray(t.triggers) ? t.triggers : []);
+    for (const tr of new Set(trigs.map((x) => topicNormName(x)).filter(Boolean))) {
+      if (!byTrig.has(tr)) byTrig.set(tr, []);
+      byTrig.get(tr).push(String(t.id));
+    }
+  }
+  const byId = new Map(cand.map((t) => [String(t.id), t]));
+  const pairShared = new Map();   // "a|b" -> shared count（只统计双方都是候选的 trigger）
+  for (const ids of byTrig.values()) {
+    if (ids.length < 2 || ids.length > 200) continue;   // 泛词（挂 >200 主题）不参与，避免爆炸
+    for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+      const a = ids[i] < ids[j] ? ids[i] : ids[j], b = ids[i] < ids[j] ? ids[j] : ids[i];
+      const k = a + "|" + b; pairShared.set(k, (pairShared.get(k) || 0) + 1);
+    }
+  }
+  let nearDupPairs = 0;
+  const nearDupTop = [];
+  for (const [k, shared] of pairShared) {
+    if (shared < 2) continue;
+    const [a, b] = k.split("|");
+    const ta = byId.get(a), tb = byId.get(b);
+    if (!ta || !tb) continue;
+    const na = topicNormName(ta.name), nb = topicNormName(tb.name);
+    let nameRelated = false;
+    if (na && nb) {
+      if (na === nb) nameRelated = true;
+      else if (Math.min(na.length, nb.length) >= 4 && (na.includes(nb) || nb.includes(na))) nameRelated = true;
+      else if (Math.min(na.length, nb.length) >= 4 && topicLev(na, nb) <= 2) nameRelated = true;   // 短名（项目/计划/系统）不因 Lev 误报
+    }
+    if (!(nameRelated || shared >= 3)) continue;
+    nearDupPairs += 1;
+    if (nearDupTop.length < 20) nearDupTop.push({ a: { id: ta.id, name: ta.name }, b: { id: tb.id, name: tb.name }, sharedTriggers: shared, nameRelated });
+  }
+  nearDupTop.sort((x, y) => (y.sharedTriggers - x.sharedTriggers) || String(x.a.id).localeCompare(String(y.a.id)));
+  const data = { dupTriggers, fragments, orphans, nearDupPairs, oversized, nearDupTop: nearDupTop.slice(0, 20), at: now, cached: false };
+  TOPIC_HEALTH_CACHE.at = now; TOPIC_HEALTH_CACHE.sig = sig; TOPIC_HEALTH_CACHE.data = data;
+  return data;
+}
+/** 面板/工具共用一行文案（全 0 ⇒ 良好） */
+function topicHealthLineText(m) {
+  const x = m || {};
+  const n = (v) => Number(v || 0);
+  if (!n(x.dupTriggers) && !n(x.fragments) && !n(x.nearDupPairs) && !n(x.oversized) && !n(x.orphans)) return "主题卫生：良好";
+  return "主题卫生：重复 trigger " + n(x.dupTriggers) + " · 碎片 " + n(x.fragments) + " · 近重复 " + n(x.nearDupPairs) + " 对 · 超限 " + n(x.oversized) + (n(x.orphans) ? " · 未归类 " + n(x.orphans) : "");
+}
+// [4.5.7] rename 每轮限次（dream 卫生节：每轮最多 3 次；sessionId 变化或 >1h 视为新一轮）
+const RENAME_ROUND = { sid: "", at: 0, count: 0, limit: 3 };
+function renameRoundReset() { RENAME_ROUND.sid = ""; RENAME_ROUND.at = 0; RENAME_ROUND.count = 0; return RENAME_ROUND; }
+export { topicHealthMetrics as __topicHealthMetrics, topicHealthLineText as __topicHealthLineText,
+  isRenameProtectedTopicName as __isRenameProtectedTopicName, RENAME_ROUND as __renameRound,
+  renameRoundReset as __renameRoundReset };
 // v2.6.7：UTF-8 字节数（沙箱无 Buffer，用 TextEncoder）——**提级到模块级**（原在 apply 闭包内，W1 阶段：
 //   软硬阈值同源需在模块级判定；纯函数无闭包依赖。注：模块级调用闭包内函数会 ReferenceError，
 //   而注入链在 try 内会把异常吞成一行 cerr → 记忆注入整链静默失效，故此处必须模块级）。
@@ -4588,6 +4720,13 @@ function buildDreamPromptLibrary(extras) {
     + "2. 项目专属事实/决策 → 用 memory_dream_patch({ patches: [{ topic: \"<主题ID或名字>\", action: \"append|edit|replace|delete\", ... }] }) 写入对应主题；不要新建 md 文件。\n"
     + "3. 每条 1-3 行；精确字面量（文号/路径/数字/命令）逐字保留；相对日期转 YYYY-MM-DD。\n"
     + "4. 写前先用 memory_read 读全该主题；局部修改优先 action:\"edit\"（old_string→new_string）。\n\n"
+    + "## 主题卫生（每轮顺手检查，有问题才动手）\n"
+    + "对候选主题逐个判断，只在**明确有问题**时处理，**每轮最多 3 个操作**：\n"
+    + "- 近重复（名字/trigger 高度重叠）⇒ memory_review_topic({verdict:\"merge\", into:<保留的>})\n"
+    + "- 命名过时（指向已不存在/已改名的项目）⇒ memory_rename_topic({topic, new_name, reason})\n"
+    + "- 碎片（正文 <3 句且无独立价值）⇒ 建议合并（memory_review_topic merge）\n"
+    + "- 超限（>40000 字符，索引类除外）⇒ memory_split_topic 按语义分片\n"
+    + "纪律：**宁可不动，不要瞎动**；每次操作必须在最终文本里报告「改了什么、为什么」。\n"
     + "## Capacity / Prune\n" + cap + "\n"
     + reviewBlock + "\n"
     + (noteBlock ? noteBlock + "\n" : "")
@@ -4595,7 +4734,7 @@ function buildDreamPromptLibrary(extras) {
     + "## Self-Calibration\n- D: " + String(p.calibStats || "数据不足") + "\n- E: " + String(p.eCalibStats || "数据不足") + "\n"
     + "- W: " + String(p.wCalibStats || "数据不足") + "\n- Break: " + String(p.brkCalibStats || "数据不足") + "\n- Maint: " + String(p.maintStats || "数据不足") + "\n"
     + "- 只准调用 dsh_spiral_thresh / dsh_maint_thresh 工具并带 reason；无需调整就不调用。\n\n"
-    + "## Write Path\n- 工具面：read/grep/glob/memory_search/memory_size_preview/memory_dream_patch/memory_split_topic/memory_review_topic；没有写文件工具。\n"
+    + "## Write Path\n- 工具面：read/grep/glob/memory_search/memory_size_preview/memory_dream_patch/memory_split_topic/memory_review_topic/memory_rename_topic；没有写文件工具。\n"
     + "- 一切写入走 memory_dream_patch：库模式用 topic 寻址（优先）；global.md/index.md 属人工稳定层，仍可用 file 写。\n"
     + "- 结构分片（主题超限、内容确属多个子主题）走 memory_split_topic：先 memory_read 读全文，再传 sentence_texts（原文逐字）。\n"
     + "- 待审队列裁决走 memory_review_topic（keep=转 active / merge=并入 into 并归档源）：**必须**先 memory_read 读正文再判，不许凭名字猜。\n"
@@ -5740,7 +5879,7 @@ function p3OnSessionEvent(session, event) {
           try {
             const _nh = noteRemindPeek(sid, total);
             if (_nh) {
-              const _qOk = enqueueRegressionReminder(sid, "note-remind", noteRemindText("上下文已用约 " + _nh.ratio + "%（第 " + _nh.level + " 档）。"));
+              const _qOk = enqueueRegressionReminder(sid, "note-remind", noteRemindText(""));
               // [CRA M3] 投递成功才消费档位：入队失败（队列异常/会话已结束）时保持原档，下轮重试。
               if (_qOk) {
                 noteRemindCommit(sid, _nh.level);
@@ -9513,7 +9652,7 @@ function topicDbStatsSnapshot() {
     //   面板按 state/stage 渲染"升级状态"一行并给出可复制的升级命令（只读展示）。
     upgrade: topicDbUpgradeSummary(),
     reviewQueue: [],         // 待审队列前 5 条（面板可点开；excerpt 即 memory_read 的前几句）
-    health: { ok: 0, failed: 0, txDepthLeak: 0, lastWriteAt: null, lastImportAt: null, lastError: null },
+    health: { ok: 0, failed: 0, txDepthLeak: 0, lastWriteAt: null, lastImportAt: null, lastError: null, topicHealth: null },
     // [4.5.2 P1-3] 会话笔记未提炼统计（口径 A：最后一条指针之后的句数；只读）
     noteUnrefined: { topics: 0, sentences: 0, total: 0, items: [] },
     updatedAt: at,
@@ -9578,6 +9717,8 @@ function topicDbStatsSnapshot() {
       out.checkpointTopics = hier.checkpointTopics || 0;
       out.effective = out.effectiveTopics;
       out.hierarchy = { counts: hier.counts, domains: hier.domains, unmappedItems: hier.unmappedItems, caps: hier.caps };
+      // [4.5.7] 主题卫生指标（复用本次已取的 topics rows；nearDup TTL 5min 缓存；孤儿复用 hier.unmapped）
+      try { out.health.topicHealth = topicHealthMetrics(topics, { orphans: hier.unmapped, at: at }); } catch (eTH) { out.health.topicHealth = null; }
       if (counts) {
         // 同源取值（权威）
         out.main = counts.main;
@@ -9812,6 +9953,13 @@ function topicDbPanelBlock() {
     L.push('    h += "<div class=mono>未归类 " + num(t.unmapped) + " 个（parent=null，未挂进任何域树）</div>";');
     L.push('    var nu0 = t.noteUnrefined || { topics: 0, sentences: 0 };');
     L.push('    h += "<div class=mono>会话笔记 " + num(t.noteTopics) + " 个（系统主题，无需归类） · 待提炼 " + num(nu0.sentences) + " 句</div>";');
+    L.push('    var _th = (t.health && t.health.topicHealth) || null;');
+    L.push('    h += "<div class=mono>" + (function (m) {');
+    L.push('      if (!m) return "主题卫生：—";');
+    L.push('      var n = function (v) { return Number(v || 0); };');
+    L.push('      if (!n(m.dupTriggers) && !n(m.fragments) && !n(m.nearDupPairs) && !n(m.oversized) && !n(m.orphans)) return "主题卫生：良好";');
+    L.push('      return "主题卫生：重复 trigger " + n(m.dupTriggers) + " · 碎片 " + n(m.fragments) + " · 近重复 " + n(m.nearDupPairs) + " 对 · 超限 " + n(m.oversized) + (n(m.orphans) ? " · 未归类 " + n(m.orphans) : "");');
+    L.push('    })(_th) + "</div>";');
   L.push('    h += "<div class=mono>总行 " + num(total) + " · 已合并源 " + num(t.mergedSources) + " · 物理句 " + num(t.physicalSentences) + "</div>";');
   L.push('    h += "<div class=mono>后端 " + esc(t.backend || "-") + " · 库 " + human(t.dbSizeBytes) + " · 库文件 " + esc(t.dbPath || "-") + "</div>";');
   L.push('    h += "<div class=mono>待归类 " + num(t.needsReview) + " 条" + (Number(t.oldestPendingDays || 0) > 0 ? "（最早 " + num(t.oldestPendingDays) + " 天）" : "") + " · dream 自动裁决</div>";');
@@ -12483,6 +12631,10 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
           const _nu = noteUnrefinedStats(store, rows);   // [D10] 复用本函数已取的整库 rows
           out2.push("");
           out2.push("[会话笔记] " + hier.noteTopics + " 个（系统主题，无需归类） · 待提炼 " + _nu.sentences + " 句（口径 A：最后一条指针之后的句数；dream 整合时自动提炼+收敛）");
+        try {
+          const _th = topicHealthMetrics(rows, { orphans: hier.unmapped });
+          out2.push("[主题卫生] " + topicHealthLineText(_th));
+        } catch (eTH2) { /* 指标失败不影响清单 */ }
           if (_nu.items.length) {
             out2.push("  " + _nu.items.slice(0, 5).map((x) => x.id + "「" + String(x.name).replace(/^笔记·/, "") + "」" + x.count + " 句").join("；")
               + (_nu.total > 5 ? "（…另 " + (_nu.total - 5) + " 个）" : ""));
@@ -12642,6 +12794,63 @@ function topicDbRegisterTools(toolSvc, deps = {}) {
         }
         return JSON.stringify({ ok: false, code: "BAD_OP", message: "op 只支持 append|replace，收到 " + op });
       } catch (e) { topicDbHealthTick(false, e, store); return JSON.stringify(topicDbMemErr(e)); }   // [topicdb] task-10 A1：失败也计数（面板"最近错误"）
+    },
+  });
+
+  // memory_rename_topic：dream 卫生节专用（独立工具，不塞 dream_patch；tools/pre-execute 有 dream 闸）
+  //   纪律：只改 name/norm/aliases（不动 id/trigger/句子/层级/state）；每轮最多 3 次；系统/结构主题与 archived 拒绝；
+  //   撞名 ⇒ NAME_CONFLICT 提示走 merge；成功后异步调度导出（全量快照 2.3-3.3s，绝不在调用栈 await）。
+  compatTool(toolSvc, {
+    name: "memory_rename_topic",
+    description: "【dream 卫生节专用】重命名主题：只改 name/norm/aliases，不动 id/trigger/句子/层级/state。每轮最多 3 次。"
+      + "系统/结构主题（笔记·/P2.5 会话主题/会话检查点线·域/索引类）与 archived 一律拒绝；新名撞现有主题或别人的 alias ⇒ NAME_CONFLICT（同名本质应合并，请走 merge）。"
+      + "旧名会进 aliases（上限 10，FIFO 淘汰最旧），旧名仍可被 memory_search 命中。",
+    parameters: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "主题 ID 或名字/别名" },
+        new_name: { type: "string", description: "新主题名（非空；不要改名成系统主题名）" },
+        reason: { type: "string", description: "可选：为什么改名（写审计，dream 最终文本也要报告）" },
+      },
+      required: ["topic", "new_name"],
+    },
+    output: { schema: { type: "string" }, render(_a, v) { return [{ type: "text", text: String(v) }]; } },
+    async execute(args, exec) {
+      const store = await readStore();
+      if (!store) return topicDbUnavailable();
+      try {
+        if (typeof store.renameTopic !== "function") return JSON.stringify({ ok: false, code: "UNSUPPORTED", message: "当前 memory-store 不支持 renameTopic（请升级 memtopic）" });
+        const a = (args && typeof args === "object") ? args : {};
+        const topic = String(a.topic || "").trim();
+        const newName = String(a.new_name == null ? "" : a.new_name).trim();
+        const reason = String(a.reason || "").trim();
+        if (!topic || !newName) return JSON.stringify({ ok: false, code: "BAD_ARG", message: "topic / new_name 必填" });
+        // tool 层完整保护判据（store 层还有兜底）：先读当前名，避免只凭入参猜
+        try {
+          const st = store.readTopic(topic);
+          if (!st) return JSON.stringify({ ok: false, code: "NOT_FOUND", message: "主题不存在：" + topic });
+          if (isRenameProtectedTopicName(String(st.name || "")) || isRenameProtectedTopicName(newName)) {
+            return JSON.stringify({ ok: false, code: "SYSTEM_TOPIC_READONLY", topicId: String(st.id || topic), message: "系统/结构主题（笔记/P2.5/会话检查点/索引）禁止重命名：" + String(st.name || "") });
+          }
+          if (String(st.state || "") === "archived") return JSON.stringify({ ok: false, code: "ARCHIVED_READONLY", topicId: String(st.id || topic), message: "主题已归档（archived 只读），不能重命名" });
+        } catch (eT) { /* 读失败让 store 报自己的错 */ }
+        // 每轮限次：dream 轮次以 sessionId 为界；session 变化或 >1h 重置（与卫生节「每轮最多 3 个操作」一致）
+        const agSid = String((exec && exec.agent && exec.agent.session && exec.agent.session.id) || "");
+        const nowT = Date.now();
+        if (RENAME_ROUND.sid !== agSid || (nowT - RENAME_ROUND.at) > 3600000) { RENAME_ROUND.sid = agSid; RENAME_ROUND.at = nowT; RENAME_ROUND.count = 0; }
+        RENAME_ROUND.at = nowT;
+        if (RENAME_ROUND.count >= RENAME_ROUND.limit) {
+          return JSON.stringify({ ok: false, code: "RENAME_RATE_LIMITED", used: RENAME_ROUND.count, limit: RENAME_ROUND.limit, message: "本轮已用满 " + RENAME_ROUND.limit + " 次重命名（dream 卫生节限次）；下轮再改" });
+        }
+        const r = store.renameTopic(topic, newName, { actor: "runtime", reason: reason || "dream-hygiene" });
+        if (!r || r.ok === false) return JSON.stringify({ ok: false, code: (r && r.code) || "RENAME_FAILED", message: "重命名失败" });
+        RENAME_ROUND.count += 1;
+        try { monitorEvent("topic", "rename " + String(r.id) + " " + String(r.from || "").slice(0, 40) + " -> " + String(r.to || "").slice(0, 40) + " n=" + RENAME_ROUND.count); } catch (eM) { /* 忽略 */ }
+        // 导出视图：异步调度（CRA 实测全量快照 2.3-3.3s；失败静默、不阻塞）
+        let exportScheduled = false;
+        try { exportScheduled = topicDbScheduleAutoExport("rename") === true; } catch (eX) { exportScheduled = false; }
+        return JSON.stringify({ ok: true, id: r.id, from: r.from, to: r.to, aliasesAdded: Number(r.aliasesAdded || 0), evicted: r.evicted || null, used: RENAME_ROUND.count, limit: RENAME_ROUND.limit, exportScheduled: exportScheduled });
+      } catch (e) { return JSON.stringify(Object.assign(topicDbMemErr(e), { ok: false })); }
     },
   });
 
@@ -17991,7 +18200,7 @@ compatOn(ctx, "tools/pre-execute", async (exec, next) => {
   try {
     const toolName = String((exec && exec.name) || "");
     // [dream 待审裁决][2026-11-04] memory_review_topic 同属结构改写权（改 state / 并库），与 split 同一道闸
-    if (toolName !== "memory_split_topic" && toolName !== "memory_review_topic") return next();
+    if (toolName !== "memory_split_topic" && toolName !== "memory_review_topic" && toolName !== "memory_rename_topic") return next();
     const ag = exec && exec.agent;
     const sid = (ag && ag.session && ag.session.id) || "";
     const g = sid ? SUBAGENT_GUARDS.get(sid) : null;

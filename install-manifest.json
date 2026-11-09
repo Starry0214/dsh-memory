@@ -1,6 +1,6 @@
 {
-  "version": "4.5.6",
-  "generatedAt": "2026-11-08T04:44:31.999Z",
+  "version": "4.5.7",
+  "generatedAt": "2026-11-09T01:41:38.020Z",
   "files": [
     {
       "path": "AGENTS.template.md",
@@ -24,8 +24,8 @@
     },
     {
       "path": "index.js",
-      "bytes": 1572490,
-      "sha256": "d9663647e775fa29d32175c76d0faf3c8d1e2f0679413feed66ba864b92b3103"
+      "bytes": 1587984,
+      "sha256": "e4525258806ac9ccb8894fd82241cf93713a1dc7901780c9ce011911cbb5c8e6"
     },
     {
       "path": "memtopic/src/backend-ledger.mjs",
@@ -34,8 +34,8 @@
     },
     {
       "path": "memtopic/src/backend-sqlite.mjs",
-      "bytes": 8291,
-      "sha256": "99887f992bc9d9b62a89a2227589a4dadf7fd47fd6cfcfc60a56a7cccf7aaac5"
+      "bytes": 8658,
+      "sha256": "69602437124a169e591f9686e504650cedd64628a234ff7bdd46af2cf0e55ab6"
     },
     {
       "path": "memtopic/src/curation-apply.mjs",
@@ -54,8 +54,8 @@
     },
     {
       "path": "memtopic/src/governance.mjs",
-      "bytes": 16712,
-      "sha256": "8c9db0ce953fd406ab88741af6aa2e9c3fecd115262f399351dc1f13d8190ba0"
+      "bytes": 16772,
+      "sha256": "c043bfc180367162dc2b645835537ed67cf52151f8c3404e5b9bd9c9c8f974ea"
     },
     {
       "path": "memtopic/src/import.mjs",
@@ -69,8 +69,8 @@
     },
     {
       "path": "memtopic/src/memory-store.mjs",
-      "bytes": 132206,
-      "sha256": "323b49c871b980fc43758688bb919edf8be6d0beadaec9c5701dc2bc751bc057"
+      "bytes": 140240,
+      "sha256": "d40708e50c5ecc561351e971351c89f2fe31053dfa36849adfaccb506d0886ee"
     },
     {
       "path": "memtopic/src/migrate.mjs",
@@ -95,7 +95,7 @@
     {
       "path": "package.json",
       "bytes": 651,
-      "sha256": "f4b08e1f0a37d99dace880673b3c57aab81bf730257837abc33fa8c3f365c725"
+      "sha256": "22ce669ed83a5c3ba7cc881ed1a3ed47c023f77f70413e441bf95ecdb04c62f0"
     },
     {
       "path": "tools/session-search.mjs",
@@ -106,12 +106,12 @@
     {
       "path": "version.txt",
       "bytes": 5,
-      "sha256": "b5413b4e68035f97ea0eb808127f0fd1236c79ec25b32b186ffcef71747f4677"
+      "sha256": "f90bb38ff4621387a2dc9558baab34f9668c81c3f905c0118f82a47f5930cbd3"
     }
   ],
   "zip": {
-    "name": "dsh-memory-4.5.6.zip",
-    "bytes": 776486,
-    "sha256": "504b0c306acb9575d869d96def26a0a3624495be3aaaa01466f0881149d8bd24"
+    "name": "dsh-memory-4.5.7.zip",
+    "bytes": 784565,
+    "sha256": "38bf731f4974afd69f7fa783a943c1dc3bae5fb8dda1f6674966d30cb668a112"
   }
 }
