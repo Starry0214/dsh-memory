@@ -1,0 +1,43 @@
+{
+  "deployedAt": "2026-11-09T13:55:42.373Z",
+  "stamp": "20261109-215542",
+  "files": {
+    "index.js": {
+      "sha256": "B388FCD7CBD5C8034B618785C81F031133921D54578560AD58880860DA9508CB",
+      "bytes": 1572329
+    },
+    "p3-cost.js": {
+      "sha256": "3BEC04F53C8DBBCA76D432FEFAEF0FDC4A97ED6A73360A68BF9FE17C77C1CBBC",
+      "bytes": 19635
+    },
+    "p3-triggers.js": {
+      "sha256": "A35F71419E2C892E3FAF25793AD1969734DE6CE303597B5E3E2CEDD18AA3F520",
+      "bytes": 11738
+    },
+    "p3-readside.js": {
+      "sha256": "4FC58C843F27559AC9E2CC3F4A5749CCDA0A89F6BB31421D0CF261CF58D164D7",
+      "bytes": 18538
+    },
+    "p25-topics.js": {
+      "sha256": "6920E6DDC90161D2EBFAF30A57B373EA0046D0C382AD09EBB30E8EC0E880903D",
+      "bytes": 36790
+    }
+  },
+  "targets": [
+    {
+      "dir": "C:\\Users\\Starry\\.dsh\\profiles\\web\\plugins\\memory",
+      "beforeSha": "A730394D743A678B33EBD8E839ABDA9F7655B3BBD57BDFDC49DD64C4453BCBDE",
+      "afterSha": "B388FCD7CBD5C8034B618785C81F031133921D54578560AD58880860DA9508CB"
+    },
+    {
+      "dir": "C:\\Users\\Starry\\.dsh\\profiles\\web-test\\plugins\\memory",
+      "beforeSha": "A730394D743A678B33EBD8E839ABDA9F7655B3BBD57BDFDC49DD64C4453BCBDE",
+      "afterSha": "B388FCD7CBD5C8034B618785C81F031133921D54578560AD58880860DA9508CB"
+    },
+    {
+      "dir": "C:\\Users\\Starry\\.dsh\\profiles\\web-cc-test\\plugins\\memory",
+      "beforeSha": "A730394D743A678B33EBD8E839ABDA9F7655B3BBD57BDFDC49DD64C4453BCBDE",
+      "afterSha": "B388FCD7CBD5C8034B618785C81F031133921D54578560AD58880860DA9508CB"
+    }
+  ]
+}

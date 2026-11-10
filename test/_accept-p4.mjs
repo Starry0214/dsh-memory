@@ -581,6 +581,22 @@ const own = (obj, k) => Object.prototype.hasOwnProperty.call(obj || {}, k);
   }
 }
 
+// P-A3（4.5.10）：**所有**记忆插件子代理的 label 必须带目标 sid（用户口径 2026-11-09：
+//   「子代理 label/归属带上目标 sid，避免挂在无关会话名下造成误读。这个是非常必要的，所有记忆插件的子代理都是」）
+{
+  const scL = await boot("a-label", {});
+  const hL = scL.mod.__p4Hooks || {};
+  if (typeof hL.subagentLabelWithTarget === "function") {
+    const full = "session-bca1141e-92a3-45a3-8395-f11e3018f076";
+    const l1 = hL.subagentLabelWithTarget("dsh-memory-压缩-intent-abcd1234", full);
+    R.ok(l1 === "dsh-memory-压缩-intent-abcd1234@bca1141e", "P-L1 检查点 writer label 带目标 sid", l1);
+    const l2 = hL.subagentLabelWithTarget("dsh-memory-自动整合-定时", "session-0ff4d999-476a-4bbc-941a-5c68aa8c0545");
+    R.ok(l2 === "dsh-memory-自动整合-定时@0ff4d999", "P-L2 自动整合 label 带触发会话 sid", l2);
+    const l3 = hL.subagentLabelWithTarget("dsh-memory-压缩-intent-x", "");
+    R.ok(l3 === "dsh-memory-压缩-intent-x@anon", "P-L3 缺 sid 回落 anon（不抛）", l3);
+  } else R.skip("P-L1~L3 子代理 label 带目标 sid", "缺 __p4Hooks.subagentLabelWithTarget（4.5.10 应暴露）");
+}
+
 // P-A2：compactOnce —— 默认配置带 preset；preset 挂载失败回落；自定义 preset 名
 {
   const capA = mkSub02({ text: "ONCE-OK-1" });
@@ -593,7 +609,7 @@ const own = (obj, k) => Object.prototype.hasOwnProperty.call(obj || {}, k);
     R.ok(!threw && out === "ONCE-OK-1" && capA.calls.length === 1, "P9 compactOnce(默认配置)：成功返回子代理文本（1 次 spawn）", threw ? threw.message : "out=" + out + " calls=" + capA.calls.length);
     R.ok(!!spec.request && String(spec.request.agentPreset) === "mem-writer", "P10 ★ compactOnce 默认配置透传 agentPreset=mem-writer", "agentPreset=" + (spec.request && spec.request.agentPreset));
     R.ok(!!spec.request && JSON.stringify(spec.request.toolFilter) === JSON.stringify({ allow: ["memory_search"] }), "P11 compactOnce toolFilter 仍透传", JSON.stringify(spec.request && spec.request.toolFilter));
-    R.ok(String(spec.label || "").indexOf("dsh-memory-压缩-p4-a1") === 0, "P12 compactOnce label 约定不变（dsh-memory-压缩-<tag>）", spec.label);
+    R.ok(String(spec.label || "") === "dsh-memory-压缩-p4-a1@p4-a1", "P12 ★ compactOnce label 带目标 sid（dsh-memory-压缩-<tag>@<sid8>）", spec.label);
   } else R.skip("P9~P12 compactOnce 默认配置", "缺 __p4Hooks.compactOnce");
 
   // preset 挂载失败 → 回落不带 preset 再起一次；成功不阻断

@@ -213,6 +213,24 @@ test("收尾：lastActivityAt 在未来 → not-idle", () => {
 test("收尾：空参数对象安全降级", () => {
   eq(decideSessionEnd(), { fire: false, reason: "no-activity" });
 });
+// ═══ 7b. T5 修复（4.5.10 / CRA 2026-11-09）：归档排除 + 最大空闲窗 ═══
+test("收尾：已归档会话排除（T5-1）", () => {
+  eq(decideSessionEnd({ lastActivityAt: NOW - 3600000, now: NOW, isArchived: true }), { fire: false, reason: "archived" });
+});
+test("收尾：归档优先于 hasCheckpoint 与 idle", () => {
+  eq(decideSessionEnd({ lastActivityAt: NOW - 3600000, now: NOW, isArchived: true, hasCheckpoint: true }).reason, "archived");
+  eq(decideSessionEnd({ lastActivityAt: NOW, now: NOW, isArchived: true }).reason, "archived");
+});
+test("收尾：超过最大空闲窗（默认 7 天）⇒ too-old（T5-F）", () => {
+  const D7 = 7 * 86400000;
+  const BIG = 100 * 86400000;   // 用大基准：NOW(1e7) 减 7 天会变负数，会先命中 no-activity
+  eq(decideSessionEnd({ lastActivityAt: BIG - D7, now: BIG }), { fire: true, reason: "idle" });
+  eq(decideSessionEnd({ lastActivityAt: BIG - D7 - 1, now: BIG }), { fire: false, reason: "too-old" });
+});
+test("收尾：自定义 maxIdleMs 生效", () => {
+  eq(decideSessionEnd({ lastActivityAt: NOW - 3600000, now: NOW, maxIdleMs: 1800000 }).reason, "too-old");
+  eq(decideSessionEnd({ lastActivityAt: NOW - 3600000, now: NOW, maxIdleMs: 7200000 }).reason, "idle");
+});
 
 // ═══ 8. decideMissed（T6 漏网扫描）═══
 const D = 86400000;

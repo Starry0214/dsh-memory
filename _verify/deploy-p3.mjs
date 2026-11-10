@@ -34,6 +34,9 @@ const MODULES = [
   "p3-readside.js",
   "p25-topics.js",
 ];
+// [4.5.12] 版本元数据也必须随部署同步：memory_onboard 自检读部署目录的 version.txt/package.json，
+//   只换 index.js 会导致「版本/模板一致」门 FAIL（index=4.5.12 而 version.txt=4.5.11）。
+const VERSION_FILES = ["version.txt", "package.json"];
 
 function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex").toUpperCase();
@@ -44,8 +47,8 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-const files = ["index.js", ...MODULES].filter((f) => fs.existsSync(path.join(DEV, f)));
-const missing = ["index.js", ...MODULES].filter((f) => !fs.existsSync(path.join(DEV, f)));
+const files = ["index.js", ...MODULES, ...VERSION_FILES].filter((f) => fs.existsSync(path.join(DEV, f)));
+const missing = ["index.js", ...MODULES, ...VERSION_FILES].filter((f) => !fs.existsSync(path.join(DEV, f)));
 
 console.log(`=== P3 部署${APPLY ? "" : "（dry-run）"} ===`);
 console.log(`源目录: ${DEV}`);

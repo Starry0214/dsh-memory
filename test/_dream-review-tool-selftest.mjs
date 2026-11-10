@@ -62,7 +62,9 @@ ok(/LAST_DREAM_WROTE_AT = Date\.now\(\);/.test(src) && /DREAM_REVIEW_ROUND \+= 1
 ok(/## 待审队列（needs_review · 由 dream 自动裁决，不推给用户）/.test(src) && /memory_review_topic\(\{ topic, verdict:/.test(src), "J 任务书含待审队列区块 + 裁决规则");
 ok(/"memory_dream_patch", "memory_split_topic", "memory_review_topic"\]/.test(src), "K dream toolFilter 含 memory_review_topic");
 ok(/由 dream 整合自动裁决（转 active 或并入重复主题），无需人工处理/.test(src), "L 面板措辞改为 dream 自动裁决");
-ok(/function listReviewQueueFromDb\(store, maxN\)/.test(src) && /a\.stateSince - b\.stateSince/.test(src), "M 待审队列最旧优先");
+// [4.5.13 I'-1] 签名已扩为可选第三参 rowsOpt（P0-4 复用 rows）；断言接受「第二参必在 + 第三参可选」，
+//   不再写死 `(store, maxN)` 两参形态（否则 4.5.13 必红 —— CRA③ I'-1）。
+ok(/function listReviewQueueFromDb\(store, maxN(?:, rowsOpt)?\)/.test(src) && /a\.stateSince - b\.stateSince/.test(src), "M 待审队列最旧优先");
 
 // ── 库层端到端（N）：真跑工具 execute ──
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-memory-reviewtool-"));

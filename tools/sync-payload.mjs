@@ -21,6 +21,7 @@
  * 版本号来源：version.txt（并交叉校验 package.json==version.txt 与 index.js 的 PLUGIN_VERSION）。
  * 打包内容（相对插件根目录，写进 zip 的路径也长这样）：
  *   index.js / package.json / version.txt / AGENTS.template.md
+ *   p3-cost.js / p3-triggers.js / p3-readside.js / p25-topics.js   （index.js 静态 import 的运行时模块，缺一即加载失败）
  *   client/**                （排除 node_modules / *.bak* / .config.json）
  *   memtopic/src/*.mjs       （全部运行时模块，含 migrate.mjs）
  *
@@ -102,7 +103,10 @@ function walk(root, relDir, out) {
 
 function collect() {
   const files = [];
-  for (const rel of ['index.js', 'package.json', 'version.txt', 'AGENTS.template.md', 'tools/session-search.mjs']) {
+  // [4.5.10 MF4] P3 模块必须随 payload 分发：index.js 静态 import 它们，缺文件 = 插件加载失败
+  //   （本机走 _verify/deploy-p3.mjs 复制模块所以长期未暴露；从 payload/install.ps1 全新安装会挂）。
+  for (const rel of ['index.js', 'package.json', 'version.txt', 'AGENTS.template.md', 'tools/session-search.mjs',
+    'p3-cost.js', 'p3-triggers.js', 'p3-readside.js', 'p25-topics.js']) {
     const abs = path.join(ROOT, rel);
     if (!fs.existsSync(abs)) fail(`missing required input: ${rel}`);
     files.push(rel);

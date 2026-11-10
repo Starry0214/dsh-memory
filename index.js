@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.9";
+const PLUGIN_VERSION = "4.5.13";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -2830,6 +2830,7 @@ function isRenameProtectedTopicName(name) {
     if (typeof p25Topics.isSessionTopicName === "function" && p25Topics.isSessionTopicName(n)) return true;   // <wsKey>/<sid8>
     if (n.indexOf("会话检查点") === 0) return true;            // 会话检查点·* 线 / 会话检查点（已归档…）
     if (n === (p25Topics.D8_DOMAIN_NAME || "日记忆（按天流水）")) return true;
+    if (/^\d{4}-\d{2}-\d{2}(?:\s*[·・].*)?$/.test(n)) return true;   // [4.5.13 I'-7] D8 日期主题（按天流水）
     if (INDEX_TOPIC_NAME_RE.test(n)) return true;              // 精确字面量索引 / 记忆索引
   } catch (e) { return false; }
   return false;
@@ -4000,6 +4001,13 @@ export { renderOverLimitHint };
 function listOverLimitTopicsFromDb(store, opts) {
   const o = opts || {};
   const limit = Number.isFinite(Number(o.limit)) ? Number(o.limit) : PROJECT_CHAR_HARD;
+  // [4.5.13 P0-2][M'-4] excludeNotes：排除会话笔记主题（默认 false 保持旧行为）。
+  //   为什么：笔记正文 append-only，只能由插件收敛流程改写（memory_dream_patch/split 对笔记都被
+  //   NOTE_TOPIC_DREAM_FORBIDDEN 拒）⇒ 把笔记列成"超限主题"是给 dream 出**不可执行建议**，
+  //   且会让空轮判定 / overLimitStuck 记账继续把"修不了的笔记"当"有活"（死胡同）。
+  //   调用方：任务书渲染（buildDreamPromptLibrary）、健康体检/overLimitStuck（buildOverLimitHealthLibrary）
+  //   一律传 true —— **源头一处决定**，渲染/空轮/记账三处共用同一份 overTopics。
+  const excludeNotes = o.excludeNotes === true;
   const out = [];
   if (!store || typeof store.topics !== "function" || typeof store.readTopic !== "function") return out;
   let topics = [];
@@ -4012,6 +4020,7 @@ function listOverLimitTopicsFromDb(store, opts) {
   try { lv = topicDbLevelMap(store, topics); } catch (e) { lv = null; }
   for (const t of topics) {
     if (!t || String(t.state || "") === "archived") continue;
+    if (excludeNotes && isNoteTopicName(t.name)) continue;   // [P0-2] 笔记只能插件收敛，dream 修不了
     let rows = [];
     try { rows = (store.readTopic(t.id).sentences || []); } catch (e) { continue; }
     const chars = rows.reduce((n, x) => n + String((x && x.text) || "").length, 0);
@@ -4028,11 +4037,12 @@ function listOverLimitTopicsFromDb(store, opts) {
 // [dream 待审裁决][2026-11-04] 待审队列（needs_review）取最旧 N 条 + 摘录，供 dream 任务书。
 // 口径与面板 `reviewQueue`（index.js:9733 附近）一致：按 stateSince 升序（最旧优先），同刻按 id 升序。
 // 只读 store.topics() + readTopic()，不读任何 md；摘录截 140 字 × 2 条（防大主题把任务书撑爆）。
-function listReviewQueueFromDb(store, maxN) {
+function listReviewQueueFromDb(store, maxN, rowsOpt) {
   const empty = { list: [], total: 0 };
   if (!store || typeof store.topics !== "function" || typeof store.readTopic !== "function") return empty;
   let topics = [];
-  try { topics = store.topics() || []; } catch (e) { return empty; }
+  // [4.5.13 P0-4] rows 可选复用（buildDreamPromptLibrary 已取整库行 ⇒ 本轮 store.topics() 只调 1 次）
+  try { topics = Array.isArray(rowsOpt) ? rowsOpt : (store.topics() || []); } catch (e) { return empty; }
   const n = Math.max(1, Number(maxN) || 6);
   const q = topics
     .filter((t) => String((t && t.state) || "") === "needs_review")
@@ -4606,14 +4616,390 @@ export {
   NOTE_COMPACT_SENTINEL as __NOTE_COMPACT_SENTINEL,
   NOTE_COMPACT_TTL_MS as __NOTE_COMPACT_TTL_MS,
 };
+// ═══════════════════════════════════════════════════════════════════════════
+// [4.5.13 Part A1][CRA② M'-1/M'-5/M'-6] dream 预筛：note → 关联主题（**纯内存打分**）
+//   依据：docs/方案-4.5.12-dream预筛与记忆面板v2.md §7.2（A 案预算）+ §7.7（token/df）
+//        + docs/audit/dream-prescreen-panel_v2_AUDIT_2026-11-10.md M'-1~M'-6。
+//   硬纪律（逐条对应审计失效路径）：
+//    ① **不调** topicDbSearchTopics / searchSentencesByTokens：
+//       · topicDbSearchTopics 内部无条件 markTopicHits ⇒ 写 last_hit_at ⇒ 抑制生命周期归档（F-1，不可逆）；
+//       · searchSentencesByTokens 中文不切词 + >1000 token 抛 `Expression tree is too large`（F-3）。
+//    ② token 词典 = 主题名 + effectiveTriggers（rows 已带，零额外读库）；note 端 2–4 字滑窗/英文 token
+//       **必须命中词典**才计入（M'-6：杜绝 33%–87% 全库命中）；df 权重 ×log(1+N/df)；
+//       token ≤64 且**按权重取**（禁止前缀截断）。
+//    ③ 打分 = Σ权重 / (1+log(1+chars))（长度归一，防大主题霸榜）；第二层仅 top10 候选 readTopic 正文复核
+//       （无正文命中 ⇒ 降权 ×0.5）。
+//    ④ 摘录：单句先截断 ≤200、最多 2 句、累计 ≤400（M-2：真库单句 max 1,881，旧「累计 600 就停」必空）。
+//    ⑤ 每 note ≤3 关联、摘要 ≤80、命中 token ≤3；无摘录 ⇒ fallback "no-snippet"；无命中 ⇒ fallback "no-hit"。
+//   观测：monitorEvent("dream","prescreen notes=N related=M fallback=K chars=C ms=T dropped=D")（S'-4 加 dropped）。
+// ═══════════════════════════════════════════════════════════════════════════
+const DREAM_PRESCREEN_MAX_NOTES = 5;        // §7.2 A 案：note ≤5（6 个会 4,650 > 4,600）
+const DREAM_PRESCREEN_MAX_LINKS = 3;        // 每 note 最多 3 个关联主题
+const DREAM_PRESCREEN_BLOCK_CAP = 4600;     // 预筛块上限（§7.2：183 + 5×868 = 4,523 ⇒ 4,600）
+const DREAM_PRESCREEN_TOTAL_CAP = 10500;    // 任务书总上限（§7.2：5,844 + 4,600 = 10,444 ⇒ 10,500）
+const DREAM_PRESCREEN_TOKEN_CAP = 64;       // token 硬上限（按权重取，禁止前缀截断）
+const DREAM_PRESCREEN_TOKEN_USE = 48;       // [I'-3] 实际使用数（≤64；收紧降噪）
+const DREAM_PRESCREEN_MAX_HIT_TOPICS = 100; // [I'-3] 单 note 命中候选主题数硬上限（M'-6 质量门）
+const DREAM_PRESCREEN_MIN_VIABLE = 1100;    // [I'-4] 预算耗尽时的最小可行块（块头 154 + 最坏 note 868）
+const DREAM_PRESCREEN_TOP2 = 10;            // 第二层复核候选数
+const DREAM_PRESCREEN_SNIPPET_SENT = 200;   // 单句截断
+const DREAM_PRESCREEN_SNIPPET_TOTAL = 400;  // 摘录累计
+const DREAM_PRESCREEN_SUMMARY = 80;         // 关联摘要
+const DREAM_CKPT_MAX_ITEMS = 4;             // A2：§7.13 建议 4 项
+const DREAM_CKPT_BLOCK_CAP = 1200;          // A2 总预算（4×(60+2×90+20) ≈ 1,040）
+const DREAM_CKPT_SEC_CHARS = 90;            // A2 每节 ≤90 字
+
+const DREAM_PRESCREEN_HEADER = "## Note → 关联主题（插件预筛 · 线索不是结论）\n"
+  + "每条未提炼笔记由插件在内存中打分出最多 3 个关联主题（含摘要与命中 token）。\n"
+  + "先看摘要判断归属，只读你真正要写的主题正文；不要全读。\n"
+  + "⚠ 不得仅凭预筛关联做 merge（merge 前必须 memory_read 双方正文）。\n";
+
+/** 中文 2–4 字滑窗 + 英文/数字 token（长度 ≥2）。只生成候选池，是否计入由词典决定（M'-6）。 */
+function dreamPrescreenTokens(text) {
+  const out = new Set();
+  const s = String(text == null ? "" : text);
+  if (!s) return out;
+  for (const m of s.matchAll(/[A-Za-z][A-Za-z0-9_.\-]{1,40}/g)) out.add(m[0].toLowerCase());
+  const runs = s.match(/[\u4e00-\u9fff]+/g) || [];
+  for (const run of runs) {
+    const n = run.length;
+    for (let len = 2; len <= 4; len++) {
+      for (let i = 0; i + len <= n; i++) out.add(run.slice(i, i + len));
+    }
+  }
+  return out;
+}
+
+/** 关联主题候选排除判据：笔记 / 真检查点 / D8 只读族（含 `会话检查点·*` 线、日期主题）/ 自动索引类 / 归档。
+ *  [4.5.13 I'-7][S'-1] D8 只读族不得作为关联出现（否则等于把「只读机械记忆」推荐给 dream 当归属）。 */
+function dreamPrescreenExcluded(t) {
+  if (!t) return true;
+  if (String(t.state || "") === "archived") return true;
+  const nm = String(t.name || "");
+  if (isNoteTopicName(nm)) return true;
+  if (INDEX_TOPIC_NAME_RE.test(nm)) return true;
+  if (isDailyMemoryTopicName(nm)) return true;   // [I'-7] 日记忆域/线/日期主题（含「会话检查点·<wsKey>」）
+  try {
+    // 真检查点（笔记名也以 /sid8 结尾，已在上面先排除 —— CRA M-4 教训）
+    if (typeof p25Topics.isSessionTopicName === "function" && p25Topics.isSessionTopicName(nm)) return true;
+  } catch (e) { /* 判据异常按不排除 */ }
+  return false;
+}
+
+/** [I'-3] 同工作区线加权判据：候选主题名或其父线名含 note 所属 wsKey（或其 ≥2 字段）⇒ 视为同族。 */
+function dreamWorkspaceRelated(cand, wsKey, parentNameById) {
+  try {
+    const nz = (x) => String(x == null ? "" : x).replace(/[\s_\-·・,，.。:：/\\()（）\[\]【】]/g, "").toLowerCase();
+    const w = nz(wsKey);
+    if (!w) return false;
+    const pn = nz(parentNameById && parentNameById.get ? parentNameById.get(cand.id) : "");
+    const own = nz(cand.name);
+    const segs = String(wsKey == null ? "" : wsKey).split(/[-_/、]+/).map(nz).filter((x) => x && x.length >= 2);
+    const test = (hay) => {
+      if (!hay) return false;
+      if (hay.indexOf(w) >= 0 || w.indexOf(hay) >= 0) return true;
+      return segs.some((s) => hay.indexOf(s) >= 0);
+    };
+    return test(own) || test(pn);
+  } catch (e) { return false; }
+}
+
+/** 未提炼句摘录：单句先截断 ≤200、最多 2 句、累计 ≤400（M-2）。
+ *  [I'-6] 分隔符（join 的 1 个空格）也计入累计 ⇒ 两句各 200 时输出 400（原实现 401）。 */
+function dreamPrescreenSnippet(sentences) {
+  const ss = Array.isArray(sentences) ? sentences : [];
+  const parts = [];
+  let total = 0;
+  for (const s of ss) {
+    if (parts.length >= 2) break;
+    const tx = String((s && typeof s === "object") ? (s.text || "") : (s || "")).trim();
+    if (!tx) continue;
+    const sep = parts.length ? 1 : 0;   // join(" ") 的分隔符
+    const room = DREAM_PRESCREEN_SNIPPET_TOTAL - total - sep;
+    if (room <= 0) break;
+    const cut = tx.slice(0, DREAM_PRESCREEN_SNIPPET_SENT);
+    const piece = cut.length > room ? cut.slice(0, room) : cut;
+    parts.push(piece);
+    total += sep + piece.length;
+  }
+  return parts.join(" ");
+}
+
+/** 第一层词典打分 + 第二层 top10 正文复核 → 每 note ≤3 关联（纯内存 + ≤10 次 readTopic）。
+ *  [I'-3] M'-6 质量收敛：①过泛 token（df > max(8, 15%N)）**直接丢弃**（防「大主题霸榜 + 命中数爆炸」）；
+ *  ②token 取 ≤48（按权重）；③同工作区线加权 ×2（防跨工作区误召回）；④候选命中数硬上限 100（按原始分取）。 */
+function dreamPrescreenRankLinks(noteText, ctx) {
+  const o = ctx || {};
+  const candById = o.candById || new Map();
+  const tokenTopics = o.tokenTopics || new Map();
+  const N = Math.max(1, Number(o.N) || 1);
+  const store = o.store || null;
+  const wsKey = String(o.wsKey == null ? "" : o.wsKey);
+  const parentNameById = o.parentNameById || new Map();
+  const toks = dreamPrescreenTokens(noteText);
+  const empty = { links: [], hitTopics: 0, hitTopicsRaw: 0 };
+  if (!toks.size) return empty;
+  // token 权重 = log(1 + N/df)；只保留命中词典且**不过泛**的 token（M'-6 + I'-3）
+  const dfCap = Math.max(8, Math.ceil(N * 0.15));
+  const hit = [];
+  for (const tk of toks) {
+    const ids = tokenTopics.get(tk);
+    if (!ids || !ids.length) continue;
+    const df = new Set(ids).size;
+    if (df > dfCap) continue;   // 过泛 token 丢弃（否则单 note 命中 100+ 主题）
+    hit.push({ tk: tk, ids: ids, w: Math.log(1 + N / Math.max(1, df)) });
+  }
+  if (!hit.length) return empty;
+  // token ≤48（≤64 硬上限；**按权重取**，禁止前缀截断）
+  hit.sort((a, b) => (b.w - a.w) || (a.tk < b.tk ? -1 : 1));
+  const useToks = hit.slice(0, DREAM_PRESCREEN_TOKEN_USE);
+  // 第一层：只在候选主题上累加（词典含全部非归档主题，候选过滤在此生效）
+  const score = new Map();
+  for (const h of useToks) {
+    for (const id of new Set(h.ids)) {
+      if (!candById.has(id)) continue;
+      let rec = score.get(id);
+      if (!rec) { rec = { s: 0, toks: new Set() }; score.set(id, rec); }
+      rec.s += h.w; rec.toks.add(h.tk);
+    }
+  }
+  if (!score.size) return empty;
+  const rawHit = score.size;
+  // [I'-3] 候选命中数硬上限 100（按原始累加分取 top100；防单 note 关联候选爆炸）
+  let entries = Array.from(score.entries());
+  if (entries.length > DREAM_PRESCREEN_MAX_HIT_TOPICS) {
+    entries.sort((a, b) => (b[1].s - a[1].s) || String(a[0]).localeCompare(String(b[0])));
+    entries = entries.slice(0, DREAM_PRESCREEN_MAX_HIT_TOPICS);
+  }
+  const ranked = [];
+  for (const [id, rec] of entries) {
+    const c = candById.get(id);
+    let sc = rec.s / (1 + Math.log(1 + Math.max(1, Number(c.chars) || 0)));
+    // [I'-3] 同工作区线加权（×2）：让「本工作区项目线」压过同词面的外区主题
+    if (wsKey && dreamWorkspaceRelated(c, wsKey, parentNameById)) sc *= 2;
+    ranked.push({ id: id, name: c.name, sentences: c.sentences, state: c.state, score: sc, toks: Array.from(rec.toks), summary: "" });
+  }
+  ranked.sort((a, b) => (b.score - a.score) || String(a.id).localeCompare(String(b.id)));
+  // 第二层：仅 top10 候选 readTopic 正文复核；无正文命中 ⇒ 降权 ×0.5（M'-5/M'-6）
+  const top = ranked.slice(0, DREAM_PRESCREEN_TOP2);
+  for (const r of top) {
+    let sents = [];
+    try { sents = ((store && store.readTopic(r.id)) || {}).sentences || []; } catch (e) { sents = []; }
+    const body = sents.map((s) => String((s && s.text) || "")).join("\n");
+    if (!body) { r.score *= 0.5; continue; }
+    if (!r.toks.some((tk) => body.includes(tk))) r.score *= 0.5;
+    const first = String((sents[0] && sents[0].text) || "").replace(/\s+/g, " ").trim();
+    r.summary = first.slice(0, DREAM_PRESCREEN_SUMMARY);
+  }
+  top.sort((a, b) => (b.score - a.score) || String(a.id).localeCompare(String(b.id)));
+  const out = [];
+  for (const r of top) {
+    if (out.length >= DREAM_PRESCREEN_MAX_LINKS) break;
+    if (!(r.score > 0)) continue;
+    out.push({ id: r.id, name: r.name, sentences: r.sentences, state: r.state, summary: r.summary, tokens: r.toks.slice(0, 3), score: Math.round(r.score * 1000) / 1000 });
+  }
+  return { links: out, hitTopics: Math.min(rawHit, DREAM_PRESCREEN_MAX_HIT_TOPICS), hitTopicsRaw: rawHit };
+}
+
+/** A1 主函数：未提炼笔记 → 关联主题块（返回 {blockText, notes, related, fallback, dropped, ms, items}）。 */
+function dreamPrescreenNoteLinks(rows, noteRows, opts) {
+  const o = opts || {};
+  const store = o.store || (TOPICDB && TOPICDB.store) || null;
+  const t0 = Date.now();
+  const res = { blockText: "", notes: 0, related: 0, fallback: 0, dropped: 0, ms: 0, items: [], noHit: 0, noSnippet: 0 };
+  const allRows = Array.isArray(rows) ? rows : [];
+  const notesIn = Array.isArray(noteRows) ? noteRows : [];
+  const maxNotes = Math.max(0, Number.isFinite(Number(o.maxNotes)) ? Number(o.maxNotes) : DREAM_PRESCREEN_MAX_NOTES);
+  const cap = Number.isFinite(Number(o.blockCap)) ? Math.max(0, Number(o.blockCap)) : DREAM_PRESCREEN_BLOCK_CAP;
+  if (!store || typeof store.readTopic !== "function" || !allRows.length || !notesIn.length || maxNotes === 0 || cap <= 0) { res.ms = Date.now() - t0; return res; }
+  // ── 1. 词典（主题名 + effectiveTriggers）+ df + 候选（排除笔记/检查点/D8只读族/索引/归档）──
+  let N = 0;
+  const candById = new Map();
+  const tokenTopics = new Map();
+  const parentNameById = new Map();   // [I'-3] 候选 → 父线名（同工作区线加权用）
+  const rowById = new Map();
+  for (const t of allRows) {
+    if (!t || String(t.state || "") === "archived") continue;
+    N += 1;
+    rowById.set(String(t.id), t);
+  }
+  for (const t of allRows) {
+    if (!t || String(t.state || "") === "archived") continue;
+    const nm = String(t.name || "");
+    const toks = dreamPrescreenTokens(nm);
+    const trigs = Array.isArray(t.effectiveTriggers) ? t.effectiveTriggers : [];
+    for (const x of trigs) for (const tk of dreamPrescreenTokens(x)) toks.add(tk);
+    for (const tk of toks) {
+      let arr = tokenTopics.get(tk);
+      if (!arr) { arr = []; tokenTopics.set(tk, arr); }
+      arr.push(String(t.id));
+    }
+    if (!dreamPrescreenExcluded(t)) {
+      candById.set(String(t.id), { id: String(t.id), name: nm, chars: Number(t.chars) || 0, sentences: Number(t.sentences) || 0, state: String(t.state || "") });
+    }
+  }
+  // 父线名表（只对候选取，减少 map 体积）
+  for (const id of candById.keys()) {
+    const t = rowById.get(id);
+    const p = t && t.parentId ? rowById.get(String(t.parentId)) : null;
+    parentNameById.set(id, p ? String(p.name || "") : "");
+  }
+  // ── 2. 未提炼笔记按 updatedAt 降序（与笔记块同序 S'-3）取 ≤maxNotes ──
+  const notesAll = notesIn.filter((t) => t && isNoteTopicName(t.name) && String(t.state || "") !== "archived");
+  const noteList = notesAll
+    .slice()
+    .sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || String(a.id).localeCompare(String(b.id)))
+    .slice(0, maxNotes);
+  if (!noteList.length) { res.ms = Date.now() - t0; return res; }
+  let cur = DREAM_PRESCREEN_HEADER;
+  let rendered = 0;
+  for (const nt of noteList) {
+    let sents = [];
+    try { sents = ((store.readTopic(nt.id)) || {}).sentences || []; } catch (e) { sents = []; }
+    // 未提炼口径 A：最后一条指针之后的句；无指针 ⇒ 全部
+    let lastPtr = -1;
+    for (let i = 0; i < sents.length; i++) { const tx = (sents[i] && typeof sents[i] === "object") ? sents[i].text : sents[i]; if (isNotePointerText(tx)) lastPtr = i; }
+    const unref = sents.slice(lastPtr + 1);
+    const snippet = dreamPrescreenSnippet(unref);
+    const noteText = unref.map((s) => String((s && typeof s === "object") ? (s.text || "") : (s || ""))).join("\n");
+    // [I'-3] note 所属工作区（`笔记·<wsKey>/<sid8>` ⇒ wsKey）用于同工作区线加权
+    const _noteName = String(nt.name || "");
+    const wsKey = _noteName.replace(/^笔记·/, "").split("/")[0];
+    const rankRes = dreamPrescreenRankLinks(noteText, { candById: candById, tokenTopics: tokenTopics, N: N, store: store, wsKey: wsKey, parentNameById: parentNameById });
+    const links = rankRes.links;
+    const item = { noteId: String(nt.id), noteName: _noteName, wsKey: wsKey, unrefined: unref.length, excerptLen: snippet.length, fallback: "", hitTopics: rankRes.hitTopics, hitTopicsRaw: rankRes.hitTopicsRaw, links: links.map((L) => ({ id: L.id, name: L.name, tokens: L.tokens, score: L.score })) };
+    let nb = "### N" + (rendered + 1) + ". " + String(nt.name) + "（未提炼 " + unref.length + " 句）\n";
+    if (snippet) nb += "摘录：" + snippet + "\n";
+    else { nb += "摘录：（无可摘录句）\n"; item.fallback = "no-snippet"; res.noSnippet += 1; res.fallback += 1; }
+    if (links.length) {
+      nb += "关联：";
+      for (let i = 0; i < links.length; i++) {
+        const L = links[i];
+        if (i > 0) nb += "\n       ";
+        nb += L.id + "「" + L.name + "」" + L.sentences + " 句 · " + L.summary + (L.tokens.length ? "（命中 " + L.tokens.join("/") + "）" : "");
+      }
+      nb += "\n";
+    } else {
+      nb += "关联：（无 token 命中）\n";
+      item.fallback = "no-hit"; res.noHit += 1; res.fallback += 1;
+    }
+    nb += "兜底：本条无强关联 ⇒ 可在下方候选主题里找归属。\n";
+    // 预算：超出即按 note 级截断（S'-4 记 dropped）
+    if (cur.length + nb.length + 1 > cap) break;
+    cur += "\n" + nb;
+    rendered += 1;
+    res.related += links.length;
+    res.items.push(item);
+  }
+  res.notes = rendered;
+  // dropped = 未被渲染的未提炼笔记数（maxNotes 上限 + 块预算截断，S'-4 观测口径）
+  res.dropped = Math.max(0, notesAll.length - rendered);
+  res.blockText = rendered > 0 ? cur : "";
+  res.ms = Date.now() - t0;
+  return res;
+}
+
+/** A2 检查点首行：优先按 `压缩 <cid> · sid <sid8> · cwd <cwd>` 抽（正文首行比方案多一个「## 检查点（…，」前缀）。 */
+function dreamCheckpointHeaderLine(body) {
+  const s = String(body || "");
+  const m = /压缩\s*([0-9a-fA-F]{6,})\s*·\s*sid\s*([0-9a-fA-F]{8})\s*·\s*cwd\s*([^\n）)]+)/.exec(s);
+  if (m) return ("压缩 " + m[1] + " · sid " + m[2] + " · cwd " + String(m[3]).trim()).slice(0, 120);
+  const first = s.split("\n").map((x) => x.trim()).filter((x) => x)[0] || "";
+  return first.slice(0, 120);
+}
+
+/** A2 检查点分节摘录（缺节返回 ""，由调用方降级文案）。 */
+function dreamCheckpointSection(body, title) {
+  const s = String(body || "");
+  if (!s) return "";
+  let re = null;
+  try { re = new RegExp("(?:^|\\n)#{2,3}\\s*" + String(title) + "\\s*\\n([\\s\\S]*?)(?=\\n#{2,3}\\s|$)"); } catch (e) { return ""; }
+  const m = re.exec(s);
+  if (!m) return "";
+  const txt = String(m[1] || "").replace(/\s+/g, " ").trim();
+  return txt ? txt.slice(0, DREAM_CKPT_SEC_CHARS) : "";
+}
+
+/** A2 主函数：真检查点证据块（只读 · ≤4 项 · 每节 ≤90 字 · 总 ≤1,200 字）。 */
+function dreamCheckpointEvidence(rows, opts) {
+  const o = opts || {};
+  const store = o.store || (TOPICDB && TOPICDB.store) || null;
+  const t0 = Date.now();
+  const res = { blockText: "", items: 0, chars: 0, ms: 0, ids: [] };
+  const allRows = Array.isArray(rows) ? rows : [];
+  if (!store || typeof store.readTopic !== "function" || !allRows.length) { res.ms = Date.now() - t0; return res; }
+  const cap = Number.isFinite(Number(o.blockCap)) ? Math.max(0, Number(o.blockCap)) : DREAM_CKPT_BLOCK_CAP;
+  const maxN = Number.isFinite(Number(o.maxItems)) ? Math.max(0, Number(o.maxItems)) : DREAM_CKPT_MAX_ITEMS;
+  if (cap <= 0 || maxN === 0) { res.ms = Date.now() - t0; return res; }
+  // [S'-2] 取数口径与写入护栏**同口径**：名字形态 + 父线双条件（= p25SessionTopicWriteGuard 的判据），
+  //   避免「展示为只读、实际可写」的口径错位（CRA③ N-4）；D8 日期主题/线/域名字形态不匹配 ⇒ 天然排除。
+  const byId = new Map(allRows.map((t) => [String(t && t.id), t]));
+  const nzCp = (x) => String(x == null ? "" : x).normalize("NFKC").toLowerCase().replace(/[\s_\-·・,，.。:：/\\()（）\[\]【】]/g, "");
+  const cps = allRows.filter((t) => {
+    if (!t || String(t.state || "") === "archived") return false;
+    const nm = String(t.name || "");
+    if (isNoteTopicName(nm)) return false;   // 笔记名同样以 /sid8 结尾 ⇒ 必须先排（CRA M-4）
+    if (isDailyMemoryTopicName(nm)) return false;
+    let parsed = null;
+    try { parsed = (typeof p25Topics.parseSessionTopicName === "function") ? p25Topics.parseSessionTopicName(nm) : null; } catch (e) { parsed = null; }
+    if (!parsed) return false;
+    const parent = t.parentId ? byId.get(String(t.parentId)) : null;
+    if (!parent) return false;   // 无父线 ⇒ 不是真检查点（与护栏一致）
+    let wantLine = "";
+    try { wantLine = p25Topics.lineName(parsed.wsKey); } catch (e) { wantLine = ""; }
+    return !!wantLine && nzCp(parent.name) === nzCp(wantLine);
+  }).sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || String(a.id).localeCompare(String(b.id))).slice(0, maxN);
+  if (!cps.length) { res.ms = Date.now() - t0; return res; }
+  let cur = "## 检查点证据（只读 · 插件预筛）\n"
+    + "最近 " + cps.length + " 个会话检查点（按最近更新排序）。**只读证据：禁止改写检查点主题**（每会话恒 1 句，写入由插件负责）。\n"
+    + "用途：补全没有笔记的会话 + 提示未完成待办是否该沉淀；**不得仅凭预筛关联做 merge**。\n";
+  let n = 0;
+  for (const t of cps) {
+    let sents = [];
+    try { sents = ((store.readTopic(t.id)) || {}).sentences || []; } catch (e) { sents = []; }
+    const body = sents.map((s) => String((s && s.text) || "")).join("\n");
+    if (!body.trim()) continue;
+    const secK = dreamCheckpointSection(body, "关键结论");
+    const secE = dreamCheckpointSection(body, "错误与修复");
+    const item = "### C" + (n + 1) + ". " + String(t.name) + "\n"
+      + dreamCheckpointHeaderLine(body) + "\n"
+      + "关键结论：" + (secK || "（本检查点无此节）") + "\n"
+      + "错误与修复：" + (secE || "（本检查点无此节）") + "\n";
+    if (cur.length + item.length + 1 > cap) break;
+    cur += "\n" + item;
+    n += 1;
+    res.ids.push(String(t.id));
+  }
+  if (n === 0) { res.ms = Date.now() - t0; return res; }
+  res.blockText = cur; res.items = n; res.chars = cur.length; res.ms = Date.now() - t0;
+  return res;
+}
+
+// [4.5.13 Part A][门用] 预筛/检查点证据纯函数导出（门直接断言逻辑，不必绕 buildPrompt 抠文本）
+export {
+  dreamPrescreenNoteLinks as __dreamPrescreenNoteLinks,
+  dreamCheckpointEvidence as __dreamCheckpointEvidence,
+  dreamPrescreenTokens as __dreamPrescreenTokens,
+};
 // [task-54] 库模式任务书：只列主题/人工稳定层；不读任何导出视图 md（D7 的确定性来源）
 function buildDreamPromptLibrary(extras) {
   const p = extras || {};
   const store = TOPICDB.store;
   // [D10 性能] 整库 rows 只取一次，候选池 / 笔记提炼块 / 未提炼统计 / 超限清单共用（原 4 次 ×684ms）
+  // [4.5.13 P0-4][M'-2] 调用方（spawnIntegrate 空轮短路）已取 rows 时直接复用 ⇒ store.topics() 每轮只调 1 次。
   let _allRows = [];
-  try { _allRows = (store && typeof store.topics === "function") ? (store.topics() || []) : []; } catch (eR) { _allRows = []; }
-  const overTopics = TOPICDB.enabled ? listOverLimitTopicsFromDb(store, { limit: PROJECT_CHAR_HARD, rows: _allRows }) : [];
+  if (Array.isArray(p.rows)) _allRows = p.rows;
+  else {
+    try { DREAM_TEST_HOOKS.libTopicsSelfFetch = (Number(DREAM_TEST_HOOKS.libTopicsSelfFetch) || 0) + 1; } catch (eC1) { /* 计数失败忽略 */ }
+    try { _allRows = (store && typeof store.topics === "function") ? (store.topics() || []) : []; } catch (eR) { _allRows = []; }
+  }
+  // [P0-0][CRA② 2026-11-10] 作用域修复：原声明在下方候选 try 块内（4635），但笔记块在 try 外使用（4674）
+  //   ⇒ 每次 buildDreamPromptLibrary() 抛 ReferenceError 被 catch 静默吞掉，导致「会话笔记提炼」块
+  //   自 v4.5.2 起从未进入运行中任务书（哨兵收敛指令实际从未下发）。提升到函数作用域。
+  const _noteDistilled = (t) => noteTopicDistilled(store, t && t.id);
+  // [4.5.13 P0-2][M'-4] overTopics **源头一处计算**：排除笔记（dream 修不了）⇒ 渲染 / 空轮判定 /
+  //   overLimitStuck 记账三处共用同一份（空轮判定用返回值 overTopics；记账在 buildOverLimitHealthLibrary 同样传 excludeNotes）。
+  const overTopics = TOPICDB.enabled ? listOverLimitTopicsFromDb(store, { limit: PROJECT_CHAR_HARD, rows: _allRows, excludeNotes: true }) : [];
   let candTopics = [];
   try {
     // [CRA A+][2026-11-03] 候选主题改为「按最近变更排序」并排除自动索引类主题。
@@ -4632,7 +5018,7 @@ function buildDreamPromptLibrary(extras) {
     //   其他活跃主题只作次要候选（防止笔记被 20 个热点主题挤掉）。命名 `笔记·<wsKey>/<sid8>`。
     // [4.5.2 P0 · CRA v4 §14.1-1] 笔记主题「已提炼完」的**唯一判据**：最后一句是指针行（双格式，模块级共享判据）。
     //   只看最后一句，不看"有没有 marker" —— 后者会把"部分提炼"的主题误判成已完成。
-    const _noteDistilled = (t) => noteTopicDistilled(store, t && t.id);
+    //   [P0-0 修复] 判据函数 `_noteDistilled` 已提升到函数作用域（见上），此处不再重复声明。
     const _notePool = _live.filter((t) => isNoteTopicName(t.name) && !_noteDistilled(t));
     // [审计 F7 修复 2026-11-04] 排除 P2.5 会话检查点主题（`<wsKey>/<sid8>`）：设计 §5 要求「dream 不再处理
     //   checkpoint」，而原候选池只排除了索引主题和笔记 ⇒ 检查点主题仍可能被 dream 当普通主题改写，
@@ -4643,7 +5029,10 @@ function buildDreamPromptLibrary(extras) {
     };
     const _pool = _live.filter((t) => !INDEX_TOPIC_NAME_RE.test(String(t.name || ""))
       && !/^笔记·/.test(String(t.name || ""))
-      && !_isCpTopic(t));
+      && !_isCpTopic(t)
+      // [4.5.13 I'-7] D8 只读族（日记忆域 / 会话检查点线 / 日期主题）不进 dream 候选：
+      //   它们是插件机械维护的按天流水，dream 不能改写（写入侧有 DAILY_MEMORY_READONLY 护栏）。
+      && !isDailyMemoryTopicName(String(t.name || "")));
     const _sorted = (arr) => arr.slice().sort((a, b) => (_ts(b) - _ts(a)) || String(a.id).localeCompare(String(b.id)));
     // 笔记优先：最多 10 个笔记主题；其余名额用活跃主题补足到总数 20（无笔记时就是原来的 20 个，零回归）
     const _notePick = _sorted(_notePool).slice(0, 10);
@@ -4662,7 +5051,7 @@ function buildDreamPromptLibrary(extras) {
   const lessons = String(p.lessonFeedText || "").replace(/(tools|projects|knowledge|sessions)\//g, "主题库/");
   // [dream 待审裁决][2026-11-04] 待审队列：needs_review 由 dream 自动裁决（starry：不该推给用户，用户也不知道怎么处理）
   let reviewQ = { list: [], total: 0 };
-  try { if (TOPICDB.enabled) reviewQ = listReviewQueueFromDb(store, 6); } catch (eRQ) { reviewQ = { list: [], total: 0 }; }
+  try { if (TOPICDB.enabled) reviewQ = listReviewQueueFromDb(store, 6, _allRows); } catch (eRQ) { reviewQ = { list: [], total: 0 }; }
   const reviewBlock = "## 待审队列（needs_review · 由 dream 自动裁决，不推给用户）\n"
     + "这些主题是**导入期**按名字/trigger 判出的「疑似近重复」，不是容量问题；队列积压没有人工兜底，只能靠你裁决。\n"
     + renderReviewQueueForPrompt(reviewQ);
@@ -4670,9 +5059,12 @@ function buildDreamPromptLibrary(extras) {
   //   为什么单列而不是塞进候选主题：候选只给 id+名字，模型不知道「这主题是笔记、要提炼」；且笔记优先级最高，
   //   不能被 20 个热点主题挤掉。提炼规则照搬 checkpoint-writer.txt:41-58 的七类映射。
   let noteBlock = "";
+  // [4.5.13 A1] 未提炼笔记行（非归档 + 未提炼）提升到函数作用域：笔记块与预筛块共用同一份，
+  //   保证两处**同一集合、同一排序**（S'-3：预筛 note 顺序与笔记块统一按 updatedAt 降序）。
+  let _noteRowsAll = [];
+  try { _noteRowsAll = _allRows.filter((t) => String(t.state || "") !== "archived" && isNoteTopicName(t.name) && !_noteDistilled(t)); } catch (eNR) { _noteRowsAll = []; }
   try {
-    const _noteRows = _allRows.filter((t) => String(t.state || "") !== "archived" && isNoteTopicName(t.name) && !_noteDistilled(t));
-    const _sortedNotes = _noteRows.slice().sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || String(a.id).localeCompare(String(b.id)));
+    const _sortedNotes = _noteRowsAll.slice().sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || String(a.id).localeCompare(String(b.id)));
     if (_sortedNotes.length) {
       let _nb = "## 会话笔记提炼（本轮**主职责** · 对齐 MiMo notes → MEMORY 的 reconcile）\n"
         + "共 " + _sortedNotes.length + " 个笔记主题（按最近更新排序；每个会话一个；未提炼口径 A = 最后一条指针之后的句数）：\n";
@@ -4711,8 +5103,12 @@ function buildDreamPromptLibrary(extras) {
     + (candTopics.length ? "- 候选主题（库内非归档 · 按最近变更排序 · 已排除自动索引类主题，最多 20 个）：" + candTopics.map((t) => t.id + "「" + t.name + "」").join("、") + "\n" : "- 候选主题：（库内暂无）\n")
     + "- 人工稳定层：global.md / index.md（唯一例外；可 read，写入走 memory_dream_patch 的 file=global.md/index.md）。\n"
     + "- 硬约束：只处理上述候选主题、**待审队列主题**与人工稳定层。**主题超限时按语义分片**：先 memory_read 读全文 → 判断哪些句子构成一个独立子主题 → 调 memory_split_topic({ topic, name, sentence_texts, reason })。禁止按字符数机械切；只超 <本档上限 10% 时应优先删/精简。不要手工复制句子。\n";
-  const _noteStats = noteUnrefinedStats(store, _allRows);
-  const prompt = "Run one automatic memory consolidation pass for the current DSH memory library (topic DB is the single source of truth; md files are export views).\n"
+  // [4.5.13 P0-4] 调用方已算过未提炼统计（空轮预信号）时复用，避免重复 readTopic 扫笔记
+  const _noteStats = (p.noteStats && typeof p.noteStats === "object" && Array.isArray(p.noteStats.items)) ? p.noteStats : noteUnrefinedStats(store, _allRows);
+  // [4.5.13 A1/A2] 两个新块的插入占位：先按"不含新块"拼任务书（flag 关时逐字 == 基线），
+  //   再用**剩余预算**决定块大小（双预算：块 ≤4,600 且任务书总 ≤10,500）。
+  const _PS_PH = "\u0000DSH_PRESCREEN\u0000";
+  let prompt = "Run one automatic memory consolidation pass for the current DSH memory library (topic DB is the single source of truth; md files are export views).\n"
     + "Consolidate only durable, VERIFIED information.\n"
     + "会话笔记未提炼：" + _noteStats.topics + " 个主题 / " + _noteStats.sentences + " 句（口径 A：最后一条指针之后的句数；笔记提炼是本轮主职责）\n\n" + scope + "\n"
     + "## Consolidate\n"
@@ -4737,6 +5133,7 @@ function buildDreamPromptLibrary(extras) {
     + "## Capacity / Prune\n" + cap + "\n"
     + reviewBlock + "\n"
     + (noteBlock ? noteBlock + "\n" : "")
+    + _PS_PH
     + lessons + "\n\n"
     + "## Self-Calibration\n- D: " + String(p.calibStats || "数据不足") + "\n- E: " + String(p.eCalibStats || "数据不足") + "\n"
     + "- W: " + String(p.wCalibStats || "数据不足") + "\n- Break: " + String(p.brkCalibStats || "数据不足") + "\n- Maint: " + String(p.maintStats || "数据不足") + "\n"
@@ -4747,7 +5144,52 @@ function buildDreamPromptLibrary(extras) {
     + "- 待审队列裁决走 memory_review_topic（keep=转 active / merge=并入 into 并归档源）：**必须**先 memory_read 读正文再判，不许凭名字猜。\n"
     + "- 不要读/写 projects/ knowledge/ sessions/ tools/ 目录下的 md（导出视图）；不要 glob 这些目录。\n\n"
     + "## Output — brief summary only\n- Written topics: 本次写入的 topicId/名字列表\n- Consolidated: n entries added\n- Updated / Deleted / Skipped\n- 若做了结构分片：输出一行「split <源topicId> → <新topicId>（移走 n 句，原因：…）」\n- 若裁决了待审队列：输出一行「review <topicId> keep（依据：…）」或「review <topicId> merge→<intoId>（并入 n 句，依据：…）」\n";
-  return { promptText: prompt, capacityText: cap, scopeText: scope, overChar: [], softChar: [], overSessionRel: null, candI: { sessionCands: [], otherCands: [] }, overTopics: overTopics, reviewQueue: reviewQ, libMode: true, noteRows: _allRows };
+  // ═══ [4.5.13 A1/A2] 预筛块 + 检查点证据块（flag `dreamPrescreen`，默认 true；关 ⇒ 不插任何字节）═══
+  let _psRes = { blockText: "", notes: 0, related: 0, fallback: 0, dropped: 0, ms: 0, items: [] };
+  let _ckRes = { blockText: "", items: 0, chars: 0, ms: 0, ids: [] };
+  let _budgetExhausted = false;
+  let _droppedBudget = 0;
+  try {
+    if (PLUGIN_CFG.dreamPrescreen !== false && prompt.indexOf(_PS_PH) >= 0) {
+      // 剩余预算 = 总上限 − 不含新块的任务书长度（占位符本身不计入）
+      // [I'-4][CRA③ N-3] 预算语义：**新块 + 基线 ≤10,500（基线 ≤10,500 时）**。基线（含 lessons 等既有块）
+      //   本身可能已 >10,500（实测 6,019 字 lesson ⇒ 基线 11,032），此时总上限不可达 —— 旧实现把 _cap1 压到 0
+      //   ⇒ 两块**静默消失**（N-3）。现在改为：预算不足时**至少保留 1 个 note 的预筛块**（MIN_VIABLE），
+      //   并显式标记 `budget=exhausted droppedBudget=1`（monitor 可观测），绝不静默丢。
+      const _baseLen = prompt.length - _PS_PH.length;
+      const _rawCap1 = Math.min(DREAM_PRESCREEN_BLOCK_CAP, Math.max(0, DREAM_PRESCREEN_TOTAL_CAP - _baseLen - 2));
+      let _cap1 = _rawCap1;
+      if (_rawCap1 < DREAM_PRESCREEN_MIN_VIABLE && _noteRowsAll.length > 0) {
+        _cap1 = DREAM_PRESCREEN_MIN_VIABLE;   // 至少保留块头 + 1 个 note（header 154 + 最坏 note 868）
+        _budgetExhausted = true;
+        _droppedBudget = 1;
+      }
+      _psRes = dreamPrescreenNoteLinks(_allRows, _noteRowsAll, { store: store, blockCap: _cap1 });
+      const _len1 = _baseLen + (_psRes.blockText ? _psRes.blockText.length + 1 : 0);
+      const _cap2 = _budgetExhausted ? 0 : Math.min(DREAM_CKPT_BLOCK_CAP, Math.max(0, DREAM_PRESCREEN_TOTAL_CAP - _len1 - 2));
+      _ckRes = dreamCheckpointEvidence(_allRows, { store: store, blockCap: _cap2 });
+      if (_budgetExhausted && _psRes.blockText) {
+        try { cwarn("[dsh-memory] dream 任务书预算已耗尽（基线 " + _baseLen + " 字 > 总上限 " + DREAM_PRESCREEN_TOTAL_CAP + "）：预筛块按最小可行保留（" + _psRes.notes + " note），检查点证据块本轮丢弃（droppedBudget=1）"); } catch (eW2) {}
+      }
+      const _insert = [_psRes.blockText, _ckRes.blockText].filter((x) => x).join("\n\n");
+      prompt = prompt.replace(_PS_PH, _insert ? _insert + "\n" : "");
+      // [S-5/S'-4/I'-4] 观测：notes/related/fallback/chars/ms/dropped + 预算标记（budget/droppedBudget）
+      try {
+        monitorEvent("dream", "prescreen notes=" + _psRes.notes + " related=" + _psRes.related
+          + " fallback=" + _psRes.fallback + " chars=" + (_psRes.blockText || "").length
+          + " ms=" + _psRes.ms + " dropped=" + _psRes.dropped
+          + " budget=" + (_budgetExhausted ? "exhausted" : "ok") + " droppedBudget=" + _droppedBudget);
+        if (_ckRes.items > 0) monitorEvent("dream", "prescreen-ckpt items=" + _ckRes.items + " chars=" + _ckRes.chars + " ms=" + _ckRes.ms);
+      } catch (eM2) { /* monitor 失败不影响任务书构建 */ }
+    } else if (prompt.indexOf(_PS_PH) >= 0) {
+      prompt = prompt.replace(_PS_PH, "");   // flag 关：不插入任何字节（逐字 == 基线）
+    }
+  } catch (ePS) {
+    // 预筛失败一律降级为空块（绝不阻断 dream 主流程；F-3 教训）
+    try { prompt = prompt.replace(_PS_PH, ""); } catch (eR2) { /* 忽略 */ }
+    try { cwarn("[dsh-memory] dream 预筛构建失败（本轮不插预筛块）：" + ((ePS && ePS.message) || String(ePS))); } catch (eL) {}
+  }
+  return { promptText: prompt, capacityText: cap, scopeText: scope, overChar: [], softChar: [], overSessionRel: null, candI: { sessionCands: [], otherCands: [] }, overTopics: overTopics, reviewQueue: reviewQ, libMode: true, noteRows: _allRows, noteStats: _noteStats, prescreen: { notes: _psRes.notes, related: _psRes.related, fallback: _psRes.fallback, noHit: _psRes.noHit, noSnippet: _psRes.noSnippet, chars: (_psRes.blockText || "").length, dropped: _psRes.dropped, items: _psRes.items, budgetExhausted: _budgetExhausted, droppedBudget: _droppedBudget }, checkpointEvidence: { items: _ckRes.items, chars: _ckRes.chars, ids: _ckRes.ids, droppedByBudget: _budgetExhausted ? 1 : 0 } };
 }
 
 // [task-54] 体检（md 口径，逐字复刻改造前字符串；flag 关用）
@@ -4765,7 +5207,9 @@ function buildOverLimitHealthLibrary(store, opts) {
   const o = opts || {};
   // [Lead 2026-10-31] 三档口径：先按最低档（9000）取候选，再按每个主题的 tier 用各自上限判定。
   //   索引类 200K / 明细 40K / 主主题 9K —— 明细与索引**不再**用"连续 N 轮未处理"升级措辞。
-  const overTopics = listOverLimitTopicsFromDb(store, { limit: PROJECT_CHAR_HARD });
+  // [4.5.13 S'-1][P0-2] 健康体检 / overLimitStuck 记账同样排除笔记主题：
+  //   笔记只能插件收敛（dream_patch/split 都被拒）⇒ 不再每轮催 dream 处理修不了的笔记（既有死胡同）。
+  const overTopics = listOverLimitTopicsFromDb(store, { limit: PROJECT_CHAR_HARD, excludeNotes: true });
   const wrTopics = o.writtenTopics || new Set();
   const prevStuck = (o.prevStuck && typeof o.prevStuck === "object") ? o.prevStuck : {};
   const healthLines = []; const stuck = {};
@@ -5819,7 +6263,7 @@ function p3SessionState(sid) {
   const key = String(sid || "");
   if (!key) return null;
   let st = p.sessions[key];
-  if (!st) st = p.sessions[key] = { fired: [], lastFireAt: 0, lastActivityAt: 0, checkpointAt: 0 };
+  if (!st) st = p.sessions[key] = { fired: [], lastFireAt: 0, lastActivityAt: 0, checkpointAt: 0, endFiredAt: 0, checkpointPendingAt: 0, t5Fails: 0, t5FailAt: 0 };   // [4.5.10 M5] endFiredAt / [4.5.11 M9] checkpointPendingAt / [P3] t5Fails
   if (!Array.isArray(st.fired)) st.fired = [];
   return st;
 }
@@ -6959,7 +7403,162 @@ export { subagentDeadEvidence, findSpawnedSessionDirById, DEAD_PROBE_CONFIRM };
 //   每轮都挑它 ⇒ 每轮必死。用户直觉正确：「要么手动发起那个会话，要么最新会话」。
 // 本段：读 workspace.json 的归档清单（带 30s 缓存；结构未知就全树找该键），供择父过滤。
 let ARCHIVED_IDS_CACHE = { at: 0, set: new Set() };
+let ARCHIVED_READ_FAIL_AT = 0;   // [CRA MF3] archived-read-fail 事件节流（30s 一次，防损坏期事件洪泛）
 function sessionIdKey(id) { return String(id || "").replace(/^session-/, ""); }
+// [4.5.10 2026-11-09] 子代理 label 统一带「目标会话 sid」后缀 @<sid8>（用户口径：所有记忆插件的子代理都要带）。
+//   动机：T5 会话收尾补写会把已归档会话的检查点派给「最近活跃会话」当父（归档会话不能当父 ⇒ pickSpawnParent 回落），
+//   子代理于是挂在无关会话名下；label 不带 sid 时无法判断它到底在给哪个会话写检查点。
+//   实证 2026-11-09：子代理 85e23d4e 给 bca1141e（发票会话，已归档）写检查点，parentSession 却是 02d20bfe（徕卡一瞬）。
+//   口径：去 `session-` 前缀取前 8 位；缺失/非法 ⇒ "anon"（保持 label 可解析、不抛）。
+function sid8Of(id) {
+  const s = String(id == null ? "" : id).replace(/^session-/, "").trim();
+  return s ? s.slice(0, 8) : "anon";
+}
+function subagentLabelWithTarget(base, targetSid) {
+  return String(base == null ? "" : base) + "@" + sid8Of(targetSid);
+}
+// [4.5.10][CRA M3] T5 会话收尾检查点 cid：纯函数（门可测）——p3e-<sid8>-<now base36>。
+//   修复前用 `sid.slice(0, 8)`，而所有 sid 均以 "session-" 开头 ⇒ 恒为 "session-" ⇒ 同 tick 所有会话共用 cid，
+//   幂等 meta（intent:<cid>）只让第一个写成功、其余被 dup-skip 丢弃；INTENT_PENDING 队列键同样互撞。
+function p3SessionEndCid(sid, now) {
+  const t = Number.isFinite(Number(now)) ? Number(now) : 0;
+  return "p3e-" + sid8Of(sid) + "-" + t.toString(36);
+}
+// [CRA M6/D-2] T5 单轮最多发起 3 个：INTENT_PENDING 容量 5 且超限静默逐旧 ⇒ 不限流会无声丢检查点。
+const T5_MAX_PER_SWEEP = 3;
+// [P3 收尾] T5 连续失败冷却：同一会话 ≥3 次失败后在 6h 内不再发起（防每小时重复烧子代理；成功/dup 清零）
+const T5_MAX_FAILS = 3;
+const T5_FAIL_COOLDOWN_MS = 6 * 3600000;
+// [CRA M5] endFired 崩溃窗口自愈：endFired 随 .monitor.json 持久化，子代理跑完前退出会永久卡死。
+const T5_ENDFIRED_HEAL_MS = 2 * 3600000;
+function p3T5ShouldHealEndFired(st, now) {
+  if (!st || st.endFired !== true) return false;
+  if (Number(st.checkpointAt) > 0) return false;
+  const at = Number(st.endFiredAt) || 0;
+  if (at > 0) return Number(now) - at > T5_ENDFIRED_HEAL_MS;
+  return true;   // 旧格式条目（无 endFiredAt）：endFired 但从未落过检查点 ⇒ 视为丢失，允许重试
+}
+// [4.5.11 CRA MF3] 检查点**真正写成功后**回填 checkpointAt（通用：T4/T5/T1 任何 cid 都算）：
+//   覆盖「queued 排空后成功」路径——否则 .then 只看到 queued、checkpointAt 永不置位，
+//   2h 自愈会把已写成功的检查点再写一遍（新 cid 绕开 dup 幂等 ⇒ 重复子代理/tokens）。
+//   同时清在途标记（checkpointPendingAt）并落盘（CRA MF4）。
+function p3MarkCheckpointDone(sessionId) {
+  try {
+    const st = p3SessionState(sessionId);
+    if (st) { st.checkpointAt = Date.now(); st.lastFireAt = Date.now(); st.checkpointPendingAt = 0; }
+    try { scheduleMonitorSave(); } catch (eS) {}
+  } catch (e) {}
+}
+// [4.5.11 CRA MF5] 宿主 Agent 的 cwd 真实形状：agent.session.header.cwd（事故记录 index.js:19137-19143：
+//   宿主 Agent 只有 agent.session.header.cwd；写成 agent.header.cwd 会恒空 ⇒ 归属修复静默失效）。
+function cwdFromAgent(a) {
+  try {
+    if (!a || typeof a !== "object") return "";
+    const s = a.session || a;
+    const v = (s && s.header && s.header.cwd) || (s && s.cwd) || (a.header && a.header.cwd) || a.cwd || "";
+    return String(v || "");
+  } catch (e) { return ""; }
+}
+// [4.5.11 CRA MF10/D-2] T1 阈值检查点 cid：p3t<level>-<sid8>-<now base36>（纯函数，门可测）。
+//   修复前 `sid.slice(0,8)` 恒为 "session-" ⇒ p3t1-session--<b36>，跨会话仅靠毫秒区分，撞键即静默丢检查点。
+function p3ThresholdCid(level, sid, now) {
+  const t = Number.isFinite(Number(now)) ? Number(now) : 0;
+  return "p3t" + String(level) + "-" + sid8Of(sid) + "-" + t.toString(36);
+}
+// [4.5.11 CRA MF2] T5 在途窗口 TTL：SUBAGENT_HARD_MS(15min) + INTENT_PENDING 串行排队(≤30min) = 45min 最坏；
+//   重试窗 1+5+15=21min + 单次 15min = 36min ⇒ 取 60min（下限 45min；30min 会在排队中途过期 ⇒ T5 与 T4 双写）。
+const T5_PENDING_TTL_MS = 60 * 60e3;
+function p3T5PendingActive(st, now) {
+  if (!st) return false;
+  const at = Number(st.checkpointPendingAt) || 0;
+  if (at <= 0) return false;
+  const t = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  return t - at < T5_PENDING_TTL_MS;
+}
+// [4.5.11 CRA MF1/MF4/MF6] T4 在途清理：只有**终态失败**才清 pending（ok/dup/queued/retry 一律保留，
+//   否则会与重试队列或 T5 形成双写）；清理后立即落盘 + 留痕（G-0 可观测）。
+function p3T4PendingCleanup(sessionId, res, reason, cid, expectAt) {
+  try {
+    const ok = !!(res && res.ok), dup = !!(res && res.duplicate), queued = !!(res && res.queued), retry = !!(res && res.retry);
+    if (ok || dup || queued || retry) return false;
+    const st = p3SessionState(sessionId);
+    if (st) {
+      // [CRA② S1] 淘汰/重火清理带时间戳保护：只清「自己这一笔」的 pending，避免误清更新的 T4
+      if (expectAt != null && Number(st.checkpointPendingAt) !== Number(expectAt)) return false;
+      st.checkpointPendingAt = 0;
+      // [CRA② S7] T5（p3e-*）终态失败：复位 endFired，让下一 tick 可补写（不必等 2h 自愈）
+      if (/^p3e-/.test(String(cid || ""))) { st.endFired = false; st.endFiredAt = 0; }
+    }
+    try { scheduleMonitorSave(); } catch (eS) {}
+    try { monitorEvent("p3", "t4-pending-cleared reason=" + String(reason || (res && res.reason) || "terminal")); } catch (eM) {}
+    return true;
+  } catch (e) { return false; }
+}
+// [CRA② N1/M2] T4 结果 → 记账三元组（纯函数，门可行为断言）：
+//   失败（retry:true / 终态失败）由 intentRetryFail 的 I-fail 记一次 ⇒ T4 不再重复记；
+//   queued 不是失败（fail:0）、dup 不算一次写（n:0）。
+function p3T4OutcomeRecord(res) {
+  const ok = !!(res && res.ok);
+  const dup = !!(res && res.duplicate);
+  const queued = !!(res && res.queued);
+  const retry = !!(res && res.retry);
+  const record = ok || dup || queued;
+  return {
+    record: record,
+    n: (ok && !dup) ? 1 : 0,
+    okFlag: ok ? 1 : 0,
+    fail: 0,
+    note: queued ? "t4-queued" : (dup ? "t4-dup" : (ok ? "t4-ok" : "t4-fail-skip")),
+  };
+}
+// [CRA MF5/G6/G13] T5 结果 → 记账三元组（纯函数，门可行为断言；sweep 的 .then 只用它）
+function p3T5OutcomeRecord(res) {
+  const ok = !!(res && res.ok);
+  const dup = !!(res && res.duplicate);
+  const queued = !!(res && res.queued);
+  return {
+    ok: ok, dup: dup, queued: queued,
+    n: (ok && !dup) ? 1 : 0,
+    okFlag: ok ? 1 : 0,
+    fail: (ok || queued) ? 0 : 1,
+    note: queued ? "session-end-queued" : (dup ? "session-end-dup" : (ok ? "session-end" : "session-end-fail")),
+  };
+}
+// [CRA MF1/G12] 失败是否允许进 `.integrate.json` 重试队列：T5（p3e-*）一律不进（由 sweep 下一 tick 拥有）。
+//   理由：重试队列的 fireIntentRetry 用「触发者 agent」当父 ⇒ 会给别的会话写检查点（跨工作区线污染，审计 F5/M11）。
+function p3ShouldEnqueueRetry(compactionId) {
+  return !/^p3e-/.test(String(compactionId || ""));
+}
+// [CRA MF5/M7/G10] T5 跳过汇总日志（纯函数；无跳过返回 null ⇒ sweep 不写事件）
+function p3T5SkipLog(counts) {
+  const a = Number(counts && counts.archived) || 0;
+  const t = Number(counts && counts.tooOld) || 0;
+  const h = Number(counts && counts.healed) || 0;
+  const c = Number(counts && counts.cooling) || 0;
+  if (!a && !t && !h && !c) return null;
+  return "t5-skip archived=" + a + " too-old=" + t + " healed=" + h + (c ? " cooling=" + c : "");
+}
+// [CRA M3] P3 测试钩子（门用；纯函数/常量引用，不改业务语义）
+const P3_TEST_HOOKS = {
+  sessionEndCid: p3SessionEndCid,
+  maxPerSweep: T5_MAX_PER_SWEEP,
+  healMs: T5_ENDFIRED_HEAL_MS,
+  shouldHealEndFired: p3T5ShouldHealEndFired,
+  outcomeRecord: p3T5OutcomeRecord,
+  skipLog: p3T5SkipLog,
+  markCheckpointDone: p3MarkCheckpointDone,
+  shouldEnqueueRetry: p3ShouldEnqueueRetry,
+  sessionState: p3SessionState,
+  cwdFromAgent: cwdFromAgent,
+  thresholdCid: p3ThresholdCid,
+  pendingActive: p3T5PendingActive,
+  pendingTtl: T5_PENDING_TTL_MS,
+  t4PendingCleanup: p3T4PendingCleanup,
+  t4OutcomeRecord: p3T4OutcomeRecord,
+  t5MaxFails: T5_MAX_FAILS,
+  t5FailCooldownMs: T5_FAIL_COOLDOWN_MS,
+};
+export { P3_TEST_HOOKS as __p3Hooks };
 function readArchivedSessionIds(opts) {
   const o = opts || {};
   const ttl = o.ttlMs === undefined ? 30000 : o.ttlMs;
@@ -6967,6 +7566,8 @@ function readArchivedSessionIds(opts) {
   if (!o.force && now - ARCHIVED_IDS_CACHE.at < ttl) return ARCHIVED_IDS_CACHE.set;
   const file = o.filePath || path.join(DSH_HOME, "storages", "workspace.json");
   const set = new Set();
+  let parsed = false;
+  let foundKey = false;
   try {
     const j = JSON.parse(fs.readFileSync(file, "utf8"));
     const seen = new Set();
@@ -6975,12 +7576,28 @@ function readArchivedSessionIds(opts) {
       seen.add(node);
       if (Array.isArray(node)) { for (const v of node) walk(v); return; }
       for (const k of Object.keys(node)) {
-        if (k === "archivedSessionIds" && Array.isArray(node[k])) { for (const id of node[k]) set.add(sessionIdKey(id)); }
+        if (k === "archivedSessionIds" && Array.isArray(node[k])) { foundKey = true; for (const id of node[k]) set.add(sessionIdKey(id)); }
         else if (node[k] && typeof node[k] === "object") walk(node[k]);
       }
     };
     walk(j);
-  } catch (e) {}
+    parsed = true;
+  } catch (e) { /* 解析异常 → 下方统一失败分支 */ }
+  // [CRA M2/MF3] 读失败（解析异常，或合法 JSON 但结构里没有 archivedSessionIds 键）**不得用空集覆盖缓存**
+  //   （否则归档过滤静默 fail-open：该 tick 全失效、归档会话照旧被 spawn）。保留上一份并**刷新 TTL**
+  //   （否则持久损坏期每会话重读 56KB + 每会话一条事件 = M7 想挡的洪泛换个门进来）；事件 30s 节流一次。
+  if (!parsed || !foundKey) {
+    if (now - ARCHIVED_READ_FAIL_AT > 30000) {
+      ARCHIVED_READ_FAIL_AT = now;
+      try { monitorEvent("p3", "archived-read-fail " + (parsed ? "no-key" : "parse")); } catch (eM) {}
+    }
+    if (ARCHIVED_IDS_CACHE.at > 0) {
+      ARCHIVED_IDS_CACHE = { at: now, set: ARCHIVED_IDS_CACHE.set };
+      return ARCHIVED_IDS_CACHE.set;
+    }
+    ARCHIVED_IDS_CACHE = { at: now, set: new Set() };   // 首轮无缓存：fail-open 可见（空集，30s 后重试）
+    return ARCHIVED_IDS_CACHE.set;
+  }
   ARCHIVED_IDS_CACHE = { at: now, set: set };
   return set;
 }
@@ -7149,6 +7766,10 @@ const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabl
   //   （09-29~10-01 连续 7 次命中全静默）；2026-10-02 18:49:48 真实埋点显示该类窗口 uniq=5/len=5/okN=3，
   //   候选 A 也救不了。置 false = 回退旧口径（硬静默，只记 reason="batch"）。
   batchSoftDeliver: true, memoryTopicDbEnabled: false,
+  // [4.5.13 Part A][CRA② M'-11] dream 预筛开关（库模式任务书里的「Note → 关联主题」+「检查点证据」两块）。
+  //   默认 true；置 false ⇒ 两块**不插入任何字节**（库模式任务书逐字回到基线，md 模式本来就不进新代码）。
+  //   落点四处：DEFAULT_CFG / SETTINGS_SCHEMA / normalizeCfg 布尔归一 / /dsh-memory/config 的 WRITABLE（热更新）。
+  dreamPrescreen: true,
   // [P4-A] 插件子代理（检查点 writer / 归档 / dream）的 Agent Preset 名。
   //   DSH 0.2.x 的 spawn 路径已**丢弃 request.toolFilter**（dsh-subagent startLocal 的
   //   snapshotSubagentDescriptor 只收 mode/provider/label/agentProvider/agentModel/agentReasoningEffort；
@@ -7213,6 +7834,8 @@ const SETTINGS_SCHEMA = z.object({
   // [topicdb] 阶段4 主题账本开关（对应文档里的 memoryTopicDb.enabled；扁平键以兼容现有 settings schema/UI）
   //   默认 false：关闭时全部走今日 md 路径，零行为变化（何时回退：改回 false 即可，立即生效）
   memoryTopicDbEnabled: z.boolean().default(false).volatile(),
+  // [4.5.13 Part A] dream 预筛开关（默认 true）：关 ⇒ 库模式任务书不插「Note → 关联主题」/「检查点证据」两块
+  dreamPrescreen: z.boolean().default(DEFAULT_CFG.dreamPrescreen).volatile(),
   // v1.12.0：使用监控开关（默认开）——记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总
   monitorEnabled: z.boolean().default(true).volatile(),
   // v2.0.2：LLM循环试错提醒（D类）——打转探针双条件命中时注入提醒；关闭则回退纯影子记录
@@ -7294,6 +7917,8 @@ function normalizeCfg(raw) {
   if (typeof cfg.monitorEnabled !== "boolean") cfg.monitorEnabled = DEFAULT_CFG.monitorEnabled;
   // [topicdb] 新开关归一化：非布尔一律回落默认 false（关闭=今日行为）
   if (typeof cfg.memoryTopicDbEnabled !== "boolean") cfg.memoryTopicDbEnabled = DEFAULT_CFG.memoryTopicDbEnabled;
+  // [4.5.13 Part A][M'-11] dreamPrescreen 布尔归一：非法值（"x"/null/数字）一律回落默认 true
+  if (typeof cfg.dreamPrescreen !== "boolean") cfg.dreamPrescreen = DEFAULT_CFG.dreamPrescreen;
   if (typeof cfg.spiralRemind !== "boolean") cfg.spiralRemind = DEFAULT_CFG.spiralRemind;
   if (typeof cfg.spiralBreak !== "boolean") cfg.spiralBreak = DEFAULT_CFG.spiralBreak;
   if (!(cfg.brkLevel >= 1 && cfg.brkLevel <= 3)) cfg.brkLevel = DEFAULT_CFG.brkLevel;
@@ -8875,6 +9500,14 @@ function p25ReadPreviousSession(store, cwd, curSid8) {
       text = ss.length ? String(ss[ss.length - 1].text != null ? ss[ss.length - 1].text : "") : "";
     } catch (e) { text = ""; }
     if (!text.trim()) return null;
+    // [4.5.11 CRA D-5/S7] 读侧防御：句首 `· cwd <cwd>` 与目标 wsKey 不一致 ⇒ 跳过（历史/未来错位主题，实证 T-0557）
+    try {
+      const _mHdr = /^## 检查点[^\n]*?·\s*cwd\s+([^\n）)]+)/m.exec(String(text || ""));
+      if (_mHdr) {
+        const _hdrWs = p25Topics.normalizeWorkspace(String(_mHdr[1] || "").trim());
+        if (_hdrWs && _hdrWs !== wsKey) return null;
+      }
+    } catch (eHdr) { /* 防御失败按原行为继续 */ }
     const ageHours = top.updatedAt ? Math.max(0, (Date.now() - top.updatedAt) / 3600000) : null;
     return { topicName: String(top.t.name || ""), sid8: top.sid8, wsKey: wsKey, text: text, updatedAt: top.updatedAt, ageHours: ageHours };
   } catch (e) {
@@ -9001,12 +9634,14 @@ export { p25SimilarSentences as __p25SimilarSentences };
 //   ② 该主题的**父主题名 === lineName(wsKey)**（确属 P2.5 会话线）
 //   任一不满足 ⇒ 放行：普通主题、名字巧合、尚不存在的新建主题、父线不匹配，全部零影响。
 // 失败纪律：守卫自身任何异常 ⇒ 返回未拦截（行为退回改前，绝不因护栏阻断正常写入）。
-function p25SessionTopicWriteGuard(store, topicRef) {
+function p25SessionTopicWriteGuard(store, topicRef, rowsOpt) {
   try {
     if (!store || typeof store.topics !== "function") return { blocked: false };
     const ref = String(topicRef == null ? "" : topicRef).trim();
     if (!ref) return { blocked: false };
-    const rows = store.topics();
+    // [4.5.13 M'-5] rows 可选复用：整批 patch 预扫时 rows 已取（store.topics() 43–70ms），
+    //   否则每条 patch 都重扫一遍。不传 ⇒ 旧行为（自行取）。
+    const rows = Array.isArray(rowsOpt) ? rowsOpt : store.topics();
     if (!Array.isArray(rows)) return { blocked: false };
     const nz = (TOPICDB.api && typeof TOPICDB.api.normalizeName === "function")
       ? TOPICDB.api.normalizeName
@@ -9062,6 +9697,67 @@ function p25SessionTopicWriteGuard(store, topicRef) {
   }
 }
 export { p25SessionTopicWriteGuard as __p25SessionTopicWriteGuard };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// [4.5.13 I'-7][用户追加 2026-11-10] **日记忆（D8）对 dream 只读**
+//   背景：D8 族（域「日记忆（按天流水）」/ 线「会话检查点」与「会话检查点·<wsKey>」/ 日期主题 YYYY-MM-DD）
+//   是插件按天流水维护的**机械记忆**，dream 改写会破坏「按天追加 + 恒 1 句覆盖」的语义（历史事故形态：
+//   把日期流水当普通主题提炼/拆分/合并/改名 ⇒ 流水断裂、检查点被污染且不可自愈）。
+//   P2.5 会话主题 `<wsKey>/<sid8>` 已有 p25SessionTopicWriteGuard（保持其拒绝码），本组补 D8 其余形态。
+//   判据双轨：**名字优先**（域/线/日期形态，零读库开销）；**父链兜底**（祖先命中 D8 形态 ⇒ 只读，
+//   防「名字不像但挂在 D8 线下」的旁路）。失败纪律：守卫异常一律**放行**（护栏绝不阻断正常写入）+ monitor 留痕。
+// ═══════════════════════════════════════════════════════════════════════════
+const DAILY_MEMORY_DOMAIN_NAME = "日记忆（按天流水）";
+const DAILY_MEMORY_CP_LINE = "会话检查点";
+const DAILY_MEMORY_CP_LINE_PREFIX = "会话检查点·";
+const DAILY_MEMORY_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:\s*[·・].*)?$/;
+/** 名字级判据：D8 域 / 会话检查点线（含 ·<wsKey>）/ 日期主题。 */
+function isDailyMemoryTopicName(name) {
+  const n = String(name == null ? "" : name).trim();
+  if (!n) return false;
+  if (n === DAILY_MEMORY_DOMAIN_NAME) return true;
+  if (n === DAILY_MEMORY_CP_LINE) return true;
+  if (n.indexOf(DAILY_MEMORY_CP_LINE_PREFIX) === 0) return true;
+  if (DAILY_MEMORY_DATE_RE.test(n)) return true;
+  return false;
+}
+/** 解析后的主题是否属于 D8 只读族：名字优先 → 父链兜底（≤6 层）。 */
+function isDailyMemoryTopic(store, ref, rowsOpt) {
+  try {
+    if (!store || typeof store.topics !== "function") return { readonly: false };
+    const r = String(ref == null ? "" : ref).trim();
+    if (!r) return { readonly: false };
+    const rows = Array.isArray(rowsOpt) ? rowsOpt : store.topics();
+    if (!Array.isArray(rows)) return { readonly: false };
+    let hit = null;
+    try {
+      if (typeof store.resolveTopic === "function") {
+        const rr = store.resolveTopic(r, { create: false });
+        if (rr && rr.id) hit = rows.find((t) => t && String(t.id) === String(rr.id)) || null;
+      }
+    } catch (eRes) { hit = null; }
+    if (!hit) hit = rows.find((t) => t && (String(t.id) === r || String(t.name) === r)) || null;
+    if (!hit) return { readonly: false };   // 不存在（新建/拼错）⇒ 放行，交给 store 自身校验
+    const nm = String(hit.name || "");
+    if (isDailyMemoryTopicName(nm)) return { readonly: true, how: "name", topicId: String(hit.id), topicName: nm };
+    // 父链兜底：祖先命中 D8 形态（域/线/日期）⇒ 只读（防「名字不像但挂 D8 线下」的旁路）
+    const byId = new Map(rows.map((t) => [String(t && t.id), t]));
+    let cur = hit;
+    for (let depth = 0; depth < 6; depth++) {
+      if (!cur || !cur.parentId) break;
+      const p = byId.get(String(cur.parentId));
+      if (!p) break;
+      const pnm = String(p.name || "");
+      if (isDailyMemoryTopicName(pnm)) return { readonly: true, how: "parent", topicId: String(hit.id), topicName: nm, parent: pnm };
+      cur = p;
+    }
+    return { readonly: false };
+  } catch (e) {
+    try { monitorEvent("intent", "daily-guard-error " + String((e && e.message) || e).slice(0, 120)); } catch (e2) { /* 忽略 */ }
+    return { readonly: false };
+  }
+}
+export { isDailyMemoryTopicName as __isDailyMemoryTopicName, isDailyMemoryTopic as __isDailyMemoryTopic };
 // [2026-11-05 协议收紧] 自测钩子：登记插件子代理 sid ⇒ actorOf 判为 "dream"（否则只能测到 lead 拒写分支）。
 export { markPluginSubagent as __markPluginSubagent };
 
@@ -13057,7 +13753,8 @@ export default {
                 // 白名单：仅可写字段（只读统计与内部态一律拒绝）
                 const WRITABLE = new Set(["staleSessionDays", "staleAction", "integrateEnabled", "integrateDays", "active",
                   "monitorEnabled", "spiralRemind", "regressionEnabled", "initGuideEnabled", "updateCheckEnabled",
-                  "spiralBreak", "brkLevel", "brkHardAbort", "brkSameN", "brkMaxDeny", "brkMinSteps", "maintTriggerChars"]);
+                  "spiralBreak", "brkLevel", "brkHardAbort", "brkSameN", "brkMaxDeny", "brkMinSteps", "maintTriggerChars",
+                  "dreamPrescreen"]);   // [4.5.13 Part A] 预筛开关可写 + 热更新（下方 PLUGIN_CFG = normalizeCfg(...) 生效）
                 const clean = {};
                 for (const [k, v] of Object.entries(patch)) {
                   if (!WRITABLE.has(k)) return reply(400, { ok: false, error: "field not writable: " + k });
@@ -13158,7 +13855,7 @@ export default {
       const list = (Array.isArray(INTENT_RETRY_CACHE) ? INTENT_RETRY_CACHE : intentRetryLoad());
       return list.some((e) => String(e.id) === id);
     }
-    function intentRetryEnqueue(compactionId, fname, sid8, text, sessionId, reason) {
+    function intentRetryEnqueue(compactionId, fname, sid8, text, sessionId, reason, cwd) {
       const id = String(compactionId || "");
       if (!id) return null;
       const list = intentRetryLoad();
@@ -13175,6 +13872,8 @@ export default {
       const entry = Object.assign({}, plan.entry, {
         id: id, fname: String(fname || ""), sid: String(sid8 || ""), sessionId: String(sessionId || ""),
         text: String(text || "").slice(0, 16000),
+        // [4.5.11 CRA MF6] 目标 cwd 随条目持久化：补火时不再依赖「谁当父」（修复前写错工作区线，实证 T-0557）
+        cwd: String(cwd || "").slice(0, 512),
       });
       const next = idx >= 0 ? list.map((e) => (String(e.id) === id ? entry : e)) : list.concat([entry]);
       intentRetrySave(next);
@@ -13202,7 +13901,11 @@ export default {
       const jobs = [];
       for (const e of due) {
         try {
-          jobs.push(Promise.resolve(spawnIntentCheckpoint(e.id, e.text || "", e.fname || (dateStr(new Date()) + ".md"), agent, e.sessionId || "", { retry: true }))
+          // [CRA② S2] 旧队列条目无 cwd（4.5.11 之前入队）⇒ 降级可观测，不再静默走空 cwd
+          if (!e.cwd) { try { monitorEvent("intent", "retry-cwd-missing " + String(e.id).slice(0, 8)); } catch (eRm) {} }
+          // [4.5.11 CRA MF5/MF6] 补火不再用「触发者 agent」当父（那会把目标会话的检查点写进触发者工作区线，实证 T-0557）：
+          //   parent=null 让 pickSpawnParent 优先用目标会话的 live agent；cwd 用队列条目里持久化的目标 cwd。
+          jobs.push(Promise.resolve(spawnIntentCheckpoint(e.id, e.text || "", e.fname || (dateStr(new Date()) + ".md"), null, e.sessionId || "", { retry: true, cwd: e.cwd || "" }))
             .then((r) => ({ id: e.id, ok: !!(r && r.ok), queued: !!(r && r.queued), reason: (r && r.reason) || null }))
             .catch((err) => ({ id: e.id, ok: false, reason: "throw:" + ((err && err.message) || err) })));
         } catch (eF) {
@@ -13387,6 +14090,10 @@ export default {
             if (!t) { topicUnresolved.push(v.topicRef + "|" + v.action); continue; }
             // [4.5.2 P0 · C4' 守卫（兜底）] 解析后的主题是笔记 ⇒ 该条拒写（正常路径在 applyPatches 已整批拒绝）
             if (isNoteTopicName(t.name)) { conflicts.push({ file: "topic:" + v.topicRef, action: v.action, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "「" + String(t.name) + "」是会话笔记主题，dream 不得写/删（只由插件收敛流程改写）" }); continue; }
+            // [4.5.13 P0-1/M'-5] 兜底：解析后的主题是 P2.5 会话检查点 ⇒ 该条拒写（正常路径在 applyPatches 整批拒绝）
+            if (p25SessionTopicWriteGuard(store, t.id, rows).blocked) { conflicts.push({ file: "topic:" + v.topicRef, action: v.action, code: "P25_SESSION_TOPIC", message: "「" + String(t.name) + "」是 P2.5 插件专用会话检查点主题（恒 1 句），dream 只读、不得写/删" }); continue; }
+            // [4.5.13 I'-7] 兜底：日记忆（D8）只读族 ⇒ 该条拒写（正常路径在 applyPatches 整批拒绝）
+            if (isDailyMemoryTopic(store, t.id, rows).readonly) { conflicts.push({ file: "topic:" + v.topicRef, action: v.action, code: "DAILY_MEMORY_READONLY", message: "「" + String(t.name) + "」属于日记忆（D8）只读族（按天流水由插件维护），dream 只读、不得写/删" }); continue; }
             const appliedBefore = applied.length;
             try {
               const live = dbLiveTexts(store, t.id);
@@ -13427,6 +14134,10 @@ export default {
           if (!hit) { unmapped.push(v.rel + "|" + v.action); mdFallback.add(v); continue; }
           // [4.5.2 P0 · C4' 守卫（兜底）] file 名归一映射到笔记主题同样拒写（防 file 寻址旁路）
           if (isNoteTopicName(hit.topic.name)) { conflicts.push({ file: v.rel, action: v.action, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "「" + String(hit.topic.name) + "」是会话笔记主题（file 名归一命中），dream 不得写/删" }); continue; }
+          // [4.5.13 P0-1/M'-5] file 寻址旁路：归一映射到 P2.5 会话检查点同样拒写
+          if (p25SessionTopicWriteGuard(store, hit.topic.id, rows).blocked) { conflicts.push({ file: v.rel, action: v.action, code: "P25_SESSION_TOPIC", message: "「" + String(hit.topic.name) + "」是 P2.5 会话检查点主题（file 名归一命中），dream 只读、不得写/删" }); continue; }
+          // [4.5.13 I'-7] file 寻址旁路：归一映射到日记忆（D8）只读族同样拒写
+          if (isDailyMemoryTopic(store, hit.topic.id, rows).readonly) { conflicts.push({ file: v.rel, action: v.action, code: "DAILY_MEMORY_READONLY", message: "「" + String(hit.topic.name) + "」属于日记忆（D8）只读族（file 名归一命中），dream 只读、不得写/删" }); continue; }
           if (/^(projects|knowledge|sessions|tools)\//.test(v.rel)) exportViews.add(v.rel);
           const tid = hit.topic.id;
           const appliedBefore0 = applied.length;
@@ -13575,6 +14286,40 @@ export default {
               hint: "按任务书在最终文本输出 " + NOTE_COMPACT_SENTINEL + " + {\"compact\":[{\"topic\",\"pointer\",\"targets\"}]} 交给插件收敛；不要直接改笔记主题",
               errors: ["patches[" + _i + "] " + _msg],
             };
+          }
+          // [4.5.13 P0-1/M'-5][CRA② F-5] dream 不得写/删 **P2.5 会话检查点主题**（每会话恒 1 句，
+          //   由压缩/阈值/会话收尾的覆盖写入负责）。判据 = p25SessionTopicWriteGuard（名字形态 + 父线双条件）。
+          //   与笔记闸同模式：命中即**整批拒绝**（绝不半批落盘），拒绝码 P25_SESSION_TOPIC。
+          //   复用本批 _gRows（一次 topics()），不额外扫库。
+          if (_t) {
+            const _p25g = p25SessionTopicWriteGuard(TOPICDB.store, _t.id, _gRows);
+            if (_p25g && _p25g.blocked) {
+              const _msg25 = "「" + String(_t.name) + "」（" + String(_t.id) + "）是 P2.5 插件专用会话检查点主题：每会话恒 1 句、由插件覆盖写入；dream **只读**，不得 append/edit/replace/delete。";
+              try { monitorEvent("dream", "dream-patch-checkpoint-denied " + String(_t.id)); } catch (eM2) {}
+              return {
+                ok: false, mode: "rejected", error: "P25_SESSION_TOPIC", wrote: 0, rejected: true,
+                message: _msg25,
+                hint: "检查点证据是只读材料：把结论写进对应项目/知识主题，不要改写检查点主题（写入由插件负责）",
+                errors: ["patches[" + _i + "] " + _msg25],
+              };
+            }
+          }
+          // [4.5.13 I'-7][用户追加] dream 不得写/删 **日记忆（D8）只读族**：D8 域「日记忆（按天流水）」/
+          //   会话检查点线（含 `会话检查点·<wsKey>`）/ 日期主题 `YYYY-MM-DD`。判据 = 名字优先 + 父链兜底
+          //   （isDailyMemoryTopic，与 P25 会话主题分开：P2.5 主题先撞上面的 P25 闸，保持 P25_SESSION_TOPIC 码）。
+          //   命中即**整批拒绝**（绝不半批落盘），拒绝码 DAILY_MEMORY_READONLY。
+          if (_t) {
+            const _dg = isDailyMemoryTopic(TOPICDB.store, _t.id, _gRows);
+            if (_dg && _dg.readonly) {
+              const _msgD = "「" + String(_t.name) + "」（" + String(_t.id) + "）属于日记忆（D8）只读族（" + String(_dg.how === "parent" ? ("父线 " + String(_dg.parent || "")) : "名字形态") + "）：按天流水由插件机械维护，dream **只读**，不得 append/edit/replace/delete。";
+              try { monitorEvent("dream", "dream-patch-daily-denied " + String(_t.id) + " how=" + String(_dg.how || "")); } catch (eMD) {}
+              return {
+                ok: false, mode: "rejected", error: "DAILY_MEMORY_READONLY", wrote: 0, rejected: true,
+                message: _msgD,
+                hint: "日记忆是只读流水：把结论写进对应项目/知识主题；日期流水与检查点由插件按天维护",
+                errors: ["patches[" + _i + "] " + _msgD],
+              };
+            }
           }
         }
       }
@@ -13882,6 +14627,13 @@ export default {
     };
     // [topicdb][task-43 P3] 测试钩子：直调**同一份** applyPatches（线上跑什么就测什么）
     try { DREAM_TEST_HOOKS.apply = (patches, opts) => applyPatches(patches, opts); } catch (eH) { /* 钩子装配失败忽略 */ }
+    // [4.5.13 Part A][门用] 两个只读钩子：
+    //   ① setCfg：把 PLUGIN_CFG 就地改成指定值（门要验「dreamPrescreen=false ⇒ 任务书 == 基线」，
+    //      而 /dsh-memory/config 热更新需要真 webServer 路由，fixture 的 inject 不回调 ⇒ 给一个等价入口；
+    //      生产路径不调用，语义与 POST 后 `PLUGIN_CFG = normalizeCfg(mergeCfgLayers(config))` 同构）；
+    //   ② promptBuildCount：buildDreamPrompt 调用计数（P0-4 空轮短路门要断言「未调用」——审计 V-1/P0-4 门可观测性）。
+    try { DREAM_TEST_HOOKS.setCfg = (patch) => { PLUGIN_CFG = normalizeCfg(Object.assign({}, PLUGIN_CFG, patch || {})); return true; }; } catch (eCfgH) { /* 钩子装配失败忽略 */ }
+    try { if (!Number.isFinite(DREAM_TEST_HOOKS.promptBuildCount)) DREAM_TEST_HOOKS.promptBuildCount = 0; } catch (eCntH) { /* 忽略 */ }
     try {
       DREAM_TEST_HOOKS.spawnIntegrate = spawnIntegrate;
       DREAM_TEST_HOOKS.buildPrompt = (p) => buildDreamPrompt(p || {});
@@ -14156,7 +14908,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
       try {
         _ctrl = new AbortController();
         const opts = {
-          label: "dsh-memory-压缩-" + tag,
+          label: subagentLabelWithTarget("dsh-memory-压缩-" + tag, sessionId || agentSessionIdOf(parent)),   // [4.5.10] 带目标会话 sid，防挂父会话名下误读
           prompt: [{ type: "text", text: promptText }],
           signal: _ctrl.signal,
           toolFilter: { allow: ["memory_search"] }
@@ -14965,7 +15717,16 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         if (INTENT_PENDING.size > 0) {
           const nxt = INTENT_PENDING.entries().next().value;
           INTENT_PENDING.delete(nxt[0]);
-          setTimeout(() => { try { spawnIntentCheckpoint(nxt[0], nxt[1].summaryText, nxt[1].fname, nxt[1].parentAgent, nxt[1].sessionId); } catch (e) {} }, 0);
+          setTimeout(() => {
+            try {
+              const _r = spawnIntentCheckpoint(nxt[0], nxt[1].summaryText, nxt[1].fname, nxt[1].parentAgent, nxt[1].sessionId, { cwd: nxt[1].cwd });
+              // [CRA② M1] 重火也要观察结果：终态失败必须清 pending（否则 T5 被 TTL 压 60min）
+              if (_r && typeof _r.then === "function") {
+                _r.then((res) => { try { p3T4PendingCleanup(nxt[1].sessionId, res, "queued-refire", nxt[0], nxt[1].at); } catch (eC) {} })
+                  .catch(() => { try { p3T4PendingCleanup(nxt[1].sessionId, null, "queued-refire-throw", nxt[0], nxt[1].at); } catch (eC2) {} });
+              }
+            } catch (e) {}
+          }, 0);
         }
       }
     }
@@ -15050,7 +15811,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
       try { archivedCompactionIds.add(id); } catch (e) {}
       try { intentRetryClear(id); } catch (e2) {}
     }
-    function intentRetryFail(compactionId, summaryText, fname, sessionId, reason) {
+    function intentRetryFail(compactionId, summaryText, fname, sessionId, reason, cwd) {
       const id = String(compactionId || "");
       if (!id) return { ok: false, retry: false, reason: String(reason || "") };
       let enq = null;
@@ -15061,7 +15822,10 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         } catch (eP3f) {}
       try {
         const sid8 = String(sessionId || "anon").replace(/^session-/, "").slice(0, 8);
-        enq = intentRetryEnqueue(id, fname, sid8, summaryText, sessionId, reason);
+        // [CRA MF1/G12] T5（p3e-*）失败**不进重试队列**：T5 重试由 sweep 下一 tick 拥有。
+        //   本守卫覆盖 queued→排空失败路径（直接失败由 sweep .then 的 intentRetryClear 兜底，两者都不入队）。
+        if (!p3ShouldEnqueueRetry(id)) return { ok: false, retry: false, reason: "t5-sweep-owned:" + String(reason || "") };
+        enq = intentRetryEnqueue(id, fname, sid8, summaryText, sessionId, reason, cwd);
       } catch (e) { cwarn("[dsh-memory] 意图检查点失败入队异常（忽略）：", (e && e.message) || String(e)); }
       // enq=null ⇒ 已触发熔断（attempts 超上限，条目已丢弃）——如实回传，供调用方/门区分"还排队"与"已放弃"
       return enq ? { ok: false, retry: true, reason: String(reason || "") }
@@ -15069,21 +15833,42 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
     }
     async function spawnIntentCheckpoint(compactionId, summaryText, fname, parentAgent, sessionId, opts) {
       const _retryCall = !!(opts && opts.retry);
+      // [4.5.11 CRA MF5/MF6] 目标 cwd 必须在忙入队早退之前算好：opts.cwd（T1/T4/T5/retry 显式传）→ 父 agent → 目标会话 live agent → 空
+      const _targetCwd = String((opts && opts.cwd) || "") || cwdFromAgent(parentAgent) || cwdFromAgent(agentsBySession.get(sessionId)) || "";
+      // [CRA② S3] 目标 cwd 三级兜底全空 ⇒ 留痕（db 会写共享日线、md 会写通用块，归属丢失但可观测）
+      if (!_targetCwd) { try { monitorEvent("intent", "cwd-missing " + String(compactionId).slice(0, 8)); } catch (eCm) {} }
       // v2.4.10：合并维护运行中同样排队（与 INTENT_RUNNING 共用 INTENT_PENDING 队列）——intent 检查点是
       // compact 中转产物、同 compactionId 不重发，被 maint 挡着时绝不能跳过只能排队；maint 结束时由
       // runMaintenanceMerge finally 补火（与自身 finally 同款 setTimeout(0) 机制）。
       if (INTENT_RUNNING || MAINT_RUNNING) {
         if (!INTENT_PENDING.has(compactionId)) {
-          INTENT_PENDING.set(compactionId, { summaryText, fname, parentAgent, sessionId });
-          if (INTENT_PENDING.size > 4) INTENT_PENDING.delete(INTENT_PENDING.keys().next().value);
+          INTENT_PENDING.set(compactionId, { summaryText, fname, parentAgent, sessionId, cwd: _targetCwd, at: Date.now() });
+          if (INTENT_PENDING.size > 4) {
+            // [CRA M6/G9] 淘汰必须留痕；且复位被淘汰会话的 endFired（否则 T5 视为「已交办」后永不重试 ⇒ 检查点静默丢）
+            const _evKey = INTENT_PENDING.keys().next().value;
+            const _evVal = INTENT_PENDING.get(_evKey);
+            INTENT_PENDING.delete(_evKey);
+            try { monitorEvent("intent", "pending-evict " + String(_evKey).slice(0, 8)); } catch (ePE) {}
+            try {
+              const _s = _evVal && _evVal.sessionId ? p3SessionState(_evVal.sessionId) : null;
+              if (_s) { _s.endFired = false; _s.endFiredAt = 0; }
+              // [4.5.11 CRA MF1/F3] 被淘汰的 T4 在途项同样要清 pending（否则 T5 被压到 TTL）
+              if (_evVal && _evVal.sessionId) p3T4PendingCleanup(_evVal.sessionId, null, "queued-evict", _evKey, _evVal.at);
+            } catch (ePS) {}
+          }
           monitorEvent("intent", "queued " + String(compactionId).slice(0, 8) + (MAINT_RUNNING ? " while-maint" : ""));
           clog("[dsh-memory] 意图检查点：忙→入队 " + String(compactionId).slice(0, 8) + (MAINT_RUNNING ? "（合并维护进行中）" : ""));
+        } else {
+          // [CRA M6/G9] 同 cid 已在队列：不重复入队，但必须留痕（修复前静默丢弃、无任何日志）
+          try { monitorEvent("intent", "pending-dedupe " + String(compactionId).slice(0, 8)); } catch (ePD) {}
         }
         return { ok: false, queued: true, reason: "busy" };
       }
       const rawSum = String(summaryText || "").trim();
       if (rawSum.length < 40) {
         clog("[dsh-memory] 意图检查点：宿主压缩摘要为空或过短（" + rawSum.length + " 字符），跳过不落盘");
+        // [P3 收尾] 留痕：过短不落盘也要可观测（此前账本零记录，无法归因「检查点为何没写」）
+        try { p3CostBump("checkpointWrite", { n: 0 }, { sid: sessionId, trigger: "I-skip", ok: 0, note: "too-short:" + rawSum.length }); } catch (eTs) {}
         return { ok: false, retry: false, reason: "too-short" };   // 同一份摘要重试也还是过短 ⇒ 不占重试队列
       }
       INTENT_RUNNING = true;
@@ -15095,21 +15880,21 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         const subagents = ctx.get("subagents");
         if (!subagentsHasStart(subagents)) {   // v3.2.1：双协议判据（0.1.x start / 0.2.x startActivation）
           clog("[dsh-memory] 意图检查点：subagents 不可用，跳过");
-          return intentRetryFail(compactionId, summaryText, fname, sessionId, "subagents-unavailable");
+          return intentRetryFail(compactionId, summaryText, fname, sessionId, "subagents-unavailable", _targetCwd);
         }
         const targetPath = MEMORY_ROOT + "/sessions/" + fname;
         const targetFull = portable(targetPath);
         let existing = "";
         try { existing = fs.readFileSync(targetFull, "utf8"); } catch (e) { existing = ""; }
-        if (existing.includes("<!-- intent: " + compactionId)) { intentRetrySucceed(compactionId); return { ok: true, duplicate: true, mode: "md-marker" }; }   // 幂等：前缀匹配（marker 已带 sid 后缀）；已有 marker = 上次已落盘 ⇒ 成功口径
+        if (existing.includes("<!-- intent: " + compactionId)) { intentRetrySucceed(compactionId); try { p3MarkCheckpointDone(sessionId); } catch (eMd) {} return { ok: true, duplicate: true, mode: "md-marker" }; }   // 幂等：前缀匹配（marker 已带 sid 后缀）；已有 marker = 上次已落盘 ⇒ 成功口径（[4.5.11 MF3] 成功标记同步）
         const sid8 = String(sessionId || "anon").replace(/^session-/, "").slice(0, 8);
         let sum = await compactOnce(subagents, parentAgent, buildCheckpointPrompt(smartTrim(summaryText, 20000, "sessions/" + fname + "（memory_search 可查）")), "intent-" + String(compactionId).slice(0, 8), null, sessionId);
-        if (!sum) { clog("[dsh-memory] 意图检查点：子代理无输出，跳过"); return intentRetryFail(compactionId, summaryText, fname, sessionId, "no-output"); }
+        if (!sum) { clog("[dsh-memory] 意图检查点：子代理无输出，跳过"); return intentRetryFail(compactionId, summaryText, fname, sessionId, "no-output", _targetCwd); }
         sum = extractBodyFromMarker(sum);   // v2.5.2（F1′）：intent 同上剥前言，防 ghost 轮检查点整块丢弃（compact 不重发，后果更重）
         if (!/^##\s*本次目标/.test(sum.trim())) {   // v2.3.8 F4: 格式护栏——拒绝非检查点文本入正文（ghost 轮跑题回复曾顶替正解落盘）
           monitorEvent("intent", "malformed " + String(compactionId).slice(0, 8) + " head=[" + sum.slice(0, 30).replace(/\n/g, " ") + "]");
           cwarn("[dsh-memory] 意图检查点：输出非检查点格式，跳过落盘 " + String(compactionId).slice(0, 8));
-          return intentRetryFail(compactionId, summaryText, fname, sessionId, "malformed");
+          return intentRetryFail(compactionId, summaryText, fname, sessionId, "malformed", _targetCwd);
         }
         // v2.4.12（P1）→ [P2-3]：写入端结构校验——P2 起要求 8 节（标题逐字/顺序固定）；
         //   为兼容历史模型输出与 P0 验收夹具，allowLegacySections 放行「三节老格式」（读取端本来就不校验结构）。
@@ -15118,7 +15903,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
           if (!vs.ok) {
             monitorEvent("intent", "bad-structure " + String(compactionId).slice(0, 8) + " " + vs.errors.join("/").slice(0, 120));
             cwarn("[dsh-memory] 意图检查点：输出结构违规，跳过落盘 " + String(compactionId).slice(0, 8) + "：" + vs.errors.join(" | "));
-            return intentRetryFail(compactionId, summaryText, fname, sessionId, "bad-structure:" + vs.errors.join("/").slice(0, 80));
+            return intentRetryFail(compactionId, summaryText, fname, sessionId, "bad-structure:" + vs.errors.join("/").slice(0, 80), _targetCwd);
           }
         }
         // [P2-3] 超纲护栏：1000 → 3000 + 8 节分节预算机器裁剪 + 整节删序（未决→任务→错误→文件；
@@ -15140,25 +15925,25 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         //   · mode="db" ⇒ 直接返回，不碰 sessions/*.md；· mode="md" ⇒ 继续走下面的原 md 路径
         //   （flag 关 = 老行为；flag 开但库写失败 = 双写兜底，检查点绝不能丢）。flag 关时本判断只读一个布尔。
         {
-          // [P2.5] cwd 从 parentAgent 取（会话主题按工作区归族：同一 cwd 的会话共享「会话检查点·<wsKey>」线）
-          let _cwP25 = "";
-          try {
-            const _agP25 = parentAgent && (parentAgent.session || parentAgent);
-            _cwP25 = String((_agP25 && ((_agP25.header && _agP25.header.cwd) || _agP25.cwd)) || "");
-          } catch (eCw) { _cwP25 = ""; }
+          // [4.5.11 CRA MF5] 目标 cwd 统一用函数头算好的 _targetCwd（不再从 parentAgent 现取——重试时 parent 是触发者）
+          const _cwP25 = _targetCwd;
           const route = topicDbIntentRoute(compactionId, sid8, sum, fname, sessionId, _cwP25);
           if (route.mode === "db") {
-            monitorEvent("intent", "topicdb " + String(compactionId).slice(0, 8) + (route.duplicate ? " dup-skip" : (" +1 " + route.topicName)));
+            const _dup = !!route.duplicate;
+            monitorEvent("intent", "topicdb " + String(compactionId).slice(0, 8) + (_dup ? " dup-skip" : (" +1 " + route.topicName)));
             // 成功日志降噪：不写 clog（每次 compact 刷一行 info 太吵）；审计细节在 .monitor.json
             intentRetrySucceed(compactionId);   // P0-2：落库成功才进去重集 + 清重试队列
+          try { p3MarkCheckpointDone(sessionId); } catch (eT5d) {}   // [4.5.11 CRA MF3] 通用成功标记（含 queued 排空成功）
           try { p4cRememberCheckpoint(sessionId, sum); } catch (eP4c1) { /* 基线缓存失败不影响落库 */ }
           // [P3-3 记账] 检查点真的写成功（n:0 不重复计"压缩次数"；outChars/durMs/fail 正常累加）
+          //   [CRA M4/D-1] dup = 真幂等命中（meta 只在写成功后写）⇒ 不算失败、也不算一次写（n 保持 0），
+          //   但必须与 I-ok 可区分（修复前 dup-skip 也记成 intent-ok-db/ok:1，账本上看不出检查点没写进去）。
           try {
             const _p3d = Date.now() - _p3t0;
-            p3CostBump("checkpointWrite", { n: 0, outChars: sum.length, estTokens: p3Cost.estTokens(sum.length), durMs: _p3d },
-              { sid: sessionId, trigger: "I-ok", ok: 1, outChars: sum.length, durMs: _p3d, note: "intent-ok-db" + (_retryCall ? "-retry" : "") });
+            p3CostBump("checkpointWrite", { n: 0, outChars: _dup ? 0 : sum.length, estTokens: _dup ? 0 : p3Cost.estTokens(sum.length), durMs: _p3d },
+              { sid: sessionId, trigger: _dup ? "I-dup" : "I-ok", ok: 1, outChars: _dup ? 0 : sum.length, durMs: _p3d, note: (_dup ? "intent-dup-skip" : "intent-ok-db") + (_retryCall ? "-retry" : "") });
           } catch (eP3o1) {}
-            return { ok: true, mode: "db", duplicate: !!route.duplicate, topicName: route.topicName };
+            return { ok: true, mode: "db", duplicate: _dup, topicName: route.topicName };
           }
         }
         const block = "<!-- intent: " + compactionId + " sid:" + sid8 + " -->\n\n## 检查点（目标与下一步，压缩 " + String(compactionId).slice(0, 8) + "）\n\n" + sum.trim() + "\n";
@@ -15167,8 +15952,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         // 格级语义：目标格 strip 后保 2 旧 + 新 block = 每格至多 3；其他格（含 dump）不动。
         let _secKey = "";
         try {
-          const _ag = parentAgent && (parentAgent.session || parentAgent);
-          const _cw = _ag && ((_ag.header && _ag.header.cwd) || _ag.cwd);
+          const _cw = _targetCwd;   // [4.5.11 CRA MF7] 与 db 路径同源（不再按触发者 parentAgent 归格）
           if (_cw) { const _mx = matchProjectByCwd(String(_cw)); if (_mx.hits.length > 0) _secKey = String(_mx.hits[0].key || ""); }
         } catch (eS) { _secKey = ""; }
         const _stripped = stripOldIntentBlocks(existing, sid8);
@@ -15182,6 +15966,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         clog("[dsh-memory] 已写入意图检查点 sessions/" + fname + "（intent " + String(compactionId).slice(0, 8) + " sid " + sid8 + "，prepend " + sum.length + " 字符）");
         try { refreshMemorySessionsIndex(); } catch (e2) {}
         intentRetrySucceed(compactionId);   // P0-2：md 写回成功才进去重集 + 清重试队列
+        try { p3MarkCheckpointDone(sessionId); } catch (eT5m) {}   // [4.5.11 CRA MF3] md 路径通用成功标记
         try { p4cRememberCheckpoint(sessionId, sum); } catch (eP4c2) { /* 基线缓存失败不影响落库 */ }
         // [P3-3 记账] 检查点写 md 成功（同上口径）
         try {
@@ -15192,13 +15977,22 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         return { ok: true, mode: "md" };
       } catch (e) {
         cwarn("[dsh-memory] 意图检查点失败:", e && e.message ? e.message : String(e));
-        return intentRetryFail(compactionId, summaryText, fname, sessionId, "throw:" + ((e && e.message) || String(e)));
+        return intentRetryFail(compactionId, summaryText, fname, sessionId, "throw:" + ((e && e.message) || String(e)), _targetCwd);
       } finally {
         INTENT_RUNNING = false;
         if (INTENT_PENDING.size > 0) {
           const nxt = INTENT_PENDING.entries().next().value;
           INTENT_PENDING.delete(nxt[0]);
-          setTimeout(() => { try { spawnIntentCheckpoint(nxt[0], nxt[1].summaryText, nxt[1].fname, nxt[1].parentAgent, nxt[1].sessionId); } catch (e) {} }, 0);
+          setTimeout(() => {
+            try {
+              const _r = spawnIntentCheckpoint(nxt[0], nxt[1].summaryText, nxt[1].fname, nxt[1].parentAgent, nxt[1].sessionId, { cwd: nxt[1].cwd });
+              // [CRA② M1] 重火也要观察结果：终态失败必须清 pending（否则 T5 被 TTL 压 60min）
+              if (_r && typeof _r.then === "function") {
+                _r.then((res) => { try { p3T4PendingCleanup(nxt[1].sessionId, res, "queued-refire", nxt[0], nxt[1].at); } catch (eC) {} })
+                  .catch(() => { try { p3T4PendingCleanup(nxt[1].sessionId, null, "queued-refire-throw", nxt[0], nxt[1].at); } catch (eC2) {} });
+              }
+            } catch (e) {}
+          }, 0);
         }
       }
     }
@@ -18142,7 +18936,8 @@ compatOn(ctx, "session/event", (session, event) => {
         //   刻意**保留 lastFireAt**：让 5 分钟冷却跨周期生效，防「压缩瞬间 + 手动压缩」连写两次。
         try {
           const _p3st = p3SessionState(session.id);
-          if (_p3st) { _p3st.fired = p3Triggers.resetAfterCompact(); _p3st.checkpointAt = Date.now(); _p3st.lastActivityAt = Date.now(); }
+          // [4.5.11 CRA M9] 只置「在途」标记：checkpointAt 收敛为「写成功」标记（失败由 p3T4PendingCleanup 清 pending ⇒ T5 可补写）
+          if (_p3st) { _p3st.fired = p3Triggers.resetAfterCompact(); _p3st.checkpointPendingAt = Date.now(); _p3st.lastActivityAt = Date.now(); }
           // [note 提醒 2026-11-05 / CRA M1+M2 修复] 压缩后：
           //   ① 档位清零（下一轮从 15% 重新开始）
           //   ② **清掉队列里还没投递的旧 note 提醒**（M2：否则压缩后注入过期百分比、且与重灌形成双提醒）
@@ -18153,7 +18948,7 @@ compatOn(ctx, "session/event", (session, event) => {
             enqueueRegressionReminder(session.id, "note-remind-compact", noteRemindText("刚完成一次上下文压缩。"));
             try { monitorEvent("note", "compact-reset purged=" + _purged + " sid=" + String(session.id).slice(0, 8)); } catch (eM2) { }
           } catch (eNR2) { /* 清零失败不影响压缩主流程 */ }
-          p3CostBump("checkpointWrite", { n: 1, inChars: text.length, estTokens: p3Cost.estTokens?.(text.length) || 0, trigger: "T4", ok: 1 }, { sid: session.id, trigger: "T4", ok: 1, inChars: text.length });
+          // [4.5.11 CRA S2] 记账移到 spawn 结果（成功/失败各记一次）——修复前在 spawn 前就记 ok:1，失败后账本「先成功后失败」
         } catch (eP3c) { /* 重置/记账失败不影响检查点链路 */ }
 
         // v2.4.16(compaction-dump 退役)：不再把宿主压缩摘要抄进当日 md（dump 停写）——
@@ -18167,9 +18962,24 @@ compatOn(ctx, "session/event", (session, event) => {
             let intentInput = text;
             try { intentInput = buildIntentInput(session, text); } catch (eIn) { intentInput = text; }
             // [P4-C2] 保存本轮检查点 Promise：R2 重灌前要等它结算（否则灌的恒是上一版，用户实测指出）
-            const _pW = spawnIntentCheckpoint(compactionId, intentInput, fname, parentAttempt, session.id);
+            // [4.5.11 CRA S1/M11] 显式传目标 cwd（session.header.cwd），parentAgent 降级为兜底
+            const _pW = spawnIntentCheckpoint(compactionId, intentInput, fname, parentAttempt, session.id,
+              { cwd: cwdFromAgent({ session: session }) });
             try {
-              if (_pW && typeof _pW.then === "function") P4C_INTENT_WAIT.set(String(session.id), _pW);
+              if (_pW && typeof _pW.then === "function") {
+                P4C_INTENT_WAIT.set(String(session.id), _pW);
+                // [4.5.11 CRA MF1/MF4/S2] 终态失败才清 pending（queued/retry 保留 ⇒ 不与重试/T5 双写）；清理落盘 + 留痕
+                _pW.then((res) => {
+                  try {
+                    const _rec = p3T4OutcomeRecord(res);   // [CRA② M2] 失败不在这里重复记（intentRetryFail 的 I-fail 已记一次）；queued 不算失败
+                    if (_rec.record) {
+                      p3CostBump("checkpointWrite", { n: _rec.n, inChars: intentInput.length, estTokens: p3Cost.estTokens(intentInput.length), ok: _rec.okFlag, fail: _rec.fail },
+                        { sid: session.id, trigger: "T4", ok: _rec.okFlag, inChars: intentInput.length, note: _rec.note });
+                    }
+                  } catch (eC) {}
+                  p3T4PendingCleanup(session.id, res, "t4", compactionId);
+                }).catch(() => { p3T4PendingCleanup(session.id, null, "t4-throw", compactionId); });
+              }
             } catch (eWm) { /* 登记失败不影响检查点 */ }
           }
           catch (e) { cerr("[dsh-memory] 意图检查点调度失败:", e && e.message ? e.message : String(e)); }
@@ -18311,7 +19121,7 @@ compatOn(ctx, "session/event", (session, event) => {
                     //   下次真机验收一眼看出「灌的是本次新检查点还是上一版」（用户 2026-11-02 实测追问的正是这点）。
                     let _cpId = "";
                     try {
-                      const _m = String(rehydrate.text || "").match(/压缩\s+([0-9a-f]{8})/i);
+                      const _m = String(rehydrate.text || "").match(/压缩\s+([0-9a-zA-Z-]{8})/);   // [P3 收尾] 兼容 p3t*/p3e* 合成 cid（此前 [0-9a-f] 恒不匹配 ⇒ 本次✓ 永不出现）
                       if (_m) _cpId = _m[1].toLowerCase();
                     } catch (eCp) { _cpId = ""; }
                     const _cmpId8 = String(compactionId || "").slice(0, 8).toLowerCase();
@@ -18798,6 +19608,16 @@ compatOn(ctx, "session/event", (session, event) => {
              // [4.5.2 P0 · C4' 守卫] 笔记主题不得作为 split **源**：splitTopic 会给源主题 append 拆分指针句 ⇒
              //   笔记最后一句不再是 note pointer（P0-1 会当未提炼重新处理）⇒ 直接拒绝。
              if (isNoteTopicName(rt.name)) return JSON.stringify({ ok: false, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "「" + String(rt.name) + "」是会话笔记主题：笔记正文 append-only，不能作为拆分源（只由插件收敛流程改写）" });
+              // [4.5.13 M'-5][防御性] P2.5 会话检查点主题不得作为 split **源**：splitTopic 会给源主题 append
+              //   一条拆分指针句 ⇒ 破坏「每会话恒 1 句」。真检查点单句 <9,000 字通常先撞 NOT_OVERSIZED，
+              //   但顺序不保证 ⇒ 这里提前拦，拒绝码与 dream_patch 一致（P25_SESSION_TOPIC）。
+              try {
+                const _spG = p25SessionTopicWriteGuard(store, rt.id);
+                if (_spG && _spG.blocked) return JSON.stringify({ ok: false, code: "P25_SESSION_TOPIC", message: "「" + String(rt.name) + "」是 P2.5 插件专用会话检查点主题（恒 1 句），只读、不能作为拆分源（写入由插件负责）" });
+                // [4.5.13 I'-7] 日记忆（D8）只读族同样不能作为 split 源（splitTopic 会给源 append 指针句）
+                const _spD = isDailyMemoryTopic(store, rt.id);
+                if (_spD && _spD.readonly) return JSON.stringify({ ok: false, code: "DAILY_MEMORY_READONLY", message: "「" + String(rt.name) + "」属于日记忆（D8）只读族（" + String(_spD.how === "parent" ? ("父线 " + String(_spD.parent || "")) : "名字形态") + "），按天流水由插件维护，不能作为拆分源" });
+              } catch (eSpG) { /* 守卫失败按放行（护栏绝不阻断正常写入） */ }
              if (st === "needs_review") { /* [2026-11-04 starry 裁决] 原实现在此硬拒（「人工裁决队列，dream 不得拆分」）⇒
                   但 needs_review 是**内容质量**判定（导入期 seed 按名字判近重复），超限是**容量**问题，两者正交；
                   真机实证 T-0436(93814/9000)、T-0481(47756/40000) 恰好两样都占 ⇒ 拆分被永久阻断、只能烂在队列里。
@@ -18914,6 +19734,16 @@ compatOn(ctx, "session/event", (session, event) => {
                if (String(dst.state || "") === "archived") return JSON.stringify({ ok: false, code: "BAD_TARGET", message: "目标主题已归档，不能并入" });
                // [4.5.2 P0 · C4' 守卫] merge 的 into 不得是笔记主题（appendSentence 会真写入笔记、bump writeCount）
                if (isNoteTopicName(dst.name)) return JSON.stringify({ ok: false, code: "NOTE_TOPIC_DREAM_FORBIDDEN", message: "into 不能是会话笔记主题「" + String(dst.name) + "」（append-only，只由插件收敛流程改写）" });
+                // [4.5.13 M'-5][CRA② V-8 实锤] merge 的 into 不得是 P2.5 会话检查点主题：否则 appendSentence
+                //   会把「恒 1 句」写成 2 句（不可自愈——下次压缩只覆盖第 1 句，第 2 句永久残留）。
+                //   在 append/归档任何副作用之前返回 ⇒ 整批不落盘。
+                try {
+                  const _rvG = p25SessionTopicWriteGuard(store, dstId);
+                  if (_rvG && _rvG.blocked) return JSON.stringify({ ok: false, code: "P25_SESSION_TOPIC", message: "into 不能是 P2.5 会话检查点主题「" + String(dst.name) + "」（每会话恒 1 句、由插件覆盖写入；dream 只读）" });
+                  // [4.5.13 I'-7] merge 的 into 不得是日记忆（D8）只读族（日期流水/线/域）
+                  const _rvD = isDailyMemoryTopic(store, dstId);
+                  if (_rvD && _rvD.readonly) return JSON.stringify({ ok: false, code: "DAILY_MEMORY_READONLY", message: "into 不能是日记忆（D8）只读族「" + String(dst.name) + "」（按天流水由插件维护；dream 只读）" });
+                } catch (eRvG) { /* 守卫失败按放行（护栏绝不阻断正常写入） */ }
                let dt = null;
                try { dt = store.readTopic(dstId); } catch (eD) { return JSON.stringify({ ok: false, code: "TARGET_NOT_FOUND", message: "目标主题读取失败：" + dstId }); }
                const dstSents = (dt && dt.sentences) || [];
@@ -20201,8 +21031,13 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
     DREAM_PATCH = dreamProgressPatch;
     // [task-54] 任务书构建：flag 关 ⇒ 原有 md 口径逐字不变；flag 开 ⇒ 库模式（不读任何导出视图 md）
     async function buildDreamPrompt(p) {
+      try { DREAM_TEST_HOOKS.promptBuildCount = (Number(DREAM_TEST_HOOKS.promptBuildCount) || 0) + 1; } catch (eC0) { /* 计数失败忽略 */ }
       const { lessonFeedText = '', calibStats = '', eCalibStats = '', wCalibStats = '', brkCalibStats = '', maintStats = '' } = p || {};
-      if (TOPICDB.enabled) return buildDreamPromptLibrary({ lessonFeedText: lessonFeedText, calibStats: calibStats, eCalibStats: eCalibStats, wCalibStats: wCalibStats, brkCalibStats: brkCalibStats, maintStats: maintStats });
+      if (TOPICDB.enabled) return buildDreamPromptLibrary({
+        lessonFeedText: lessonFeedText, calibStats: calibStats, eCalibStats: eCalibStats, wCalibStats: wCalibStats, brkCalibStats: brkCalibStats, maintStats: maintStats,
+        // [4.5.13 P0-4][M'-2] 空轮短路已取整库 rows / 未提炼统计 ⇒ 复用（store.topics() 每轮只调 1 次）
+        rows: (p && p.rows), noteStats: (p && p.noteStats),
+      });
       const stI = readIntegrateState() || {};
       const candI = listIntegrateCandidates(stI);
       // v2.4.33（空轮根治 B）：超限最近摘要强制入候选——hash 已记账（内容未变）但字符超硬预算的文件
@@ -20530,8 +21365,63 @@ lessonFeedText + "\n" +
           }
         }
       } catch (e) { /* 预计算失败按无候选处理 */ }
+      // ═══ [4.5.13 P0-4][CRA② M'-2] 空轮统一收尾（**唯一**一处空轮副作用实现，两处调用共用）═══
+      //   原实现只在 buildDreamPrompt **之后**判空轮（先付 1.6s 再丢）；P0-4 用廉价必要条件提前短路，
+      //   但必须复用同一块账本/转播/返回，不得另写 early-return（否则漏 lastIntegrateAt/lastFailAt ⇒ 2h 失败重试环）。
+      const _DREAM_EMPTY_SUMMARY = "空轮：无候选会话/无超限文件/无待沉淀条目/无待提炼笔记，记忆库已稳定，未发起子代理";
+      const _dreamEmptyRound = (why) => {
+        clog("[dsh-memory] dream 空轮跳过（" + String(why || "") + "）——不发起子代理");
+        try {
+          const stE = readIntegrateState() || {};
+          stE.lastIntegrateAt = Date.now();
+          delete stE.lastFailAt;
+          writeIntegrateState(stE);
+        } catch (eW) {}
+        DREAM_TRACK = null;
+        if (DREAM_PATCH) {
+          DREAM_PATCH({ status: "skipped", summary: _DREAM_EMPTY_SUMMARY, finishedAt: Date.now(), durMin: 0, tokens: null, health: "" });   // v2.4.35.1：空轮不走 settle→S3 清不到旧告警（实证 09-07 双重过期 health 挂面板），此处同清
+        }
+        DREAM_LISTENER = null;   // v2.5.1: 先转播（skipped 终态含唤醒）再摘监听——原序在 DREAM_PATCH 前清空导致空轮转播从未送达（伪转播缺陷之一）
+        return "skipped";   // v2.4.33：区分「空轮跳过」与「已发起」（/dream 命令据此回不同文案）
+      };
+      // ── [4.5.13 P0-4] 库模式空轮**短路**：先算廉价必要条件（_allRows 已取，~44–70ms），全空直接走空轮收尾 ──
+      //   ① 仅库模式（md 模式候选来自 listIntegrateCandidates/overChar，短路会把整条 md 路径弄死）；
+      //   ② [I'-2][CRA③ N-1] 超限判据必须**按本档上限**（main 9000 / detail 40000 / index 200000）：
+      //      审计实测旧算式 `chars>9000` 在真库恒真（136 个 chars>9000 的 detail/index 主题、真实超限 0）
+      //      ⇒ 短路永不触发、省时目标落空。档位用 topicDbLevelMap 一次 O(主题) 取（不 readTopic、不调
+      //      listOverLimitTopicsFromDb 1.33s）；**取档失败按「可能有活」保守分支**（绝不误跳）。
+      //   ③ rows / noteStats 传给 buildDreamPrompt 复用（store.topics() 每轮只调 1 次；快照另有 1 次既有调用）。
+      let _preRows = null;
+      let _preNoteStats = null;
+      if (TOPICDB.enabled && TOPICDB.ready && TOPICDB.store) {
+        try {
+          if (typeof TOPICDB.store.topics === "function") _preRows = TOPICDB.store.topics() || [];
+        } catch (ePR) { _preRows = null; }
+        if (Array.isArray(_preRows)) {
+          let _overPossible = true;   // 保守默认：可能有活
+          try {
+            const _lvPre = topicDbLevelMap(TOPICDB.store, _preRows);
+            if (_lvPre && typeof _lvPre.get === "function") {
+              _overPossible = false;
+              for (const _t of _preRows) {
+                if (!_t || String(_t.state || "") === "archived") continue;
+                const _nm = String(_t.name || "");
+                const _isIdx = INDEX_TOPIC_NAME_RE.test(_nm);
+                const _tier = _isIdx ? "index" : (_lvPre.get(_t.id) === "detail" ? "detail" : "main");
+                const _lim = _tier === "index" ? INDEX_TOPIC_CHAR_LIMIT : (_tier === "detail" ? DETAIL_TOPIC_CHAR_LIMIT : PROJECT_CHAR_HARD);
+                if (Number(_t.chars) > _lim) { _overPossible = true; break; }
+              }
+            }
+          } catch (eOP) { _overPossible = true; }   // 档位判定失败 ⇒ 按"可能有活"，绝不误跳
+          try { _preNoteStats = noteUnrefinedStats(TOPICDB.store, _preRows); } catch (eNP0) { _preNoteStats = { topics: 0, sentences: 0, total: 0, items: [] }; }
+          const _noteWorkPre = Number(_preNoteStats.topics) > 0 || Number(_preNoteStats.sentences) > 0;
+          if (!_overPossible && !_noteWorkPre && Number(lessonPickN) === 0) {
+            return _dreamEmptyRound("库模式预信号全空：无本档超限主题（main>9000 / detail>40000 / index>200000）/无待提炼笔记/无待沉淀 lesson");
+          }
+        }
+      }
       // v2.3.4(dream-hash): 候选清单注入——内容 hash 比对（账本无记录或内容变更才读；已整合且未变的自跳过）
-      const _dp = await buildDreamPrompt({ lessonFeedText: lessonFeedText, calibStats: calibStats, eCalibStats: eCalibStats, wCalibStats: wCalibStats, brkCalibStats: brkCalibStats, maintStats: maintStats });
+      const _dp = await buildDreamPrompt({ lessonFeedText: lessonFeedText, calibStats: calibStats, eCalibStats: eCalibStats, wCalibStats: wCalibStats, brkCalibStats: brkCalibStats, maintStats: maintStats, rows: _preRows, noteStats: _preNoteStats });
       const _libMode = _dp.libMode === true;
       const candI = _dp.candI;
       const overChar = _dp.overChar;
@@ -20548,28 +21438,21 @@ lessonFeedText + "\n" +
       //   性能：复用任务书构建时已取的 rows（buildDreamPromptLibrary 返回 noteRows），不新增全库扫描。
       let _notePending = { topics: 0, sentences: 0 };
       try {
-        const _stN = (TOPICDB.enabled && TOPICDB.ready) ? TOPICDB.store : null;
-        if (_stN) _notePending = noteUnrefinedStats(_stN, (Array.isArray(_dp.noteRows) ? _dp.noteRows : undefined));
+        // [4.5.13 P0-4] 任务书构建时已算过（预信号或 buildDreamPromptLibrary）⇒ 直接复用，不再重复 readTopic 扫笔记
+        if (_dp && _dp.noteStats && Array.isArray(_dp.noteStats.items)) _notePending = _dp.noteStats;
+        else {
+          const _stN = (TOPICDB.enabled && TOPICDB.ready) ? TOPICDB.store : null;
+          if (_stN) _notePending = noteUnrefinedStats(_stN, (Array.isArray(_dp.noteRows) ? _dp.noteRows : undefined));
+        }
       } catch (eNP) { _notePending = { topics: 0, sentences: 0 }; }
       const _noteHasWork = Number(_notePending.topics) > 0 || Number(_notePending.sentences) > 0;
       // v2.4.33（空轮根治 A）：无候选会话、无其他变动、无超限项目、无超限摘要、无待沉淀 → 本轮无事可做，
       //   **不 spawn 子代理**（省 token）：记 lastIntegrateAt + 清 lastFailAt 防 2h 死循环重试
       //   （实证 2026-09-07：空轮 0 落盘被 settle 判 doneOk=false → 置 lastFailAt → 转播「2 小时后自动重试」
       //   → 重试又空轮又置 → 永续空转）。空轮不是失败——是记忆库已稳定。
+      //   [4.5.13 P0-4] 副作用统一走 _dreamEmptyRound（与上方库模式短路复用同一块）。
       if (candI.sessionCands.length === 0 && candI.otherCands.length === 0 && (_libMode ? overTopics.length === 0 : overChar.length === 0) && lessonPickN === 0 && !_noteHasWork) {
-        clog("[dsh-memory] dream 空轮跳过（无候选会话/无超限文件/无待沉淀条目/无待提炼笔记；笔记 " + _notePending.topics + " 主题/" + _notePending.sentences + " 句）——不发起子代理");
-        try {
-          const stE = readIntegrateState() || {};
-          stE.lastIntegrateAt = Date.now();
-          delete stE.lastFailAt;
-          writeIntegrateState(stE);
-        } catch (eW) {}
-        DREAM_TRACK = null;
-        if (DREAM_PATCH) {
-          DREAM_PATCH({ status: "skipped", summary: "空轮：无候选会话/无超限文件/无待沉淀条目/无待提炼笔记，记忆库已稳定，未发起子代理", finishedAt: Date.now(), durMin: 0, tokens: null, health: "" });   // v2.4.35.1：空轮不走 settle→S3 清不到旧告警（实证 09-07 双重过期 health 挂面板），此处同清
-        }
-        DREAM_LISTENER = null;   // v2.5.1: 先转播（skipped 终态含唤醒）再摘监听——原序在 DREAM_PATCH 前清空导致空轮转播从未送达（伪转播缺陷之一）
-        return "skipped";   // v2.4.33：区分「空轮跳过」与「已发起」（/dream 命令据此回不同文案）
+        return _dreamEmptyRound("无候选会话/无超限文件/无待沉淀条目/无待提炼笔记；笔记 " + _notePending.topics + " 主题/" + _notePending.sentences + " 句");
       }
       const startedAt = Date.now();
       // [4.5.2 P1-2] 笔记收敛：spawn 前快照（快照先行）——只删快照内且 sha 匹配的句，快照后主 agent 新写的 note 必然幸存。
@@ -20596,7 +21479,7 @@ lessonFeedText + "\n" +
       try {
         _drmCtrl = new AbortController();
         const run = await startSubagentCompat(subagents, {   // v3.2.1：兼容 0.1.x/0.2.x
-          label: "dsh-memory-自动整合-" + reason,
+          label: subagentLabelWithTarget("dsh-memory-自动整合-" + reason, agentSessionIdOf(parent)),   // [4.5.10] 带触发会话 sid，防挂父会话名下误读
           prompt: [{ type: "text", text: promptText }],
           parent: parent,
           signal: _drmCtrl.signal,
@@ -21192,17 +22075,17 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       try {
         const sid = String((session && session.id) || "");
         if (!sid || !agent) return;
-        const sid8 = sid.slice(0, 8);
+        const sid8 = sid8Of(sid);   // [4.5.11 CRA M10] 修复前 sid.slice(0,8) 恒 "session-" ⇒ cid 跨会话仅靠毫秒区分
         const fname = dateStr(new Date()) + ".md";
         // 合成 compactionId：档位 + sid8 + 毫秒（同一次触发只写一次；G3 重试队列也认这个 id）
-        const cid = "p3t" + level + "-" + sid8 + "-" + Date.now().toString(36);
+        const cid = p3ThresholdCid(level, sid, Date.now());   // [4.5.11 CRA MF10/D-2] 纯函数，门可测
         let input = "";
         try { input = buildIntentInput(session, ""); } catch (eB) { input = ""; }
         if (!input || input.length < 80) {
           try { const st0 = p3SessionState(sid); if (st0) st0.fired = (st0.fired || []).filter((x) => x !== level); } catch (eR0) {}
           return;
         }
-        Promise.resolve(spawnIntentCheckpoint(cid, input, fname, agent, sid, { trigger: "T" + level })).then((res) => {
+        Promise.resolve(spawnIntentCheckpoint(cid, input, fname, agent, sid, { trigger: "T" + level, cwd: cwdFromAgent(agent) || cwdFromAgent({ session: session }) })).then((res) => {
           const ok = !!(res && res.ok);
           p3CostBump("checkpointWrite",
             { n: ok ? 1 : 0, inChars: input.length, estTokens: p3Cost.estTokens(input.length), ok: ok ? 1 : 0, fail: ok ? 0 : 1 },
@@ -21222,45 +22105,88 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       }
     }
 
-    /** T5：主会话空闲 ≥30 分钟且本会话还没写过检查点 ⇒ 补写一次（每会话只补一次）。 */
+    /** T5：主会话空闲 ≥30 分钟且本会话还没写过检查点 ⇒ 补写一次（每会话只补一次）。
+     *  [4.5.10 T5 修复] ①归档会话跳过（CRA M1，用循环内 sid 判定）；②cid 每会话唯一（M3）；
+     *  ③queued/dup/ok 三态记账（M4）；④endFiredAt 崩溃自愈（M5）；⑤单轮上限 3（M6）；⑥跳过日志每 tick 汇总（M7）。 */
     function p3SessionEndSweep(now) {
       let fired = 0;
+      let archivedSkipped = 0;
+      let tooOldSkipped = 0;
+      let healed = 0;
+      let cooling = 0;
       try {
+        // [CRA M1/D-5] 本轮先强制刷新归档清单一次（30s 缓存窗口会让刚归档的会话漏过；读失败由 M2 保留旧缓存）
+        try { readArchivedSessionIds({ force: true }); } catch (eF) {}
         for (const [sid, ag] of agentsBySession) {
           try {
+            // [CRA M1/R10] 归档判定用循环内 sid（agentsBySession 键 = agent.session.id），且放在建状态条目之前
+            const isArch = (() => { try { return readArchivedSessionIds().has(sessionIdKey(sid)); } catch (eA) { return false; } })();
+            if (isArch) { archivedSkipped += 1; continue; }
             const st = p3SessionState(sid);
-            if (!st || st.endFired) continue;
+            if (!st) continue;
+            if (st.endFired) {
+              // [CRA M5] 崩溃窗口自愈：endFired 已持久化，子代理跑完前退出 ⇒ 重启后永久不再补写
+              if (p3T5ShouldHealEndFired(st, now)) { st.endFired = false; st.endFiredAt = 0; healed += 1; }
+              else continue;
+            }
             const isSub = !!(ag && ag.session && ag.session.header && ag.session.header.origin === "subagent");
+            // [P3 收尾] 连续失败冷却：同一会话 ≥T5_MAX_FAILS 次失败后，冷却窗内不再发起（防每小时重复烧子代理）
+            if ((Number(st.t5Fails) || 0) >= T5_MAX_FAILS && now - (Number(st.t5FailAt) || 0) < T5_FAIL_COOLDOWN_MS) { cooling += 1; continue; }
             const dec = p3Triggers.decideSessionEnd({
               lastActivityAt: st.lastActivityAt || 0,
               now: now,
               idleMs: p3Triggers.DEFAULT_IDLE_MS,
               isSubagent: isSub,
-              hasCheckpoint: !!st.checkpointAt,
+              hasCheckpoint: !!st.checkpointAt || p3T5PendingActive(st, now),   // [4.5.11 CRA M9] 成功标记 ∨ 未过期在途（TTL 60min）
+              maxIdleMs: p3Triggers.DEFAULT_MAX_AGE_DAYS * 86400000,   // [CRA D-3] 7 天软窗：远古会话不补写
             });
-            if (!dec || !dec.fire) continue;
+            if (!dec || !dec.fire) {
+              if (dec && dec.reason === "too-old") tooOldSkipped += 1;
+              continue;
+            }
+            // [CRA M6/D-2 + S-d] 单轮上限：放在计数之后、发起之前（archived/too-old 计数保持完整；超限下轮再补）
+            if (fired >= T5_MAX_PER_SWEEP) continue;
             st.endFired = true;   // 先占位防同轮重复；失败再复位
+            st.endFiredAt = now;  // [CRA M5]
             const fname = dateStr(new Date()) + ".md";
-            const cid = "p3e-" + sid.slice(0, 8) + "-" + now.toString(36);
+            const cid = p3SessionEndCid(sid, now);   // [CRA M3] 每会话唯一（修复前恒为 p3e-session-…）
             let input = "";
             try { input = buildIntentInput(ag.session, ""); } catch (eB) { input = ""; }
-            if (!input || input.length < 80) { st.endFired = false; continue; }
+            if (!input || input.length < 80) { st.endFired = false; st.endFiredAt = 0; continue; }
             fired += 1;
-            Promise.resolve(spawnIntentCheckpoint(cid, input, fname, ag, sid, { trigger: "T5" })).then((res) => {
-              const ok = !!(res && res.ok);
-              p3CostBump("checkpointWrite",
-                { n: ok ? 1 : 0, inChars: input.length, estTokens: p3Cost.estTokens(input.length), ok: ok ? 1 : 0, fail: ok ? 0 : 1 },
-                { sid: sid, trigger: "T5", ok: ok ? 1 : 0, note: "session-end" });
+            Promise.resolve(spawnIntentCheckpoint(cid, input, fname, ag, sid, { trigger: "T5", cwd: cwdFromAgent(ag) })).then((res) => {
+              const rec = p3T5OutcomeRecord(res);   // [CRA MF5] 记账规则抽纯函数（门行为断言）
+              // [P3 收尾] 失败不在这里重复记：intentRetryFail 已记 I-fail fail:1（此前 T5 失败被计两次）
+              if (rec.ok || rec.dup || rec.queued) {
+                p3CostBump("checkpointWrite",
+                  { n: rec.n, inChars: input.length, estTokens: p3Cost.estTokens(input.length), ok: rec.okFlag, fail: 0 },
+                  { sid: sid, trigger: "T5", ok: rec.okFlag, note: rec.note });
+              }
               try {
                 const s2 = p3SessionState(sid);
                 if (s2) {
-                  if (ok) { s2.checkpointAt = Date.now(); s2.lastFireAt = Date.now(); }
-                  else s2.endFired = false;
+                  if (rec.ok || rec.dup) { s2.checkpointAt = Date.now(); s2.lastFireAt = Date.now(); s2.t5Fails = 0; s2.t5FailAt = 0; }
+                  else if (rec.queued) { /* [CRA D-4] 已交办队列：endFired 保持 true、不置 checkpointAt，交给队列补火（成功由 MF2 回填） */ }
+                  else {
+                    s2.endFired = false; s2.endFiredAt = 0;
+                    // [P3 收尾] 连续失败计数：≥T5_MAX_FAILS 次后在冷却窗内不再发起（防每小时重复烧子代理）
+                    s2.t5Fails = (Number(s2.t5Fails) || 0) + 1;
+                    s2.t5FailAt = Date.now();
+                    // [CRA G12/D-4] 单通道：T5 失败由下一 tick sweep 重试；清掉重试队列条目
+                    //   （该通道 fireIntentRetry 的 parentAgent 是触发者、会写错工作区线 —— 见审计 M11/F5）
+                    try { intentRetryClear(cid); } catch (eRc) {}
+                  }
                 }
               } catch (eC) {}
-            }).catch(() => { try { const s3 = p3SessionState(sid); if (s3) s3.endFired = false; } catch (eR) {} });
+            }).catch(() => {
+              try { const s3 = p3SessionState(sid); if (s3) { s3.endFired = false; s3.endFiredAt = 0; s3.t5Fails = (Number(s3.t5Fails) || 0) + 1; s3.t5FailAt = Date.now(); } } catch (eR) {}
+              try { intentRetryClear(cid); } catch (eRc2) {}   // [CRA S-c] 异常路径同样清重试队列
+            });
           } catch (eS) { /* 单会话失败不影响其他 */ }
         }
+        // [CRA M7] 归档/过期/自愈只记汇总一条（按会话逐条会冲掉 events 环里的诊断事件）
+        const _skipLog = p3T5SkipLog({ archived: archivedSkipped, tooOld: tooOldSkipped, healed: healed, cooling: cooling });
+        if (_skipLog) { try { monitorEvent("p3", _skipLog); } catch (eM) {} }
         if (fired > 0) { try { clog("[dsh-memory] [P3-1 T5] 会话收尾补写发起 " + fired + " 个"); } catch (eL) {} }
       } catch (e) {
         try { monitorEvent("p3", "end-sweep-throw " + ((e && e.message) || String(e))); } catch (e2) {}
@@ -21901,6 +22827,8 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       P4_TEST_HOOKS.budgets = Object.assign({}, POST_COMPACT_REHYDRATE_BUDGET);
       P4_TEST_HOOKS.compactOnce = compactOnce;
       P4_TEST_HOOKS.startSubagentCompat = startSubagentCompat;
+      P4_TEST_HOOKS.subagentLabelWithTarget = subagentLabelWithTarget;   // [4.5.10] 门：所有记忆插件子代理 label 必须带目标 sid
+      P4_TEST_HOOKS.sid8Of = sid8Of;
       P4_TEST_HOOKS.getWriterPreset = () => String(PLUGIN_CFG.writerPreset || "");
       // [4.5.2][note-compact] 笔记收敛测试钩子（模块级纯函数引用 + 内部状态探针）
       NOTE_TEST_HOOKS.isNotePointerText = isNotePointerText;

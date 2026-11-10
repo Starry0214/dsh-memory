@@ -4,6 +4,45 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.5.13（2026-11-10）：**dream 预筛 + 检查点证据 + 日记忆只读**
+
+> 审计①~④（CRA）驱动：原「note→关联主题」方案被驳回两次后重写为「内存打分预筛」；
+> 实现复核又抓出 3 个实质问题（P0-4 空轮短路真库不生效、关联质量不达标、已跟踪门被签名漂移打红）并修复。
+
+### 新增
+
+- **A1 预筛**：`dreamPrescreenNoteLinks` 纯内存打分（词典=主题名+effectiveTriggers、df 上限、同工作区线加权、token ≤48 按权重、命中硬上限 100），每 note ≤3 关联、摘要 ≤80、摘录单句 200×≤2/≤400；任务书新块「Note → 关联主题（线索不是结论）」；`dreamPrescreen` flag（默认 true，可热更新）。
+- **A2 检查点证据**：真检查点（名字+父线双条件）≤4、两节各 ≤90 字、缺节降级、总 ≤1,200、只读标注；任务书新块「检查点证据（只读）」。
+- **日记忆只读（用户 2026-11-10 追加）**：D8 域/线/日期主题/P2.5 会话主题对 dream 只读——候选池/A1/A2 排除；`applyPatches`（topic+file）、`applyDreamPatchesToDb`、`split 源`、`review merge into`、`rename` 五处护栏统一 `DAILY_MEMORY_READONLY` **整批拒绝**。
+- **P0-4 空轮短路**：仅库模式、按本档上限的廉价必要条件（main>9000/detail>40000/index>200000，取档失败保守），复用统一空轮收尾；真库「无活」实测 89ms（改前 ~2.0s）。
+- **P0-2**：`overTopics` 源头排除笔记（渲染/空轮/健康记账三处同口径）。
+
+### 修复
+
+- I'-1：`test/_dream-review-tool-selftest.mjs` 适配 `listReviewQueueFromDb(store,maxN,rowsOpt)` 签名（39/39）；review/split/empty-note/prescreen/daily 五门登记进 `TEST_DIR_GATES`。
+- I'-3 质量门（命中 ≤100 / top-1 基线）、I'-4 预算耗尽语义（MIN_VIABLE=1100 + `budget=exhausted/droppedBudget`）、I'-6 摘录严格 ≤400、I'-5 新门入库。
+
+### 门
+
+`test/_test-dream-prescreen.mjs` 110/0、`test/_test-daily-readonly.mjs` 35/0、review 39/39、dream-cand 22/22、m9m11 61/0、t5 46/0、p25 47/0/2、accept-p4 98/0；md 任务书逐字不变；flag 关基线重定为 `06b8b17649c29e6a`（因候选池排除 D8，属安全修复、不在 flag 后）。
+
+## v4.5.12（2026-11-10）：**P0-0 修复 —— 会话笔记提炼块恢复**
+
+> 审计②（CRA，2026-11-10）发现的既有 P0：`buildDreamPromptLibrary` 里 `_noteDistilled` 声明在候选
+> `try` 块内、笔记块在块外使用 ⇒ 每次抛 `ReferenceError` 被 `catch` 静默吞掉，**「会话笔记提炼」块自
+> v4.5.2 起从未进入运行中任务书**（笔记收敛哨兵 `DSH_MEMORY_COMPACT_JSON` 的指令实际从未下发）。
+
+### 变更
+
+- `_noteDistilled` 判据提升到 `buildDreamPromptLibrary` 函数作用域（删除 try 内重复声明）；
+- 任务书恢复「会话笔记提炼」块（含七类映射 + 哨兵收敛 JSON 说明）；真库副本实测任务书 4,110 → **5,844 字**（笔记块 ≈1,734）；
+- 无其他行为改动；md 模式逐字不变。
+
+### 验证
+
+- 最小夹具：`buildPrompt()` 含「会话笔记提炼」+ `DSH_MEMORY_COMPACT_JSON`；
+- 真库副本（审计②）：`prompt_has_note_block=true`，未提炼笔记 12 主题/116 句重新可见。
+
 ## v4.5.2（2026-11-06）：**会话笔记收敛（清空 + 指针）** + 未提炼统计
 
 > 4.5.1 之后的核心改造：笔记主题此前 append-only、dream 提炼后只追加一句「已提炼 → T-xxxx」，

@@ -176,6 +176,49 @@ ok(candIds.length === 20, "D 候选上限 20", "实际 " + candIds.length);
   ok(!/filter\(\(t\) => String\(t\.state \|\| ""\) !== "archived"\)\.slice\(0, 20\);/.test(seg), "F 静态接线：旧的「filter 直接 slice」已移除", "");
 }
 
+// ── P0-0 回归门（2026-11-10）──────────────────────────────────────────────
+// 会话笔记提炼块只在存在未提炼笔记时渲染 ⇒ 候选断言跑完后再造 note，避免改变候选期望。
+{
+  let noteId = null;
+  try {
+    const nr = store.createTopic({ name: "笔记·selftest/abcd1234", actor: "runtime", confirm: true });
+    noteId = nr && nr.id;
+    if (noteId) store.appendSentence({ topic: noteId, text: "P0-0 门：未提炼笔记句", actor: "runtime" });
+  } catch (e) { noteId = null; }
+  ok(!!noteId, "前置：建未提炼笔记主题", String(noteId || "失败"));
+  const dp2 = noteId ? await mod.__dreamHooks.buildPrompt() : null;
+  const pt2 = (dp2 && dp2.promptText) || "";
+  // 负例：4.5.12 修前（_noteDistilled 作用域 ReferenceError 被静默吞掉）任务书无此块 ⇒ 必 FAIL。
+  ok(pt2.includes("会话笔记提炼"), "P0-0 任务书含「会话笔记提炼」块（修前必 FAIL）");
+  ok(pt2.includes("DSH_MEMORY_COMPACT_JSON"), "P0-0 任务书含笔记收敛哨兵说明");
+}
+
+// ── [4.5.13 Part A] G1 + G4 回归门（与本仓根 `_test-dream-prescreen.mjs` 互补：
+//   本门在「30 主题 + 1 笔记」fixture 上复查「预筛零 markHit / 双预算 / flag 关不插块」）──
+{
+  const hitSnap = () => store.topics().map((t) => String(t.id) + "=" + String(t.lastHitAt == null ? "" : t.lastHitAt)).join("|");
+  const hb = hitSnap();
+  const dpA = await mod.__dreamHooks.buildPrompt({});
+  const ptA = (dpA && dpA.promptText) || "";
+  const ha = hitSnap();
+  ok(hb === ha, "G1 预筛零 markHit：buildPrompt 前后 lastHitAt 逐条相等", "changed=" + (hb !== ha));
+  ok(!!ptA && ptA.includes("## Note → 关联主题（插件预筛 · 线索不是结论）"), "A1 任务书含预筛块头");
+  const psC = (dpA && dpA.prescreen && dpA.prescreen.chars) || 0;
+  ok(psC > 0 && psC <= 4600, "G4a 预筛块 ≤4,600 字", "chars=" + psC);
+  ok(ptA.length <= 10500, "G4c 任务书总 ≤10,500 字", "len=" + ptA.length);
+  ok(!/Expression tree is too large/.test(ptA), "G4d 不出现 Expression tree is too large");
+  try {
+    mod.__dreamHooks.setCfg({ dreamPrescreen: false });
+    const dpB = await mod.__dreamHooks.buildPrompt({});
+    const ptB = (dpB && dpB.promptText) || "";
+    ok(!ptB.includes("## Note → 关联主题") && !ptB.includes("## 检查点证据"), "G4e flag 关 ⇒ 两个新块都不插");
+    ok(ptB.length < ptA.length, "G4f flag 关 ⇒ 任务书变短（块确实被移除）", ptA.length + "→" + ptB.length);
+    mod.__dreamHooks.setCfg({ dreamPrescreen: true });
+  } catch (e) {
+    ok(false, "G4e flag 关（__dreamHooks.setCfg）", String((e && e.message) || e));
+  }
+}
+
 // ── 收尾 ──
 console.log("\n" + (fails.length === 0 ? "全部通过 " + pass + "/" + pass : pass + " PASS / " + fails.length + " FAIL"));
 if (fails.length) console.log("FAIL 清单：\n- " + fails.join("\n- "));

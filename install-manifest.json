@@ -1,6 +1,6 @@
 {
-  "version": "4.5.9",
-  "generatedAt": "2026-11-09T02:24:06.842Z",
+  "version": "4.5.13",
+  "generatedAt": "2026-11-10T07:35:03.431Z",
   "files": [
     {
       "path": "AGENTS.template.md",
@@ -24,8 +24,8 @@
     },
     {
       "path": "index.js",
-      "bytes": 1570943,
-      "sha256": "a730394d743a678b33ebd8e839abda9f7655b3bbd57bdfdc49dd64c4453bcbde"
+      "bytes": 1638980,
+      "sha256": "65782fc30b020e429548a8cad2392a558fb287b9d2ef6a45242efe2643b36110"
     },
     {
       "path": "memtopic/src/backend-ledger.mjs",
@@ -93,9 +93,29 @@
       "sha256": "d01521f15be5d014f350cee2161d7c8b49919991f5820af02c81cfe115c6fb70"
     },
     {
+      "path": "p25-topics.js",
+      "bytes": 36790,
+      "sha256": "6920e6ddc90161d2ebfaf30a57b373ea0046d0c382ad09ebb30e8ec0e880903d"
+    },
+    {
+      "path": "p3-cost.js",
+      "bytes": 19635,
+      "sha256": "3bec04f53c8dbbca76d432fefaef0fdc4a97ed6a73360a68bf9fe17c77c1cbbc"
+    },
+    {
+      "path": "p3-readside.js",
+      "bytes": 18538,
+      "sha256": "4fc58c843f27559ac9e2cc3f4a5749ccda0a89f6bb31421d0cf261cf58d164d7"
+    },
+    {
+      "path": "p3-triggers.js",
+      "bytes": 12323,
+      "sha256": "8423c5e1a4ce61c578e06129bd4defd436198a74bac8ac7843ba83d8182f85cd"
+    },
+    {
       "path": "package.json",
-      "bytes": 651,
-      "sha256": "052a9bb6c969e68d295b662c3d8e25770fd4e01d88ba4ce37d9f626a6ceb9f30"
+      "bytes": 628,
+      "sha256": "da65126cca7dd915ef3b4f771e610fe50baaf4cc0967a2b3a72b274eb815d259"
     },
     {
       "path": "tools/session-search.mjs",
@@ -105,13 +125,13 @@
     },
     {
       "path": "version.txt",
-      "bytes": 5,
-      "sha256": "a19acf22d3f44757b620a2daf0253f18597cb58e2a8db312657af1e82a57c625"
+      "bytes": 6,
+      "sha256": "75d62ddcb8f35daab9df205a18ea30f8b74c04417bf6ca3edc4141637abead5f"
     }
   ],
   "zip": {
-    "name": "dsh-memory-4.5.9.zip",
-    "bytes": 783094,
-    "sha256": "090a3af023a52744d191764eed86557a33c567e50f378cb0971711e9c857f74e"
+    "name": "dsh-memory-4.5.13.zip",
+    "bytes": 838247,
+    "sha256": "b978a666c157c18251f7b065edf5c5d9c92c0a1653f24fdba142a91d5e9d72cf"
   }
 }

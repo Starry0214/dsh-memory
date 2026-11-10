@@ -118,7 +118,7 @@ DeepSeek 前缀缓存命中 **0.1 元/百万 tokens**，未命中 **1 元**—�
 
 ### 8️⃣ 看得见：设置页 / 统计面板 / 知识图谱
 
-- **设置 → 通用设置 → 记忆**：开关、阈值、用量、**子代理摘要回溯天数**
+- **设置 → 通用设置 → 记忆**：开关、阈值、用量（`staleSessionDays` 自 4.5.7 起已弃用，仅为兼容旧配置保留）
 - **统计面板** `http://127.0.0.1:<端口>/dsh-memory/stats`：主题/句子规模、状态分布、TOP 命中、近 30 天事件量、熔断与告警计数
 - **知识图谱**（统计面板内页签）：三级树 + 触发词/来源边，可交互缩放搜索；节点带 `kind`（笔记 / 检查点 / 普通主题**三色区分**）；数据接口 `/dsh-memory/graph.json`
 
@@ -201,7 +201,7 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 | `/memory-migrate` | 老记忆迁移报告；`--apply` 执行 |
 | `/memory-init` | 重走记忆初始化引导 |
 | `/memory-update` | 检查插件新版本 |
-| `/subagents-archive` | **已下线（4.5）**：子代理摘要通道退役，只回一条提示；查子代理会话用 `session_search` |
+| `/subagents-archive` | **已下线（4.5）**：子代理摘要通道退役（4.5.7 代码已删），只回一条提示；查子代理会话用 `session_search`（按时间列举用 `session_search({ list: true })`） |
 
 ### 工具（12 个，另有 2 个 dream 专用）
 
@@ -237,7 +237,7 @@ curl -fsSL https://raw.githubusercontent.com/Starry0214/dsh-memory/main/install.
 
 **主题超限了怎么办？** 见「容量三档治理」的 `split-oversized.mjs`；明细/索引类提示可以忽略（它们本来就不该被反复催）。
 
-**升级 4.5 后工具/命令变了？** `memory_archive_checkpoint`、`stale_archive` 已随漏网归档链删除；`/subagents-archive` 只回一条下线提示（查子代理会话用 `session_search`）；新增 `memory_note`。**数据不需要迁移**，详见[迁移指南第 6 节](docs/迁移指南.md)。
+**升级 4.5 后工具/命令变了？** `memory_archive_checkpoint`、`stale_archive` 已随漏网归档链删除；`/subagents-archive` 只回一条下线提示（查子代理会话用 `session_search`，按时间列举用 `session_search({ list: true })`）；新增 `memory_note`。**数据不需要迁移**，详见[迁移指南第 6 节](docs/迁移指南.md)。
 
 **装了但没生效 / 工具没出现**
 
@@ -273,7 +273,7 @@ irm https://raw.githubusercontent.com/Starry0214/dsh-memory/main/fix-cordis-patc
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `staleSessionDays` | `5` | **子代理摘要回溯天数**（4.5 起面板改名；不再是「漏网会话」检测阈值，漏网归档链已删除） |
+| `staleSessionDays` | `5` | **已弃用（4.5.7）**：子代理摘要通道代码已删除，无任何功能读取；仅为兼容旧配置保留（面板控件仍在，改它没有效果） |
 | `staleAction` | `remind` | **已废弃（4.5）**：面板控件已删除、无行为分支；仅为兼容旧配置保留，改它没有效果 |
 | `integrateEnabled` | `false` | 是否开启定期自动整合（默认手动 `/dream`） |
 | `monitorEnabled` | `true` | 使用监控（提醒/检索统计） |
