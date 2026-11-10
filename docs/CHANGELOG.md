@@ -4,6 +4,19 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.5.14（2026-11-10）：**3D 图谱 vendor 自包含（安装版可用）**
+
+> 修复一个从 3D 图谱上线起就存在的安装缺口：`/dsh-memory/vendor/*` 路由只读 `~/.dsh/memory/vendor/`，
+> 而 payload/install.ps1 从不分发这三个第三方库 ⇒ 全新安装的机器上 3D 图谱页签必 404（仅本机因手工放置可用）。
+
+### 变更
+
+- `topicDbVendorHttpHandler`：vendor 文件**优先插件目录 `vendor/`**（payload 随插件分发），回退 `~/.dsh/memory/vendor/`（历史手工放置）；两处都缺 ⇒ 404（面板退化列表视图）。
+- `tools/sync-payload.mjs`：打包 `vendor/*.js`（3 个文件：3d-force-graph.min.js / three.module.js / three.core.js）。
+- 删除 `vendor/3d-force-graph.min.js.cdn`（重复副本，无引用）。
+- `.gitignore` 增加 `_verify/suite-*.txt`（套件运行证据为生成物；汇总见 `docs/门套件结果.md`）。
+- `vendor/` 三个文件入库（仓库自包含、可复现 payload）。
+
 ## v4.5.13（2026-11-10）：**dream 预筛 + 检查点证据 + 日记忆只读**
 
 > 审计①~④（CRA）驱动：原「note→关联主题」方案被驳回两次后重写为「内存打分预筛」；

@@ -37,6 +37,9 @@ const MODULES = [
 // [4.5.12] 版本元数据也必须随部署同步：memory_onboard 自检读部署目录的 version.txt/package.json，
 //   只换 index.js 会导致「版本/模板一致」门 FAIL（index=4.5.12 而 version.txt=4.5.11）。
 const VERSION_FILES = ["version.txt", "package.json"];
+// [4.5.14] 3D 图谱 vendor 也随部署同步：路由优先插件目录 vendor/（安装版由 payload 携带），
+//   本机开发部署也保持一致，避免只靠 ~/.dsh/memory/vendor 的历史手工副本。
+const VENDOR_FILES = ["vendor/3d-force-graph.min.js", "vendor/three.module.js", "vendor/three.core.js"];
 
 function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex").toUpperCase();
@@ -47,8 +50,8 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-const files = ["index.js", ...MODULES, ...VERSION_FILES].filter((f) => fs.existsSync(path.join(DEV, f)));
-const missing = ["index.js", ...MODULES, ...VERSION_FILES].filter((f) => !fs.existsSync(path.join(DEV, f)));
+const files = ["index.js", ...MODULES, ...VERSION_FILES, ...VENDOR_FILES].filter((f) => fs.existsSync(path.join(DEV, f)));
+const missing = ["index.js", ...MODULES, ...VERSION_FILES, ...VENDOR_FILES].filter((f) => !fs.existsSync(path.join(DEV, f)));
 
 console.log(`=== P3 部署${APPLY ? "" : "（dry-run）"} ===`);
 console.log(`源目录: ${DEV}`);
@@ -58,7 +61,7 @@ if (missing.length) console.log(`⚠ 缺失（将跳过）：${missing.join(", "
 // 1) 语法检查
 let syntaxOk = true;
 for (const f of files) {
-  if (!f.endsWith(".js")) continue;
+  if (!f.endsWith(".js") || f.startsWith("vendor/")) continue;   // vendor = 第三方压缩库，跳过语法检查
   try {
     execFileSync(process.execPath, ["--check", path.join(DEV, f)], { stdio: "pipe" });
     console.log(`  [OK] node --check ${f}`);

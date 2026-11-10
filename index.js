@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.13";
+const PLUGIN_VERSION = "4.5.14";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -11281,8 +11281,18 @@ function topicDbVendorHttpHandler(req, res) {
     const raw = String((req && req.url) || "");
     const rel = TOPICDB_VENDOR_FILES[raw.split("?")[0]];
     if (!rel) { res.statusCode = 404; res.end("not found"); return; }
-    const file = path.join(MEMORY_ROOT, "vendor", rel);
-    const buf = fs.readFileSync(file);
+    // [4.5.14] vendor 自包含：优先插件目录（payload 安装时随插件分发，安装版图谱可用），
+    //   回退 ~/.dsh/memory/vendor（历史手工放置/旧安装）。两处都缺 ⇒ 404（面板退化列表视图）。
+    const candidates = [
+      path.join(MIGRATE_PLUGIN_DIR, "vendor", rel),
+      path.join(MEMORY_ROOT, "vendor", rel),
+    ];
+    let buf = null;
+    let file = "";
+    for (const c of candidates) {
+      try { buf = fs.readFileSync(c); file = c; break; } catch (e) { /* 试下一个 */ }
+    }
+    if (!buf) { res.statusCode = 404; res.end("not found"); return; }
     res.setHeader("content-type", "application/javascript; charset=utf-8");
     res.setHeader("cache-control", "public, max-age=86400");
     res.end(buf);

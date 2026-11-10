@@ -51,3 +51,6 @@ docs/*.csv
 docs/事故-*.md
 docs/冻结清单-*.md
 docs/变体矩阵-*.md
+
+# 套件运行证据（生成物；汇总见 docs/门套件结果.md）
+_verify/suite-*.txt

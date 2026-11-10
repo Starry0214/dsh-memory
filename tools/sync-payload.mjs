@@ -113,8 +113,15 @@ function collect() {
   }
   walk(ROOT, 'client', files);
   walk(ROOT, 'memtopic/src', files);
-  // 只打 .mjs 运行时模块（spec/、.run/、*.json 不随 payload 分发）
-  const filtered = files.filter((rel) => (rel.startsWith('memtopic/src/') ? rel.endsWith('.mjs') : true));
+  // [4.5.14] 3D 图谱第三方库随 payload 分发：路由优先插件目录 vendor/，安装版图谱才能加载
+  //   （历史只在 ~/.dsh/memory/vendor 手工放置，全新安装会 404）。
+  walk(ROOT, 'vendor', files);
+  // 只打 .mjs 运行时模块（spec/、.run/、*.json 不随 payload 分发）；vendor 只保留 .js 实体
+  const filtered = files.filter((rel) => {
+    if (rel.startsWith('memtopic/src/')) return rel.endsWith('.mjs');
+    if (rel.startsWith('vendor/')) return rel.endsWith('.js');
+    return true;
+  });
   filtered.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   return filtered;
 }

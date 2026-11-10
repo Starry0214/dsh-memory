@@ -1,6 +1,6 @@
 {
-  "version": "4.5.13",
-  "generatedAt": "2026-11-10T07:35:03.431Z",
+  "version": "4.5.14",
+  "generatedAt": "2026-11-10T09:15:59.706Z",
   "files": [
     {
       "path": "AGENTS.template.md",
@@ -24,8 +24,8 @@
     },
     {
       "path": "index.js",
-      "bytes": 1638980,
-      "sha256": "65782fc30b020e429548a8cad2392a558fb287b9d2ef6a45242efe2643b36110"
+      "bytes": 1639499,
+      "sha256": "4d769d94fca556b33343773e3544c41ec05b82c6f730733f2f0872b712d55800"
     },
     {
       "path": "memtopic/src/backend-ledger.mjs",
@@ -115,7 +115,7 @@
     {
       "path": "package.json",
       "bytes": 628,
-      "sha256": "da65126cca7dd915ef3b4f771e610fe50baaf4cc0967a2b3a72b274eb815d259"
+      "sha256": "738f7153fb5d25308b42eb57c4d96c8b9157e9bb2dbce6d175c23bd530d6dd70"
     },
     {
       "path": "tools/session-search.mjs",
@@ -124,14 +124,29 @@
       "version": "5.0.0"
     },
     {
+      "path": "vendor/3d-force-graph.min.js",
+      "bytes": 1389954,
+      "sha256": "13088340aad408156064fd120c3bc3a47c93a3cc45b8f132d6284b20e2223be9"
+    },
+    {
+      "path": "vendor/three.core.js",
+      "bytes": 1403455,
+      "sha256": "eb077d2417f61d3e6d9264c317cabc4ea35769ed6b0ab533067292a550784c20"
+    },
+    {
+      "path": "vendor/three.module.js",
+      "bytes": 603113,
+      "sha256": "c8211c69345d2e9949dc7a8ac969380497aa0600a5a8ac6a459c8cd02dd9cb8a"
+    },
+    {
       "path": "version.txt",
       "bytes": 6,
-      "sha256": "75d62ddcb8f35daab9df205a18ea30f8b74c04417bf6ca3edc4141637abead5f"
+      "sha256": "0341387a2f6d9cacc477bd57851342ace74d0724f1a217a7e85580a2c5520926"
     }
   ],
   "zip": {
-    "name": "dsh-memory-4.5.13.zip",
-    "bytes": 838247,
-    "sha256": "b978a666c157c18251f7b065edf5c5d9c92c0a1653f24fdba142a91d5e9d72cf"
+    "name": "dsh-memory-4.5.14.zip",
+    "bytes": 1599589,
+    "sha256": "dae3ae78cbfcf2ef33dad338c85c88dcd56e02a0d20e47ff2f96a0cfe36e2ee1"
   }
 }
