@@ -50,8 +50,10 @@ const HOST_SUMMARY = "## Primary Request and Intent\nP4 验收宿主摘要占位
 // [审计 F6 修复 2026-11-04] 预算对齐实现现值（设计定稿 §3.4）：四段 body 合计 5800 + 装配头容差 300 = 6100。
 //   旧值 2000/700/300（合计 3320）会让本门 10 条断言全红（实现已改，测试没跟）。
 const R2_BUDGET = { checkpoint: 2400, project: 1150, profile: 350, note: 1900 };
-// 重灌块整条上限 = 四段 body 合计 5800 + 装配容差 300（重灌头+段头+分隔符；与实现 R2_TOTAL 同口径）
-const R2_BLOCK_TOTAL = R2_BUDGET.checkpoint + R2_BUDGET.project + R2_BUDGET.profile + R2_BUDGET.note + 300;
+// 重灌块整条上限 = [4.5.15 §10.1] R2_TOTAL 6100→**6900**（四段 body 5800 + 装配头 300 = 6100，
+//   再加 learnings 段 ≤900 ⇒ 饱和时 7000 > 6900，learnings 作为第一刀被砍）。实现见 index.js `R2_TOTAL`。
+const R2_BLOCK_TOTAL = 6900;
+const R2_LEARNINGS_MAX = 900;   // [4.5.15] learnings 段上限（本门为 md 模式，learnings 不出现；值用于口径注释）
 const MERGED_TOTAL_MAX = 8000;
 
 const TITLES8 = ["本次目标", "当前状态", "下一步行动", "关键结论", "文件与代码", "错误与修复", "任务与待办", "未决问题"];
@@ -215,6 +217,8 @@ function parseRehydrate(text) {
     const m = ln.match(/^【([^】]+)】/);
     const nm = m ? m[1] : "";
     if (nm.startsWith("检查点续接")) { cur = "checkpoint"; segs[cur] = []; continue; }
+    // [4.5.15][L-6] learnings 段头（放在【检查点续接】之前）：不识别会把正文并入 checkpoint 段 ⇒ 撞 cpBody ≤2400
+    if (nm.startsWith("累积学习")) { cur = "learnings"; segs[cur] = []; continue; }
     if (nm.startsWith("项目记忆")) { cur = "project"; segs[cur] = []; continue; }
     if (nm.startsWith("用户画像")) { cur = "profile"; segs[cur] = []; continue; }
     if (nm.startsWith("压缩后记忆重灌")) { cur = null; continue; }
@@ -372,13 +376,13 @@ const R2 = {
   R.ok(factsLen > 0 && factsLen <= 3000 + 150,
     "B5 事实包 ≤3000 + 头容差（实测 " + factsLen + "；P1 现有预算不回归）", "len=" + factsLen);
   R.ok(blockLen > 0 && blockLen <= R2_BLOCK_TOTAL,
-    "B6 重灌块整条 ≤" + R2_BLOCK_TOTAL + "（3000 + 装配容差 320；实测 " + blockLen + "）", "len=" + blockLen);
+    "B6 重灌块整条 ≤" + R2_BLOCK_TOTAL + "（R2_TOTAL=6900；实测 " + blockLen + "）", "len=" + blockLen);
   R.ok(factsLen > 0 && blockLen > 0 && factsLen + blockLen <= MERGED_TOTAL_MAX + 400,
     "B7 两包之和 ≤6000 + 装配容差 400（实测 事实包 " + factsLen + " + 重灌 " + blockLen + " = " + (factsLen + blockLen) + "）", "sum=" + (factsLen + blockLen));
   R.ok(all.indexOf(cpKeep) >= 0, "B8 保留节字面量：关键结论标记完整保留（不切半）", "kept=" + (all.indexOf(cpKeep) >= 0));
   R.ok(all.indexOf(pjMark) >= 0 && all.indexOf(pfMark) >= 0, "B9 项目/画像标记在预算内仍完整出现（切片没有切坏首行）", "proj=" + (all.indexOf(pjMark) >= 0) + " prof=" + (all.indexOf(pfMark) >= 0));
-  R.ok(!lastB || !Array.isArray(lastB.dropped) || (lastB.dropped.indexOf("profile") < 0 && lastB.dropped.indexOf("project") < 0 && lastB.dropped.indexOf("checkpoint") < 0),
-    "B10 未为过断言整段砍段：getLastRehydrate().dropped 不含 profile/project/checkpoint", lastB ? JSON.stringify(lastB.dropped) : "无钩子");
+  R.ok(!lastB || !Array.isArray(lastB.dropped) || (lastB.dropped.indexOf("profile") < 0 && lastB.dropped.indexOf("project") < 0 && lastB.dropped.indexOf("checkpoint") < 0 && lastB.dropped.indexOf("learnings") < 0),
+    "B10 未为过断言整段砍段：getLastRehydrate().dropped 不含 profile/project/checkpoint/learnings（本门 md 模式 learnings 恒不出现）", lastB ? JSON.stringify(lastB.dropped) : "无钩子");
   // 规格歧义点：饱和时整条注入（含刷新提示）会超过 6000 —— 指标为 WARN，交 Lead 决策是否做总量动态收口
   R.warn("B11 预算分解（饱和·信息项）：整条注入 " + all.length + " 字 = 刷新提示(≈330) + 事实包(" + factsLen + ") + 重灌块(" + blockLen + ")；硬线 " + MERGED_TOTAL_MAX,
     "overHardLine=" + (all.length - MERGED_TOTAL_MAX));
@@ -424,7 +428,7 @@ const R2 = {
   R.ok(cpBody.length <= R2_BUDGET.checkpoint && pjBody.length <= R2_BUDGET.project && pfBody.length <= R2_BUDGET.profile,
     "M2 MAX 饱和：三段严格预算（实测 " + cpBody.length + "/" + pjBody.length + "/" + pfBody.length + "）", "caps=2000/700/300");
   R.ok(blockLen > 0 && blockLen <= R2_BLOCK_TOTAL,
-    "M3 MAX 饱和：重灌块整条 ≤" + R2_BLOCK_TOTAL + "（实测 " + blockLen + "）", "len=" + blockLen);
+    "M3 MAX 饱和：重灌块整条 ≤" + R2_BLOCK_TOTAL + "（R2_TOTAL=6900；实测 " + blockLen + "）", "len=" + blockLen);
   R.ok(factsLen > 0 && factsLen <= 3000 + 150,
     "M4 MAX 饱和：事实包 ≤3000 + 头容差（实测 " + factsLen + "）", "len=" + factsLen);
   R.ok(factsLen + blockLen <= MERGED_TOTAL_MAX + 400,

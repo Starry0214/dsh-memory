@@ -4,6 +4,25 @@
 > 架构与设计决策另见 [设计文档.md](设计文档.md)。
 > （注：v2.4.1~v2.5.4 的逐版变更史记录于记忆库 knowledge/MEMORY-dsh-memory-v2.5.x-合并维护与dream修复.md 及 tools/记忆插件.md，本文件自 v2.5.5 起恢复同步。）
 
+## v4.5.15（2026-11-11）：**记忆检索提醒（每轮）+ 升级协议 + 重建注入 learnings**
+
+> 对齐 MiMo-Code 三处做法：per-turn active recall reminder、memory→history 升级协议、rebuild 注入累积学习。
+> 设计：`docs/方案-4.5.15-记忆检索提醒与升级协议.md`（§9/§10，经 CRA 审计①~④）。
+
+### 新增
+
+- **每轮 recall reminder**：`agent/pre-step` 尾部注入 `<system-reminder>【记忆检索】…</system-reminder>`（db/md 两版各 ≤180 字）；触发 = 本会话有检查点（`p3.sessions[sid].checkpointAt`）/ 本会话未提炼笔记（共用 rows+30s TTL）/ 本会话有 todo 记录（P1 per-session）；flag **`recallPerTurn`**（默认 true，四落点+热更新）；同轮只 append 一次（去重键 `sid+(msg.id||p4cMsgKey)`），不写会话历史/inbox、长前缀不变。
+- **R3 每 8 轮轻提醒并入同一通道**：`turn/start` 只维护轮次；先 recall，未命中且 `turn-lastNudgeTurn≥8` 则同一 handler 注入 R3 文本，**append 成功后才置位**；删除旧 `agent.inject` 注入点（无双注入）。
+- **升级协议写进工具描述**：`memory_search`（命中即信 / 部分命中→`session_search` 取逐字 / 0 命中逐级升级：换稀有词→直读→`session_search`→放宽范围）；`session_search`（仅在 memory_search 无有用结果或需逐字原文时用）；`memory_search` 0 结果文案统一指向 `session_search`。
+- **R2 重建注入增强**：新增「累积学习」段（同 wsKey 收窄、排除本会话、≤2 检查点×2 节×2 条×≤100 字、段 ≤900）+ Verify-before-act 提醒；`R2_TOTAL 6100→6900`、砍序 learnings 第一、`dropped` 记 `learnings`；flag **`rebuildLearnings`**（默认 true）。
+- **门**：新增 `test/_test-recall-reminder.mjs`、`test/_test-rehydrate-learnings.mjs` 并登记 `TEST_DIR_GATES`；`_accept-p4` 适配 6900/新段头；13 门 FAIL 行集合与基线逐行一致（新增 0）。
+
+### 已知行为（非缺陷）
+
+- R3 兜底仅对「含真实 user 消息的 step1」生效（定时任务/goal 续轮等合成消息会话由 RT 覆盖）。
+- 升级后**首轮一次性 cache miss**（工具描述 + R2 文本变更），属预期。
+- 成本 kind `recallReminder` 语义改为 **R3+RT 合计**（面板标签同步为「记忆提醒（R3/RT 合计）」）。
+
 ## v4.5.14（2026-11-10）：**3D 图谱 vendor 自包含（安装版可用）**
 
 > 修复一个从 3D 图谱上线起就存在的安装缺口：`/dsh-memory/vendor/*` 路由只读 `~/.dsh/memory/vendor/`，

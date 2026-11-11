@@ -221,7 +221,7 @@ window.__ModuleLoader__.load({
 		// 只读展示：GET /dsh-memory/stats.json 的 cost 段（结构见 13-p3-design.md §5.2）；
 		// 不提供清空/改阈值按钮（阈值仍由 /dream 自校准）；只用 react.useState，展开/刷新时才 fetch。
 		const COST_KINDS = [
-			["checkpointWrite", "检查点写入"], ["rebuildInject", "压缩后重灌"], ["startupInject", "启动注入"], ["recallReminder", "定期轻提醒"],
+			["checkpointWrite", "检查点写入"], ["rebuildInject", "压缩后重灌"], ["startupInject", "启动注入"], ["recallReminder", "记忆提醒（R3/RT 合计）"],
 			["hintA", "提醒 A"], ["hintB", "提醒 B"], ["hintC", "提醒 C"], ["memorySearch", "记忆检索"], ["dream", "dream 整合"],
 			["maint", "合并维护"], ["export", "导出"]
 		];

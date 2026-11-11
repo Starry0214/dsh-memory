@@ -1,0 +1,63 @@
+{
+  "deployedAt": "2026-11-11T09:29:09.430Z",
+  "stamp": "20261111-172909",
+  "files": {
+    "index.js": {
+      "sha256": "071C7C90A4665306FB30715678F34ADBF008CBC93AF07F6F7BB9AB8EEFFAE8EB",
+      "bytes": 1671548
+    },
+    "p3-cost.js": {
+      "sha256": "3BEC04F53C8DBBCA76D432FEFAEF0FDC4A97ED6A73360A68BF9FE17C77C1CBBC",
+      "bytes": 19635
+    },
+    "p3-triggers.js": {
+      "sha256": "8423C5E1A4CE61C578E06129BD4DEFD436198A74BAC8AC7843BA83D8182F85CD",
+      "bytes": 12323
+    },
+    "p3-readside.js": {
+      "sha256": "4FC58C843F27559AC9E2CC3F4A5749CCDA0A89F6BB31421D0CF261CF58D164D7",
+      "bytes": 18538
+    },
+    "p25-topics.js": {
+      "sha256": "6920E6DDC90161D2EBFAF30A57B373EA0046D0C382AD09EBB30E8EC0E880903D",
+      "bytes": 36790
+    },
+    "version.txt": {
+      "sha256": "9F8495EDB5029BC1A15003B971739DAB7FEB220924177F6542CBF4B585A1A6B6",
+      "bytes": 6
+    },
+    "package.json": {
+      "sha256": "A92E074434E4FF56C6F4E20E4F733D744023C70DF947234AA8B1C11D08468420",
+      "bytes": 628
+    },
+    "vendor/3d-force-graph.min.js": {
+      "sha256": "13088340AAD408156064FD120C3BC3A47C93A3CC45B8F132D6284B20E2223BE9",
+      "bytes": 1389954
+    },
+    "vendor/three.module.js": {
+      "sha256": "C8211C69345D2E9949DC7A8AC969380497AA0600A5A8AC6A459C8CD02DD9CB8A",
+      "bytes": 603113
+    },
+    "vendor/three.core.js": {
+      "sha256": "EB077D2417F61D3E6D9264C317CABC4EA35769ED6B0AB533067292A550784C20",
+      "bytes": 1403455
+    }
+  },
+  "targets": [
+    {
+      "dir": "C:\\Users\\Starry\\.dsh\\profiles\\web\\plugins\\memory",
+      "beforeSha": "4D769D94FCA556B33343773E3544C41EC05B82C6F730733F2F0872B712D55800",
+      "afterSha": "071C7C90A4665306FB30715678F34ADBF008CBC93AF07F6F7BB9AB8EEFFAE8EB"
+    },
+    {
+      "dir": "C:\\Users\\Starry\\.dsh\\profiles\\web-test\\plugins\\memory",
+      "beforeSha": "4D769D94FCA556B33343773E3544C41EC05B82C6F730733F2F0872B712D55800",
+      "afterSha": "071C7C90A4665306FB30715678F34ADBF008CBC93AF07F6F7BB9AB8EEFFAE8EB"
+    },
+    {
+      "dir": "C:\\Users\\Starry\\.dsh\\profiles\\web-cc-test\\plugins\\memory",
+      "beforeSha": "4D769D94FCA556B33343773E3544C41EC05B82C6F730733F2F0872B712D55800",
+      "afterSha": "071C7C90A4665306FB30715678F34ADBF008CBC93AF07F6F7BB9AB8EEFFAE8EB"
+    }
+  ]
+}

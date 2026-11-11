@@ -632,7 +632,7 @@ const PS_BACKUP = BACKUP_ROOT.replace(/\//g, "\\");
 //   为什么是 3.0 而不是 2.9：本批改的是**语义与契约**（错误可见性、水位/候选口径、账本保护、单元写失败可归因），
 //   不是叠加特性；且事后证明最关键的修复（`archivePendingEntry`）**覆盖面比设计时以为的更宽**。
 //   历史：v2.8.4（T1）时版本号曾停在 2.5.6，导致"重启后无法据版本判断加载了哪份字节" ⇒ 三处版本落点必须同步。
-const PLUGIN_VERSION = "4.5.14";
+const PLUGIN_VERSION = "4.5.15";
 // v2.8.4（T1·**构建指纹**）：版本号是人写的常量，**不能**回答用户重启后最关心的那个问题——"这次重启到底加载了哪份字节？"
 //   事故背景（2026-09-18）：同步了新构建、重启后横幅仍打 `就绪 v2.5.6`，用户据此无法确认加载是否成功。
 //   ⇒ 加载时自读本文件，把 **字节数 + sha256 前 8 位** 打进就绪行；与磁盘副本一比即知新旧（只读自身，零副作用）。
@@ -1920,6 +1920,18 @@ export { UPGRADE_SELFCHECK_HOOKS as __upgradeSelfcheckHooks };
 //   纪律：只挂引用，不改业务语义。
 const HEADER_TEST_HOOKS = { noteStatPayload: null };
 export { HEADER_TEST_HOOKS as __headerHooks };
+// [4.5.15] 每轮记忆检索提醒（RT）+ R3 兜底 / R2 learnings 的测试钩子容器（模块级；apply 末尾挂内部同一份引用）：
+//   text(mode) 定稿文本（"db"|"md"，门断言 ≤180 且 mode-aware）/ r3Text() 兜底文本 /
+//   lastSkip() 最近一次 skip reason（M-1 观测）/ lastInject() 最近一次注入 {kind,chars,sid} /
+//   dedupSize() / resetDedup() / rowsFetches() / resetRowsCache() / handlerInfo() 注册序（A=1、recall=2）。
+//   纪律：只挂引用，不改业务语义。
+const RECALL_TEST_HOOKS = {
+  text: null, r3Text: null, lastSkip: null, lastR3Skip: null, lastInject: null,
+  chainCounts: null, resetChainCounts: null,
+  dedupSize: null, resetDedup: null, rowsFetches: null, resetRowsCache: null,
+  handlerInfo: null,
+};
+export { RECALL_TEST_HOOKS as __recallHooks };
 
 // ★ §9.11.4-3 修正六/七/十五（红队 rev8c B② → rev8d P1 → **工程席 rev8k A2**）：账本**存在但读不出来**时，
 //   归档轮每轮**现问**（`ledgerUnreadableNow()`）⇒ **不需要**"粘滞状态"变量。
@@ -2027,6 +2039,11 @@ const REGRESSION_AT = new Map();           // v0.5: (sid+"\u0001"+sig) -> { ts, 
 // v0.5（P0c）：回归提醒待注入队列（方案 A：独立 pre-step handler 消费，不受 step 限制）
 //   sid -> [ { sig, text, enqueueAt } ]——一次 reminder 触发入队；pre-step 到点取队头注入
 let REGRESSION_QUEUE = new Map();          // per-sid 队列（先进先出；同一 sid 内保持顺序，注入后移除）
+// [4.5.15 N-3] pre-step **内层链破坏性副作用**的只读计数（仅测试钩子消费，不改任何行为）：
+//   动机：A 的 catch 是 `return next ? await next() : undefined` ⇒ 内层 handler 一旦抛错到 A，
+//   next() 会被**再调一次**，dequeueRegressionReminder / drainCmdEcho / maint spawn 各多跑一次。
+//   计数打在**函数入口/发起点**（不是成功点）⇒ 「跑了几次」一眼可辨（正常 1 / 双发 2）。
+const PRE_STEP_CHAIN_COUNTS = { dequeue: 0, cmdEchoDrain: 0, maintSpawn: 0 };
 // ═══ [note 提醒 2026-11-05] 按上下文占用每 15% 提醒一次（starry 拍板方案）═══
 // 为什么不用「轮次/定时」（实测否决）：
 //   40 个真实会话中位数 = 2.3 轮/时、压缩间隔 10.86 小时 ⇒ 「每 30 轮」≈ 13.2 小时一次（等于没有）；
@@ -2130,6 +2147,7 @@ function enqueueCmdEcho(sid, title, text) {
   } catch (e) { return false; }
 }
 function drainCmdEcho(sid) {
+  try { PRE_STEP_CHAIN_COUNTS.cmdEchoDrain += 1; } catch (e0) { /* [4.5.15 N-3] 入口计数（双发即 2） */ }
   try {
     const q = CMD_ECHO_QUEUE.get(sid);
     if (!q || q.length === 0) return null;
@@ -2613,6 +2631,7 @@ function peekRegressionReminder(sid) {
 }
 // pre-step handler：把队头提醒追加进当轮请求（决策直入，当轮可见），并从队列移除
 function dequeueRegressionReminder(sid) {
+  try { PRE_STEP_CHAIN_COUNTS.dequeue += 1; } catch (e0) { /* 计数失败忽略 */ }   // [4.5.15 N-3] 入口计数（双发即 2）
   const q = REGRESSION_QUEUE.get(sid);
   if (q && q.length > 0) { q.shift(); if (q.length === 0) REGRESSION_QUEUE.delete(sid); return true; }
   return false;
@@ -4975,6 +4994,42 @@ function dreamCheckpointEvidence(rows, opts) {
   return res;
 }
 
+// ═══ [4.5.15][L-6] R2「累积学习（Accumulated learnings）」段：预算常量 + 节抽取 ═══
+// 预算自洽（§8.9/§9.6/§10.1）：≤2 检查点 × 2 节 × ≤2 条 × ≤100 字 = 800 + 段头 ≈ 60 ⇒ **段 ≤900 字**；
+//   段头插在【检查点续接】之前；总收口 R2_TOTAL 6100→6900 ⇒ 饱和（四段 6100 + learnings 900 = 7000 > 6900）
+//   时 learnings 作为**第一刀**被砍、dropped 记 "learnings"（门可满足，见 §10.1）。
+const R2_LEARN_MAX_CP = 2;            // 最多取最近 2 个检查点
+const R2_LEARN_ITEMS_PER_SEC = 2;     // 每节最多 2 条
+const R2_LEARN_ITEM_CHARS = 100;      // 每条 ≤100 字（超长按字符硬截 + 省略号；行内不切半句语义）
+const R2_LEARN_SEG_MAX = 900;         // 整段（含段头）≤900 字
+const R2_LEARN_SECTIONS = Object.freeze(["关键结论", "错误与修复"]);
+
+/** 名字归一（与 dreamCheckpointEvidence 的 nzCp 同口径：NFKC + 小写 + 去空白/标点/分隔符） */
+function nzCpKey(x) {
+  return String(x == null ? "" : x).normalize("NFKC").toLowerCase()
+    .replace(/[\s_\-·・,，.。:：/\\()（）\[\]【】]/g, "");
+}
+
+/** 取检查点某一节的条目（≤2 条/节、每条 ≤100 字；剥 `-`/`*` 前缀；指针行不算结论）。 */
+function r2LearnSectionItems(body, title) {
+  const out = [];
+  try {
+    const s = String(body || "");
+    let re = null;
+    try { re = new RegExp("(?:^|\\n)#{2,3}\\s*" + String(title) + "\\s*\\n([\\s\\S]*?)(?=\\n#{2,3}\\s|$)"); } catch (e) { return out; }
+    const m = re.exec(s);
+    if (!m) return out;
+    for (const raw of String(m[1] || "").split("\n")) {
+      const ln = String(raw || "").replace(/^\s*[-*·]\s*/, "").replace(/\s+/g, " ").trim();
+      if (!ln) continue;
+      if (isNotePointerText(ln)) continue;   // 指针行（"YYYY-MM-DD 已提炼 N 句 → T-…"）不是结论
+      out.push(ln.length > R2_LEARN_ITEM_CHARS ? ln.slice(0, R2_LEARN_ITEM_CHARS - 1) + "…" : ln);
+      if (out.length >= R2_LEARN_ITEMS_PER_SEC) break;
+    }
+  } catch (e) { /* 抽取失败 ⇒ 该节无条目（不阻断 R2） */ }
+  return out;
+}
+
 // [4.5.13 Part A][门用] 预筛/检查点证据纯函数导出（门直接断言逻辑，不必绕 buildPrompt 抠文本）
 export {
   dreamPrescreenNoteLinks as __dreamPrescreenNoteLinks,
@@ -6366,20 +6421,14 @@ function p3OnSessionEvent(session, event) {
     if (event.type === "turn/start" || event.type === "step/start" || event.type === "user/message") {
       st.lastActivityAt = now;
     }
-    // ④ [P3-2 R3] 每 8 轮轻提醒（只主会话；同轮不重复由 shouldNudge + lastNudgeTurn 保证）
+    // ④ [P3-2 R3 → 4.5.15 L-1] 轮次计数：`turn/start` **只维护 st.turn**，不再判定/注入 R3。
+    //   动因（审计② K-2/N-1）：R3 原本在 session/event(turn/start) 里决策并 agent.inject，而宿主 `turn()` 先
+    //   append("turn/start") 再 await preStep ⇒ R3 的决策**必然早于**同轮 step1 的 pre-step，「本轮 recall 成功
+    //   ⇒ 跳过 R3」在时序上不可实现（两套账本也不同构：时间戳 vs 轮次）。
+    //   4.5.15 起 R3 的到点判定 + 注入统一挪进 `agent/pre-step` 的 recall handler（见「[4.5.15] 记忆检索提醒」段），
+    //   本处只做轮次自增（st.turn 在 pre-step 时已自增，L-1 证据链）。
     if (event.type === "turn/start" && !isSub) {
-      try {
-        const turn = (Number(st.turn) || 0) + 1;
-        st.turn = turn;
-        if (p3Readside.shouldNudge({ turn: turn, everyN: 8, lastNudgeTurn: st.lastNudgeTurn })) {
-          const nudge = p3Readside.buildRecallNudge({ turn: turn, everyN: 8, topicHint: "" });
-          if (nudge) {
-            st.lastNudgeTurn = turn;
-            p3CostBump("recallReminder", { n: 1, injectedChars: nudge.length }, { sid: sid, trigger: "R3", ok: 1, note: "turn" + turn });
-            return { kind: "nudge", text: nudge, turn: turn };
-          }
-        }
-      } catch (eN) { /* 提醒失败忽略 */ }
+      try { st.turn = (Number(st.turn) || 0) + 1; } catch (eT) { /* 轮次计数失败忽略（R3 兜底自然延后） */ }
     }
     return null;
   } catch (e) {
@@ -7770,6 +7819,13 @@ const DEFAULT_CFG = { staleSessionDays: 5, staleAction: "remind", integrateEnabl
   //   默认 true；置 false ⇒ 两块**不插入任何字节**（库模式任务书逐字回到基线，md 模式本来就不进新代码）。
   //   落点四处：DEFAULT_CFG / SETTINGS_SCHEMA / normalizeCfg 布尔归一 / /dsh-memory/config 的 WRITABLE（热更新）。
   dreamPrescreen: true,
+  // [4.5.15] 每轮记忆检索提醒（RT）开关：默认 true。关 ⇒ pre-step 零字节注入（R3 每 8 轮兜底**不受影响**）。
+  //   命名纪律（M-3）：flag 名 `recallPerTurn`；成本 kind 仍 `recallReminder`（KIND_LIST 冻结，不新增 kind）。
+  //   落点四处：DEFAULT_CFG / SETTINGS_SCHEMA / normalizeCfg 布尔归一 / /dsh-memory/config 的 WRITABLE（热更新）。
+  recallPerTurn: true,
+  // [4.5.15][L-6] R2「累积学习（learnings）」段开关：默认 true。
+  //   关 ⇒ R2 重灌文本逐字回到 4.5.14 基线（sha16 门；四段 body 硬上限合计 5800 < 6100 ⇒ 预算放宽不产生字节差）。
+  rebuildLearnings: true,
   // [P4-A] 插件子代理（检查点 writer / 归档 / dream）的 Agent Preset 名。
   //   DSH 0.2.x 的 spawn 路径已**丢弃 request.toolFilter**（dsh-subagent startLocal 的
   //   snapshotSubagentDescriptor 只收 mode/provider/label/agentProvider/agentModel/agentReasoningEffort；
@@ -7836,6 +7892,10 @@ const SETTINGS_SCHEMA = z.object({
   memoryTopicDbEnabled: z.boolean().default(false).volatile(),
   // [4.5.13 Part A] dream 预筛开关（默认 true）：关 ⇒ 库模式任务书不插「Note → 关联主题」/「检查点证据」两块
   dreamPrescreen: z.boolean().default(DEFAULT_CFG.dreamPrescreen).volatile(),
+  // [4.5.15] 每轮记忆检索提醒（RT）开关（默认 true）：关 ⇒ pre-step 零字节注入（R3 兜底不受影响）
+  recallPerTurn: z.boolean().default(DEFAULT_CFG.recallPerTurn).volatile(),
+  // [4.5.15] R2 累积学习段开关（默认 true）：关 ⇒ 重灌文本逐字回到 4.5.14
+  rebuildLearnings: z.boolean().default(DEFAULT_CFG.rebuildLearnings).volatile(),
   // v1.12.0：使用监控开关（默认开）——记录提醒/查询/错误事件到 .monitor.json，设置界面显示汇总
   monitorEnabled: z.boolean().default(true).volatile(),
   // v2.0.2：LLM循环试错提醒（D类）——打转探针双条件命中时注入提醒；关闭则回退纯影子记录
@@ -7919,6 +7979,9 @@ function normalizeCfg(raw) {
   if (typeof cfg.memoryTopicDbEnabled !== "boolean") cfg.memoryTopicDbEnabled = DEFAULT_CFG.memoryTopicDbEnabled;
   // [4.5.13 Part A][M'-11] dreamPrescreen 布尔归一：非法值（"x"/null/数字）一律回落默认 true
   if (typeof cfg.dreamPrescreen !== "boolean") cfg.dreamPrescreen = DEFAULT_CFG.dreamPrescreen;
+  // [4.5.15] 两个新开关布尔归一（非法值一律回落默认 true；关 ⇒ recall 零注入 / R2 逐字回基线）
+  if (typeof cfg.recallPerTurn !== "boolean") cfg.recallPerTurn = DEFAULT_CFG.recallPerTurn;
+  if (typeof cfg.rebuildLearnings !== "boolean") cfg.rebuildLearnings = DEFAULT_CFG.rebuildLearnings;
   if (typeof cfg.spiralRemind !== "boolean") cfg.spiralRemind = DEFAULT_CFG.spiralRemind;
   if (typeof cfg.spiralBreak !== "boolean") cfg.spiralBreak = DEFAULT_CFG.spiralBreak;
   if (!(cfg.brkLevel >= 1 && cfg.brkLevel <= 3)) cfg.brkLevel = DEFAULT_CFG.brkLevel;
@@ -9521,7 +9584,7 @@ export { p25ReadPreviousSession as __p25ReadPreviousSession };
  *  用途：检查点输入端的「上次检查点（增量基线）」在内存 Map 丢失时（进程重启 / 32 条 FIFO 淘汰）的库回落 ——
  *   让**阈值检查点**与**压缩检查点**都能"既接收主会话材料、又看上一轮记忆库中写的什么"（用户 2026-11-03 拍板「两厢结合」）。
  *  失败纪律：任何异常/缺库/无主题 ⇒ 返回 null，调用方退回改前行为（无基线，整 8 节重写）。 */
-function p25ReadOwnSession(store, cwd, sid8) {
+function p25ReadOwnSession(store, cwd, sid8, rowsOpt) {
   try {
     if (!store || typeof store.topics !== "function" || typeof store.readTopic !== "function") return null;
     const want = String(sid8 || "").replace(/^session-/, "").slice(0, 8);
@@ -9532,7 +9595,8 @@ function p25ReadOwnSession(store, cwd, sid8) {
     const nz = (TOPICDB.api && typeof TOPICDB.api.normalizeName === "function")
       ? TOPICDB.api.normalizeName
       : ((s) => String(s == null ? "" : s).trim().toLowerCase());
-    const rows = store.topics();
+    // [4.5.15 L-6] rows 可选复用：R2 重灌入口已取一份整库行 ⇒ 本处不再 store.topics()（真机 684ms/次量级）
+    const rows = Array.isArray(rowsOpt) ? rowsOpt : store.topics();
     let lv = null;
     try { lv = topicDbLevelMap(store, rows); } catch (e) { lv = null; }
     let line = null;
@@ -9952,7 +10016,8 @@ function topicDbReadIntentSummary(store, opts) {
     const maxSent = Math.max(1, Math.min(20, Number(o.maxSentences) || 3));
     const norm = (typeof o.norm === "function") ? o.norm : p0NormName;
     const now = (o.now instanceof Date) ? o.now : new Date();
-    const rows = store.topics() || [];
+    // [4.5.15 L-6] rows 可选复用：R2 重灌入口已取一份整库行 ⇒ 本处不再 store.topics()
+    const rows = Array.isArray(o.rows) ? o.rows : (store.topics() || []);
     let lv = null;
     try { lv = topicDbLevelMap(store, rows); } catch (eLv) { lv = null; }
     const wantLine = norm("会话检查点");
@@ -13764,7 +13829,7 @@ export default {
                 const WRITABLE = new Set(["staleSessionDays", "staleAction", "integrateEnabled", "integrateDays", "active",
                   "monitorEnabled", "spiralRemind", "regressionEnabled", "initGuideEnabled", "updateCheckEnabled",
                   "spiralBreak", "brkLevel", "brkHardAbort", "brkSameN", "brkMaxDeny", "brkMinSteps", "maintTriggerChars",
-                  "dreamPrescreen"]);   // [4.5.13 Part A] 预筛开关可写 + 热更新（下方 PLUGIN_CFG = normalizeCfg(...) 生效）
+                  "recallPerTurn", "rebuildLearnings", "dreamPrescreen"]);   // [4.5.15] 每轮提醒 / R2 learnings 开关；[4.5.13 Part A] 预筛开关可写 + 热更新（dreamPrescreen 保持在末尾：门 S-4 静态断言 `"dreamPrescreen"]`）
                 const clean = {};
                 for (const [k, v] of Object.entries(patch)) {
                   if (!WRITABLE.has(k)) return reply(400, { ok: false, error: "field not writable: " + k });
@@ -16109,6 +16174,19 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         }
       } catch (e) { /* 旁路记账失败不影响主流程 */ }
     }
+    /** [4.5.15 L-5] 本会话是否有 todo/goal 记录（recall 触发判据 ③ 的 per-session 源）。
+     *  纪律：①只用 `P1_EVENT_CACHE.get`（**不**用 `p1CacheOf`——后者会建条目并触发 200 上限 LRU 抖动）；
+     *        ②**不得**用 `readRecentSessionFacts`：那是启动期全局 7 天快照（带 sid 但非"本会话"）⇒ 假阳/假阴
+     *          （审计② N-7）。P1 缓存是纯内存（重启即丢）⇒ 该支自然降级，不影响判据 ①/②。 */
+    function p1SessionHasTasks(sid) {
+      try {
+        const st = P1_EVENT_CACHE.get(String(sid || ""));
+        if (!st) return false;
+        if (Array.isArray(st.todos) && st.todos.length > 0) return true;
+        if (st.goal && st.goal.__cleared !== true) return true;
+        return false;
+      } catch (e) { return false; }
+    }
     // 段 1：最近用户原话 verbatim —— deriveMessages 优先，事件流兜底（都只认 source.kind==="user"）
     function deriveUserQuotes(session, opts) {
       const o = opts || {};
@@ -16425,6 +16503,17 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
       //   opts.budget 仅供测试/未来动态策略；生产调用不传（保持三段齐全语义，见调用处口径注释）。
       let segs = [];
       const dropped = [];
+      // [4.5.15][L-6] 入口取**一份** rows（`store.topics()` 每次重灌只调 1 次），三处共用：
+      //   ① 本会话检查点恢复指针（原先在此独立 `TOPICDB.store.topics()` 扫一次）② 本会话笔记主题（原独立再扫一次）③ learnings 跨会话检查点。
+      //   md 模式 `TOPICDB.store` 为 null ⇒ rows=[]（**null-safe**，零行为变化）。
+      let _r2Rows = null;
+      const _r2Store = (TOPICDB && TOPICDB.store) || null;
+      const r2Rows = () => {
+        if (_r2Rows !== null) return _r2Rows;
+        try { _r2Rows = (_r2Store && typeof _r2Store.topics === "function") ? (_r2Store.topics() || []) : []; }
+        catch (e) { _r2Rows = []; }
+        return _r2Rows;
+      };
       // ① 检查点正文：**本次压缩刚写的本会话检查点优先**（P4-C2-fix）——
       //   实测 2026-11-02 23:48:19 的重灌注入的是**别的会话**（91a8aef6/sid 4fba46dc）的旧检查点：
       //   `latestSessionSummary()` 读「全库最新」，落库瞬间谁最新就灌谁；而本次 writer 23:49:04 才写完。
@@ -16436,7 +16525,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         const _agSid = String((agent && agent.session && agent.session.id) || "");
         const _agCwd = String((agent && agent.session && ((agent.session.header && agent.session.header.cwd) || agent.session.cwd)) || "");
         // [P4-C3] 内存无基线时从主题库回落读本会话上一轮检查点（重启后首压也能接上，不再灌"别的会话最新"）
-        if (_agSid) _ownCp = p4cLastCheckpoint(_agSid, _agCwd);
+        if (_agSid) _ownCp = p4cLastCheckpoint(_agSid, _agCwd, r2Rows());
       } catch (eOwn) { _ownCp = ""; }
       try {
         if (_ownCp) {
@@ -16456,7 +16545,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
                 const _ws9 = (typeof p25Topics.normalizeWorkspace === "function") ? p25Topics.normalizeWorkspace(_cwd9) : "";
                 const _s89 = (typeof p25Topics.sid8Of === "function") ? p25Topics.sid8Of(_sid9) : "";
                 const _nm9 = (_ws9 && _s89) ? p25Topics.sessionTopicName(_ws9, _s89) : "";
-                const _tp9 = (_nm9 && TOPICDB.store) ? ((TOPICDB.store.topics() || []).find((x) => String(x.name) === _nm9) || null) : null;
+                const _tp9 = (_nm9 && _r2Store) ? ((r2Rows()).find((x) => String(x.name) === _nm9) || null) : null;
                 if (_tp9) _ptr = "\n[完整检查点 " + String(_ownCp).length + " 字，此处按注入预算截到 " + cpText.length + " 字；读全用 memory_read " + String(_tp9.id) + "]";
               }
             } catch (ePtr) { /* 指针失败不影响注入 */ }
@@ -16472,7 +16561,8 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
             dropped.push("checkpoint:own-empty");
           }
         } else {
-          const latest = await latestSessionSummary();
+          // [4.5.15 L-6] 传入口那份 rows：库模式「本会话无基线 ⇒ 取库内最新检查点」不再二次全库扫描
+          const latest = await latestSessionSummary(r2Rows());
           if (latest && latest.text) {
             let cpText = "";
             if (latest.source === "db" && Array.isArray(latest.sentences)) {
@@ -16534,9 +16624,9 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         const _nWs = (typeof p25Topics.normalizeWorkspace === "function") ? p25Topics.normalizeWorkspace(_nCwd) : "";
         const _nS8 = (typeof p25Topics.sid8Of === "function") ? p25Topics.sid8Of(_nSid) : "";
         const _nName = (_nWs && _nS8) ? ("笔记·" + _nWs + "/" + _nS8) : "";
-        const _nTp = (_nName && TOPICDB.store) ? ((TOPICDB.store.topics() || []).find((x) => String(x.name) === _nName) || null) : null;
+        const _nTp = (_nName && _r2Store) ? ((r2Rows()).find((x) => String(x.name) === _nName) || null) : null;
         if (_nTp) {
-          const _nRows = (TOPICDB.store.readTopic(_nTp.id).sentences || []).map((s) => String((s && s.text) || ""));
+          const _nRows = ((_r2Store.readTopic(_nTp.id) || {}).sentences || []).map((s) => String((s && s.text) || ""));
           if (_nRows.length) {
             // 尾部优先：从最后一条往前累加，直到预算
             const picked = [];
@@ -16558,22 +16648,104 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
           }
         }
       } catch (e4) { dropped.push("note:error"); }
-      if (!segs.length) return { text: "", dropped: dropped, checkpointFile: cpFile, chars: 0 };
+      // ⑤ [4.5.15][L-6] 累积学习（Accumulated learnings）：最近 ≤2 个**同工作区、非本会话**检查点的
+      //   「关键结论」「错误与修复」摘录（≤2 条/节、每条 ≤100 字、整段 ≤900）；按时间**正序**（最新在后）。
+      //   收窄口径（审计② N-4）：rows 先按父线 `会话检查点·<wsKey>` + 名字前缀 `<wsKey>/` 筛**本工作区**，
+      //   再排除本会话 `会话检查点·<wsKey>/<sid8>` ⇒ 跨项目零注入。段头放在【检查点续接】**之前**（unshift）。
+      let learnN = 0;
+      if (PLUGIN_CFG.rebuildLearnings !== false) {
+        try {
+          const _lSid = String((agent && agent.session && agent.session.id) || "");
+          const _lCwd = String((agent && agent.session && ((agent.session.header && agent.session.header.cwd) || agent.session.cwd)) || "");
+          const _lWs = (typeof p25Topics.normalizeWorkspace === "function") ? p25Topics.normalizeWorkspace(_lCwd) : "";
+          const _lS8 = (typeof p25Topics.sid8Of === "function") ? p25Topics.sid8Of(_lSid) : "";
+          if (_lWs && _r2Store && typeof _r2Store.readTopic === "function") {
+            const _rowsL = r2Rows();
+            const _byIdL = new Map(_rowsL.map((t) => [String(t && t.id), t]));
+            const _wantLine = (typeof p25Topics.lineName === "function") ? p25Topics.lineName(_lWs) : "";
+            const _selfName = _lS8 ? ((typeof p25Topics.sessionTopicName === "function") ? p25Topics.sessionTopicName(_lWs, _lS8) : "") : "";
+            const _cpsL = _rowsL.filter((t) => {
+              if (!t || String(t.state || "") === "archived") return false;
+              const nm = String(t.name || "");
+              if (isNoteTopicName(nm)) return false;        // 笔记名同样以 /sid8 结尾 ⇒ 必须先排
+              if (isDailyMemoryTopicName(nm)) return false;
+              let parsed = null;
+              try { parsed = (typeof p25Topics.parseSessionTopicName === "function") ? p25Topics.parseSessionTopicName(nm) : null; } catch (eP) { parsed = null; }
+              if (!parsed) return false;
+              if (String(parsed.wsKey) !== String(_lWs)) return false;   // 按当前 wsKey 收窄（防跨项目注入）
+              if (_selfName && nm === _selfName) return false;           // 排除本会话检查点
+              const parent = t.parentId ? _byIdL.get(String(t.parentId)) : null;
+              if (!parent) return false;                                  // 无父线 ⇒ 不是真检查点（同 dreamCheckpointEvidence）
+              return !!_wantLine && nzCpKey(parent.name) === nzCpKey(_wantLine);
+            }).sort((a, b) => ((Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0)) || String(a.id).localeCompare(String(b.id)))
+              .slice(0, R2_LEARN_MAX_CP);
+            if (_cpsL.length) {
+              _cpsL.reverse();   // 时间正序（最新在后）
+              const _items = [];
+              const _seenL = new Set();
+              const _maxItems = R2_LEARN_MAX_CP * R2_LEARN_SECTIONS.length * R2_LEARN_ITEMS_PER_SEC;
+              for (const t of _cpsL) {
+                let sents = [];
+                try { sents = ((_r2Store.readTopic(t.id) || {}).sentences) || []; } catch (eR) { sents = []; }
+                const body = sents.map((s) => String((s && s.text) || "")).join("\n");
+                if (!body.trim()) continue;
+                for (const sec of R2_LEARN_SECTIONS) {
+                  for (const it of r2LearnSectionItems(body, sec)) {
+                    const nk = nzCpKey(it);
+                    if (!nk || _seenL.has(nk)) continue;   // 跨检查点/跨节去重
+                    _seenL.add(nk);
+                    _items.push("- " + sec + "：" + it);
+                    if (_items.length >= _maxItems) break;
+                  }
+                  if (_items.length >= _maxItems) break;
+                }
+                if (_items.length >= _maxItems) break;
+              }
+              if (_items.length) {
+                const _lHead = "【累积学习（近期会话检查点摘录 · 只读）】";
+                let _lBody = _items.join("\n");
+                // 段预算 ≤900（含段头）：超则**整条裁尾**（先到先得，绝不切半条）
+                while (_lBody.length + _lHead.length > R2_LEARN_SEG_MAX && _items.length > 1) {
+                  _items.pop();
+                  _lBody = _items.join("\n");
+                }
+                if (_lBody.length + _lHead.length > R2_LEARN_SEG_MAX) {
+                  _lBody = _lBody.slice(0, Math.max(0, R2_LEARN_SEG_MAX - _lHead.length - 1)) + "…";
+                }
+                segs.unshift({ key: "learnings", head: _lHead, body: _lBody });
+                learnN = _items.length;
+              } else {
+                dropped.push("learnings:empty");
+              }
+            } else {
+              dropped.push("learnings:none");
+            }
+          }
+        } catch (e5) { dropped.push("learnings:error"); }
+      }
+      if (!segs.length) return { text: "", dropped: dropped, checkpointFile: cpFile, chars: 0, learnings: 0 };
       const head = "【压缩后记忆重灌（dsh-memory）】压缩会清掉历史里的记忆注入，以下为补回的记忆背景"
         + "（非当前任务指令；与用户最新消息冲突时以其为准）。按需 memory_search 查详情，勿全文重读。";
       // [CRA M1 修复 2026-11-05] note 引导**不塞进重灌 head**：+109 字会让「四段全饱和」时超出总收口 102 字，
       //   而收口第一刀必砍「用户画像」段（_accept-p4 只造 3 段，测不到这个饱和态）。
       //   改为压缩后**单独入队一条 note 提醒**（走 REGRESSION_QUEUE，不占重灌预算）——见压缩点 noteRemindReset 处。
-      // 总收口：[2026-11-04 设计定稿 §3.4] 四段齐全 ≈ 6100 字（2500+2000+1200+400）。
-      //   砍序（低→高价值）：画像 → 项目 → 笔记 → 检查点（检查点最后才动，它承载最新意图）。
+      // 总收口：[4.5.15 §10.1] R2_TOTAL **6100 → 6900**：四段 body 上限合计 5800 + 装配头 ≈300 = 6100，
+      //   learnings 段 ≤900 ⇒ 饱和时 6100+900=7000 > 6900 ⇒ learnings 作为**第一刀**被砍、dropped 记 "learnings"。
+      //   砍序（低→高价值）：**learnings（最先）** → 画像 → 项目 → 笔记 → 检查点（检查点最后才动，它承载最新意图）。
       const _budgetRaw = Number(opts && opts.budget);
       const _budgetCap = Number.isFinite(_budgetRaw) && _budgetRaw > 0
-        ? Math.max(1200, Math.min(6100, Math.floor(_budgetRaw)))
-        : 6100;
+        ? Math.max(1200, Math.min(6900, Math.floor(_budgetRaw)))
+        : 6900;
       const R2_TOTAL = _budgetCap;
       const render = () => head + (segs.length ? "\n\n" + segs.map((s) => s.head + "\n" + s.body).join("\n\n") : "");
       let text = render();
-      // 总收口（整条重灌块 ≤R2_TOTAL，不含事实包/刷新提示）：砍序=画像（最低）→ 项目 → 笔记 → 检查点（最高）
+      // 总收口（整条重灌块 ≤R2_TOTAL，不含事实包/刷新提示）：砍序 learnings（第一刀）→ 画像 → 项目 → 笔记 → 检查点
+      while (text.length > R2_TOTAL && segs.some((s) => s.key === "learnings")) {
+        segs = segs.filter((s) => s.key !== "learnings");
+        dropped.push("learnings");
+        learnN = 0;
+        text = render();
+      }
       while (text.length > R2_TOTAL && segs.some((s) => s.key === "profile")) {
         segs = segs.filter((s) => s.key !== "profile");
         dropped.push("profile");
@@ -16607,14 +16779,16 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         }
       }
       // [设计定稿 §4.2-5] token 账可观测：每段实际字数 + 总量 + 丢弃项，便于事后核对「这次压缩注入了多少」。
+      // [4.5.15][L-6] 增 `learn=<条数>`（learnings 段是否生效 / 是否被砍一眼可见）。
       try {
         const _sz = {};
         for (const s of segs) _sz[s.key] = String(s.body || "").length;
         monitorEvent("rehydrate", "cp=" + (_sz.checkpoint || 0) + " note=" + (_sz.note || 0)
           + " proj=" + (_sz.project || 0) + " prof=" + (_sz.profile || 0)
+          + " learn=" + learnN
           + " total=" + text.length + (dropped.length ? " dropped=" + dropped.join("/") : ""));
       } catch (eMon) { /* 监控失败不影响注入 */ }
-      return { text: text, dropped: dropped, checkpointFile: cpFile, chars: text.length };
+      return { text: text, dropped: dropped, checkpointFile: cpFile, chars: text.length, learnings: learnN };
     }
 
     // ═══════════ [P2][task-8] 检查点输入换料：最近对话原文 + 任务与待办 ═══════════
@@ -16776,7 +16950,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         }
       } catch (eC) { /* 缓存失败不影响检查点 */ }
     }
-    function p4cLastCheckpoint(sid, cwd) {
+    function p4cLastCheckpoint(sid, cwd, rowsOpt) {
       try {
         const v = P4C_LAST_CP.get(String(sid || ""));
         if (v) return (typeof v === "string") ? v : (v.text || "");
@@ -16787,7 +16961,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
       //   失败一律返回空串 ⇒ 调用方行为退回改前（无基线、整 8 节重写），绝不让回落异常影响检查点链路。
       try {
         if (!TOPICDB.enabled || !TOPICDB.ready || !TOPICDB.store) return "";
-        const r = p25ReadOwnSession(TOPICDB.store, String(cwd || ""), String(sid || ""));
+        const r = p25ReadOwnSession(TOPICDB.store, String(cwd || ""), String(sid || ""), rowsOpt);
         if (r && r.text) {
           try {
             monitorEvent("intent", "cp-base-from-db sid=" + String(sid || "").slice(0, 8)
@@ -16908,10 +17082,11 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
     }
 
     // 探测最近会话摘要：**P0-1 先读主题库（flag 开时检查点只写库不写 md），读不到再回落 md（老行为逐字不变）**
-    async function latestSessionSummary() {
+    async function latestSessionSummary(rowsOpt) {
       // [P0-1][G2] 主题库优先：写侧 topicDbIntentRoute(mode="db") 明确不写 md，旧读侧只读 md ⇒ 检查点永远
       //   注不进下一个会话。这里按写侧同一路径反查 D8「会话检查点」线（flag 关 / 库未就绪 / 库内无句子
       //   ⇒ 返回 null，继续走下面原 md 扫描，逐字不变）。库名解析优先用 memtopic 同源 normalizeName。
+      //   [4.5.15 L-6] rowsOpt 可选：R2 入口已取一份整库行 ⇒ 传下来复用，避免重灌路径二次全库扫描。
       try {
         if (TOPICDB.enabled) {
           if (!(TOPICDB.ready && TOPICDB.store)) { try { await topicDbEnsure(); } catch (e0) { /* 加载失败 ⇒ 回落 md */ } }
@@ -16920,6 +17095,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
             const dbSum = topicDbReadIntentSummary(st, {
               norm: (TOPICDB.api && typeof TOPICDB.api.normalizeName === "function") ? TOPICDB.api.normalizeName : p0NormName,
               maxSentences: 3,
+              rows: Array.isArray(rowsOpt) ? rowsOpt : undefined,
             });
             if (dbSum && dbSum.text) return dbSum;
           }
@@ -18292,6 +18468,216 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
       }
     });
 
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // [4.5.15] 记忆检索提醒（RT，每轮）+ R3 每 8 轮兜底 —— 同一个 pre-step handler
+    //   依据：docs/方案-4.5.15-记忆检索提醒与升级协议.md §9（L-1~L-6）+ §10（v4 定稿，冲突处以此为准）
+    //   注册位：A 类 handler（上一段）之后、回归 handler（下一段）之前 ⇒ **A 仍是插件内第 1 个 pre-step
+    //     handler**（`test/_rehydrate-gate-selftest.mjs:124-134` 的「取第一个 + arr1.length===1」不受影响）。
+    //   消息序（waterfall 内层先）：[…, recall(本段), A 类] —— 两条独立 <system-reminder>，不合并（D-3 裁决）。
+    //   纪律（审计② N-6 / 审计③ L-2，缺一即事故）：
+    //     ① 本 handler 是**内层**：A 的 `step!==1`/非顶层早退**拦不住它** ⇒ 函数内三闸自查；
+    //     ② **整体 try/catch 且 catch 返回 decision、绝不 await next()**：A 的 catch 是
+    //        `return next ? await next() : undefined`，本 handler 一旦抛错会被 A 的 catch 再调一次 next()，
+    //        内层链（dequeueRegressionReminder / maint spawn / drainCmdEcho）整体跑第二遍（破坏性副作用双发）；
+    //     ③ **只 append、绝不替换/清空 messages**：宿主 `turn()` 里 `step===0 && messages.length===0` ⇒ 整轮结束；
+    //     ④ `messages` 是 `inbox.claim()` **一次性认领批**（审计② N-2）：可为空、可含 next-step 注入消息、
+    //        **user 消息在末尾**；`source.kind !== "user"` 的合成消息不注入；去重键 `sid + (msg.id || p4cMsgKey(msg))`
+    //        只作防御（abort/retry 重放时 claimed 已空 ⇒ 天然不重复）。
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    const RECALL_EVERY_N = 8;              // R3 兜底节奏（轮）
+    const RECALL_ROWS_TTL_MS = 30000;      // 判据② 的 store.topics() 共用缓存（热路径 ≤1 次库调用 / 30s）
+    const RECALL_DEDUP_CAP = 256;          // 去重键 FIFO 上限（防 Map 无限增长）
+    const RECALL_SKIP_CAP = 64;            // skip 观测去重表上限
+    const RECALL_DEDUP = new Map();        // key = sid + "\u0000" + msgKey
+    const RECALL_SKIP_SEEN = new Map();    // key = reason + "|" + sid8（同因只落一次，防 step>1 每步刷爆 2000 条事件环）
+    let RECALL_ROWS_CACHE = { at: 0, rows: [] };
+    let RECALL_ROWS_FETCHES = 0;           // 观测/门：store.topics() 真实调用次数
+    let RECALL_LAST_SKIP = "";             // 观测（M-1）：最近一次 **recall 分支** skip reason（不含 R3 分支）
+    let RECALL_LAST_R3_SKIP = "";          // 观测：最近一次 **R3 分支** skip reason（not-due / won / empty）
+    let RECALL_LAST_INJECT = null;         // 观测：最近一次注入 {kind, chars, sid}
+    // §10.2 定稿文本（含标签各 ≤180 字；db 177/176、md 同量级）——mode-aware（K-7/B3）：
+    //   db 模式提 `memory_read`；md 模式换成「read 直读 ~/.dsh/memory/」且**不含** memory_read/memory_topics。
+    const RECALL_TEXT_DB = "<system-reminder>\n【记忆检索】本会话有记忆（检查点/笔记/待办）。需要时：memory_search(\"<稀有词>\") → memory_read；原文/逐字 → session_search。\n命中即信；摘要丢字面量取原文；0 命中换稀有词→直读→原文→放宽范围。\n不要问用户记忆里已记过的事。\n</system-reminder>";
+    const RECALL_TEXT_MD = "<system-reminder>\n【记忆检索】本会话有记忆。需要时：memory_search(\"<稀有词>\") → read 直读 ~/.dsh/memory/；原文/逐字 → session_search。\n命中即信；摘要丢字面量取原文；0 命中换稀有词→直读→原文→放宽范围。\n不要问用户记忆里已记过的事。\n</system-reminder>";
+    /** 当前模式的 recall 文本（db 模式才提 memory_read） */
+    function recallTextOf() { return (TOPICDB && TOPICDB.enabled) ? RECALL_TEXT_DB : RECALL_TEXT_MD; }
+    /** skip 观测（M-1）：同因同会话只落一次（step>1 每步都会走到这里，不能每步写事件） */
+    function recallSkip(reason, sid) {
+      const r = String(reason || "");
+      RECALL_LAST_SKIP = r;
+      try {
+        const s8 = String(sid || "").replace(/^session-/, "").slice(0, 8);
+        const k = r + "|" + s8;
+        if (RECALL_SKIP_SEEN.has(k)) return;
+        if (RECALL_SKIP_SEEN.size >= RECALL_SKIP_CAP) RECALL_SKIP_SEEN.clear();
+        RECALL_SKIP_SEEN.set(k, 1);
+        monitorEvent("recall", "skip reason=" + r + (s8 ? " sid8=" + s8 : ""));
+      } catch (e) { /* 观测失败绝不影响主流程 */ }
+    }
+    /** R3 分支 skip 观测：只记 R3 自己的原因，**不覆盖** recall 分支的 lastSkip（门/H-6 断言分列） */
+    function recallSkipR3(reason, sid) {
+      const r = String(reason || "");
+      RECALL_LAST_R3_SKIP = r;
+      try {
+        const s8 = String(sid || "").replace(/^session-/, "").slice(0, 8);
+        const k = "R3:" + r + "|" + s8;
+        if (RECALL_SKIP_SEEN.has(k)) return;
+        if (RECALL_SKIP_SEEN.size >= RECALL_SKIP_CAP) RECALL_SKIP_SEEN.clear();
+        RECALL_SKIP_SEEN.set(k, 1);
+        monitorEvent("recall", "skip reason=" + r + (s8 ? " sid8=" + s8 : ""));
+      } catch (e) { /* 观测失败绝不影响主流程 */ }
+    }
+    /** 判据②/① 共用一份 rows（30s TTL；md 模式 store 为 null ⇒ []，**null-safe 不抛**） */
+    function recallTopicRows() {
+      const now = Date.now();
+      if (now - RECALL_ROWS_CACHE.at < RECALL_ROWS_TTL_MS) return RECALL_ROWS_CACHE.rows;
+      let rows = [];
+      try {
+        const st = (TOPICDB && TOPICDB.store) || null;
+        if (st && typeof st.topics === "function") { RECALL_ROWS_FETCHES += 1; rows = st.topics() || []; }
+      } catch (e) { rows = []; }
+      RECALL_ROWS_CACHE = { at: now, rows: Array.isArray(rows) ? rows : [] };
+      return RECALL_ROWS_CACHE.rows;
+    }
+    /** 判据：本会话是否有可召回记忆（L-5 三条，任一为真；热路径 ≤1 次库调用且带 TTL） */
+    function recallHasTarget(agent, sid) {
+      // ① 本会话已有检查点（T1/T4/T5 任一写成功都置位、已持久化）—— 廉价、不碰库
+      try {
+        const st = p3SessionState(sid);
+        if (st && Number(st.checkpointAt) > 0) return true;
+      } catch (e1) { /* 状态读失败 ⇒ 继续判据 ②/③ */ }
+      // ③ 本会话有 todo/goal（P1 per-session 源；**不得**用 readRecentSessionFacts —— 全局 7 天快照）
+      try { if (p1SessionHasTasks(sid)) return true; } catch (e3) { /* 忽略 */ }
+      // ② 本会话笔记主题存在且未提炼句 > 0（与 ① 共用一份 rows + 30s TTL；只对本会话主题 readTopic 一次）
+      try {
+        const st = (TOPICDB && TOPICDB.store) || null;
+        if (!st || typeof st.readTopic !== "function") return false;
+        const cwd = String((agent && agent.session && ((agent.session.header && agent.session.header.cwd) || agent.session.cwd)) || "");
+        const wsKey = (typeof p25Topics.normalizeWorkspace === "function") ? p25Topics.normalizeWorkspace(cwd) : "";
+        const s8 = (typeof p25Topics.sid8Of === "function") ? p25Topics.sid8Of(sid) : "";
+        if (!wsKey || !s8) return false;
+        const want = "笔记·" + wsKey + "/" + s8;
+        const rows = recallTopicRows();
+        const tp = (rows || []).find((x) => String(x && x.name) === want) || null;
+        if (!tp) return false;
+        const ss = ((st.readTopic(tp.id) || {}).sentences) || [];
+        return noteUnrefinedCount(ss) > 0;
+      } catch (e2) { return false; }
+    }
+    /** 去重键：`sid + (msg.id || p4cMsgKey(msg))`（p4cMsgKey 指纹兜底；空批/无 id 不抛） */
+    function recallDedupKeyOf(sid, msg) {
+      try {
+        const id = (msg && typeof msg === "object" && msg.id != null) ? String(msg.id) : "";
+        const fp = id || String(p4cMsgKey(msg) || "");
+        if (!fp) return "";
+        return String(sid) + "\u0000" + fp;
+      } catch (e) { return ""; }
+    }
+    function recallDedupAdd(k) {
+      try {
+        if (!k) return;
+        RECALL_DEDUP.set(k, 1);
+        while (RECALL_DEDUP.size > RECALL_DEDUP_CAP) {
+          const first = RECALL_DEDUP.keys().next().value;
+          if (first === undefined) break;
+          RECALL_DEDUP.delete(first);
+        }
+      } catch (e) { /* 去重表失败 ⇒ 退化为"不去重"，绝不阻断注入 */ }
+    }
+    /** R3 兜底文本：复用 p3-readside 的定稿文案（纯函数内部有 `turn % everyN === 0` 硬闸 ⇒ 传 everyN 的整数倍取文本；
+     *  到点判定由本 handler 的 `turn - lastNudgeTurn >= 8` 负责，不依赖该硬闸——审计③ L-1 注②）。 */
+    function recallR3Text() {
+      try { return p3Readside.buildRecallNudge({ turn: RECALL_EVERY_N, everyN: RECALL_EVERY_N, topicHint: "" }) || ""; } catch (e) { return ""; }
+    }
+    function recallSid8(sid) { try { return String(sid || "").replace(/^session-/, "").slice(0, 8); } catch (e) { return ""; } }
+
+    compatOn(ctx, "agent/pre-step", async ({ agent, messages: stepMsgs, step }, next) => {
+      let decision;
+      try {
+        decision = await next();
+      } catch (eNext) {
+        // 内层链抛错：**绝不重跑 next**（破坏性副作用会双发）。给宿主一个合法兜底决策（claim 批原样保留）。
+        return { kind: "enter", messages: Array.isArray(stepMsgs) ? stepMsgs.slice() : [] };
+      }
+      try {
+        // ── 三闸（内层自查；A 的早退拦不住本 handler）──
+        if (step !== 1) { recallSkip("step>1", agent && agent.session && agent.session.id); return decision; }
+        if (!agent) { recallSkip("no-agent", ""); return decision; }
+        if (!isTopLevelSession(agent)) { recallSkip("subagent", agent.session && agent.session.id); return decision; }
+        if (!decision || decision.kind !== "enter") { recallSkip("not-enter", agent.session && agent.session.id); return decision; }
+        const sid = String((agent.session && agent.session.id) || "");
+        if (!sid || sid === "?") { recallSkip("no-sid", ""); return decision; }
+        // ── 认领批语义：user 消息在末尾；合成消息（source.kind !== "user"）不算真实用户消息 ──
+        const msgs = Array.isArray(stepMsgs) ? stepMsgs : [];
+        let userMsg = null;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i];
+          if (!m || typeof m !== "object" || String(m.role || "") !== "user") continue;
+          if (String((m.source && m.source.kind) || "") !== "user") continue;
+          userMsg = m;
+          break;
+        }
+        if (!userMsg) { recallSkip(msgs.length ? "synthetic" : "empty", sid); return decision; }
+        const st = p3SessionState(sid);
+        const turn = Number(st && st.turn) || 0;
+        const lastNudge = Number(st && st.lastNudgeTurn) || 0;
+        const flagOn = PLUGIN_CFG.recallPerTurn !== false;
+        // ── ① RT（每轮 recall）：条件满足 + 未去重 ⇒ append；成功则本轮 R3 让位（同轮同类提示 ≤1 条）──
+        let recallInjected = false;
+        if (!flagOn) {
+          recallSkip("flag-off", sid);
+        } else {
+          const dk = recallDedupKeyOf(sid, userMsg);
+          if (dk && RECALL_DEDUP.has(dk)) {
+            recallSkip("dedup", sid);
+          } else if (!recallHasTarget(agent, sid)) {
+            recallSkip("no-target", sid);
+          } else {
+            const text = recallTextOf();
+            const _msgs = Array.isArray(decision.messages) ? decision.messages : [];
+            decision = { ...decision, messages: [..._msgs, makeMessage(text)] };
+            recallDedupAdd(dk);
+            recallInjected = true;
+            RECALL_LAST_INJECT = { kind: "RT", chars: text.length, sid: sid };
+            // L-3：RT 是**高频**记账 ⇒ **不传 ev**（p3CostBump 的 `if (ev)` 才 pushEvent；每轮一条 ev 会挤满
+            //   500 条环形、挤掉 checkpointWrite 的 trigger/topSessions 明细）。R3 仍保留 ev{trigger:"R3"}。
+            try { p3CostBump("recallReminder", { n: 1, injectedChars: text.length }); } catch (eC) { /* 记账失败不影响注入 */ }
+            try { monitorEvent("recall", "inject sid8=" + recallSid8(sid) + " chars=" + text.length + " kind=RT turn=" + turn); } catch (eM) { /* 忽略 */ }
+          }
+        }
+        // ── ② R3 兜底：recall 未注入 且 `turn - lastNudgeTurn >= 8` ⇒ 同一通道 append（**append 成功后才置** lastNudgeTurn）──
+        const r3Due = turn > 0 && (turn - lastNudge) >= RECALL_EVERY_N;
+        if (recallInjected) {
+          if (r3Due) recallSkipR3("R3-won", sid);   // 同轮已由 RT 占位（M-1：R3 让位也要留痕）
+        } else if (r3Due) {
+          const r3 = recallR3Text();
+          if (r3) {
+            const wrapped = "<system-reminder>\n" + r3 + "\n</system-reminder>";
+            const _msgs = Array.isArray(decision.messages) ? decision.messages : [];
+            decision = { ...decision, messages: [..._msgs, makeMessage(wrapped)] };
+            // 投递成功才记账本（审计② K-2：旧实现先置位、注入失败也置位 ⇒ 「账本说提醒过、模型一个字没看到」双失）
+            try {
+              const st2 = p3SessionState(sid);
+              if (st2) { st2.lastNudgeTurn = turn; scheduleMonitorSave(); }
+            } catch (eS) { /* 账本写失败 ⇒ 下轮重试（不置位） */ }
+            RECALL_LAST_INJECT = { kind: "R3", chars: wrapped.length, sid: sid };
+            try { p3CostBump("recallReminder", { n: 1, injectedChars: wrapped.length }, { sid: sid, trigger: "R3", ok: 1, note: "turn" + turn }); } catch (eC2) { /* 忽略 */ }
+            try { monitorEvent("recall", "inject sid8=" + recallSid8(sid) + " chars=" + wrapped.length + " kind=R3 turn=" + turn); } catch (eM2) { /* 忽略 */ }
+          } else {
+            recallSkipR3("R3-empty", sid);
+          }
+        } else {
+          recallSkipR3("R3-not-due", sid);
+        }
+        return decision;
+      } catch (e) {
+        // 整体兜底：绝不抛、绝不 await next（A 的 catch 会重跑 next ⇒ 内层链双发）
+        try { recallSkip("error", agent && agent.session && agent.session.id); } catch (e2) { /* 忽略 */ }
+        return decision;
+      }
+    });
+
+
     // v0.5（P0c 方案 A）：回归提醒注入——独立 pre-step handler，消费 REGRESSION_QUEUE，
     // 不受 step 限制（B/C 触发与窗口再现都发生在 step>1 的工具轮）；顶层会话 + 普通子代理生效（v2.4.27 放开 normal）。
     // 决策直入当轮请求（与 A 类同机制）：提示不进 inbox/会话历史、不破坏前缀缓存、无重入风险。
@@ -18338,6 +18724,7 @@ DREAM_TEST_HOOKS.limits = { main: PROJECT_CHAR_HARD, detail: DETAIL_TOPIC_CHAR_L
         } catch (e) { needMerge = false; }
         if (needMerge) {
           // 延迟到 pre-step 窗口外 spawn，避免阻塞模型请求链
+          try { PRE_STEP_CHAIN_COUNTS.maintSpawn += 1; } catch (e0) { /* [4.5.15 N-3] 发起点计数（双发即 2） */ }
           setTimeout(() => {
             try {
               runMaintenanceMerge(todayName, "", agent, (agent.session && agent.session.id) || "");
@@ -18860,20 +19247,14 @@ compatOn(ctx, "session/event", (session, event) => {
         //   验收夹具就是「事件只经 session/event 广播」的形态）。压缩事件本身在下面继续处理。
         try { p1RecordSessionEvent(session, event); } catch (eP1Rec) { /* 旁路记账失败不影响主流程 */ }
         // [P3][2026-11-02] 统一事件入口：hostUsage 记账 + 写侧三阈值判定（Patch 1 只判定+日志，不 spawn）
-        //   + R3 每 8 轮轻提醒（返回 nudge 时由下面延迟注入）。
+        //   + 轮次计数（4.5.15 起 R3 的判定/注入已挪进 pre-step，本处只维护 st.turn）。
         //   放在压缩事件早退之前，才能收到 assistant/message / turn/start 等全部事件。
         let _p3res = null;
         try { _p3res = p3OnSessionEvent(session, event); } catch (eP3) { /* P3 失败绝不影响主流程 */ }
-        if (_p3res && _p3res.kind === "nudge") {
-          const _p3ag = agentsBySession.get(session.id);
-          if (_p3ag && typeof _p3ag.inject === "function") {
-            // 同 v10.5 纪律：session/event 在 append 发布窗口内同步派发，inject 必须推迟到 macrotask
-            setTimeout(() => {
-              try { _p3ag.inject(makeMessage("<system-reminder>\n" + _p3res.text + "\n</system-reminder>")); }
-              catch (eP3n) { /* 提醒注入失败忽略 */ }
-            }, 0);
-          }
-        }
+        // [4.5.15 L-1] 旧 R3 注入点（`_p3res.kind === "nudge"` ⇒ setTimeout + agent.inject）**已删除**：
+        //   R3 现在与每轮 recall 提醒共用同一个 pre-step handler（`agent/pre-step` 尾部 append），
+        //   旧点若保留会双发（审计③ 放行条件 2：实现必带「删旧 R3 注入点 18867-18876」）。
+        //   `p3OnSessionEvent` 自 4.5.15 起不再返回 nudge（turn/start 只维护 st.turn）。
         // [P3-1 T1–T3] 阈值触发 → 真正写检查点（Patch 2）。spawn 是 async + 自带队列，
         //   必须推迟到 macrotask（不在 append 发布窗口内发起子代理）。
         if (_p3res && _p3res.kind === "threshold") {
@@ -19141,6 +19522,8 @@ compatOn(ctx, "session/event", (session, event) => {
                       checkpointFile: rehydrate.checkpointFile || "",
                       checkpointCompactionId: _cpId,
                       checkpointIsCurrent: !!(_cpId && _cmpId8 && _cpId === _cmpId8),
+                      // [4.5.15][L-6] learnings 条数（0 = 无/被砍；门与真机验收都看这一项）
+                      learnings: Number(rehydrate.learnings) || 0,
                     };
                     clog("[dsh-memory] 压缩后记忆重灌已构建：" + (rehydrate.chars || rehydrate.text.length) + " 字"
                       + " checkpoint=" + (rehydrate.checkpointFile || "-")
@@ -19309,6 +19692,7 @@ compatOn(ctx, "session/event", (session, event) => {
         const sessionSearchToolDef = {
           name: "session_search",
           description: "在**原始会话日志**里检索精确字面量并给出出处（dsh-memory v2.8.4）。"
+            + "**仅在 memory_search 无有用结果、或需要逐字原文时使用**（原文检索是「更慢但逐字」的通道；memory_search 有命中就先用它）。"
             + "用途：当记忆库（memory_search）里**没有、或记不准**某个字面量时，回原始会话原文把它捞出来 —— "
             + "适用于 ID/GUID、URL、文件路径、命令、参数、文号、报错串、数值这类**精确串**。"
             + "分工：memory_search 查已沉淀的**结论**；session_search 查**原始对话**。"
@@ -19993,9 +20377,18 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
     // 注册 memory_search（原工具，toolSvc 声明已提前共用）
     if (toolSvc !== undefined && typeof toolSvc.register === "function") {
       try {
+        // [4.5.15 B1][K-7] 工具描述升级协议（三段式）+ mode-aware：
+        //   db 模式直读档 = `memory_read`（可先 `memory_topics` 看结构）；md 模式 = `read 直读 ~/.dsh/memory/`
+        //   ⇒ **md 模式描述不含 memory_read/memory_topics**（M-2/B3 断言）。
+        //   `_alignment-discipline-selftest.mjs:45-48` 的四短语（命中即信 / 要精确字面量 + session_search 回原始会话捞逐字原文 /
+        //   不要从摘要反推或猜 / 命中行尾的 ⟪…⟫ 是该句来源）**逐字保留**，改文案时勿动。
+        const _msDbMode = !!(TOPICDB && TOPICDB.enabled);
+        const _msDirectStep = _msDbMode
+          ? "用 memory_read 直读主题（可先 memory_topics 看结构）"
+          : "用 read 工具直读 ~/.dsh/memory/ 下对应文件";
         const memorySearchToolDef = {
           name: "memory_search",
-          description: "搜索全局记忆库（~/.dsh/memory/）以召回此前沉淀的持久知识。应当先于「凭记忆猜/直接问用户」使用——跨会话踩坑、项目事实、精确配置（路径/ID/命令/数字）、用户偏好大概率已记录。参数 query：主题关键词（1-3 个最具体词，如 OA日志、智检API、前缀缓存）或记忆文件相对路径（global、index、fixed、长沙交易场地…）。检索语义：OR 分词 + 相关度排序——任一单词命中即返回候选，稀有词比泛词更准（避免「配置 参数 数据库」堆泛词）。命中即信：一次查询未中不代表未记录，换更稀有词重试；0 结果时按返回文案的升级路径处理（换词 → read 直读 ~/.dsh/memory/ 下文件 → 查最近会话摘要）。**命中行尾的 `⟪…⟫` 是该句来源**（原文相对路径 / 知识档），可 read 原文核对。**要精确字面量**（完整路径、端口、命令、凭证、文号、数字）而摘录只给了大意时，用 session_search 回原始会话捞逐字原文——**不要从摘要反推或猜**（摘要会概括，字面量必须逐字）。可直接作为工具调用；run_code 程序内亦可经 await tools.memory_search({ query }) 调用。",
+          description: "搜索全局记忆库（~/.dsh/memory/）以召回此前沉淀的持久知识。应当先于「凭记忆猜/直接问用户」使用——跨会话踩坑、项目事实、精确配置（路径/ID/命令/数字）、用户偏好大概率已记录。参数 query：主题关键词（1-3 个最具体词，如 OA日志、智检API、前缀缓存）或记忆文件相对路径（global、index、fixed、长沙交易场地…）。检索语义：OR 分词 + 相关度排序——任一单词命中即返回候选，稀有词比泛词更准（避免「配置 参数 数据库」堆泛词）。**使用纪律（升级协议）**：①**命中即信**——一次命中就是证据，别因换个说法没命中就断定「没记录」；②摘要可能丢字面量（端口/路径/命令/ID/文号）：**要精确字面量**而摘录只给了大意时，用 **session_search 回原始会话捞逐字原文**——**不要从摘要反推或猜**（摘要会概括，字面量必须逐字）；③0 命中时**逐级升级**：换更稀有词 → " + _msDirectStep + " → session_search 原文 → 放宽范围（本会话笔记 → 项目主题 → 全局/跨项目）。**命中行尾的 `⟪…⟫` 是该句来源**（原文相对路径 / 知识档），可 read 原文核对。可直接作为工具调用；run_code 程序内亦可经 await tools.memory_search({ query }) 调用。",
           parameters: {
             type: "object",
             properties: {
@@ -20099,10 +20492,18 @@ if (toolSvc !== undefined && typeof toolSvc.register === "function") {
               // v12：0 结果引导——参考 mimocode memory.txt 升级策略，避免模型误判"没记录过"
               // v2.2.6：零结果是检索断链的高发症状——自检未通过时在此自动携带诊断（模型可见，不依赖人看控制台）
               const selfBad = (RETRIEVAL_SELF && !RETRIEVAL_SELF.ok) ? "⚠️【检索层自检未通过】" + RETRIEVAL_SELF.msg + " ——本次零结果可能与检索断链有关，必要时用 read 直查 ~/.dsh/memory/ 下文件。\n" : "";
+              // [4.5.15 K-7] 0 结果文案统一指向 `session_search`（原文检索通道）：
+              //   旧文案教「memory_search 查 会话 / sessions」是**错的**（那是主题库检索，查不到原始会话）⇒ 模型会原地打转。
+              //   mode-aware：db 模式第 2 步给 memory_topics/memory_read；md 模式给 read 直读（不出现 memory_read/memory_topics）。
+              const _zDbMode = !!(TOPICDB && TOPICDB.enabled);
+              const _zStep2 = _zDbMode
+                ? "字面量（URL/端口/路径/命令）被分词器拆散，改用 memory_topics 看结构 / memory_read 直读对应主题。\n"
+                : "字面量（URL/端口/路径/命令）被分词器拆散，改用 read 工具直接读 ~/.dsh/memory/ 下文件。\n";
               return selfBad + "未找到匹配「" + q + "」。0 结果不代表从未记录过，请按此升级：\n" +
                 "1. 换更少更独特的词（1-3 个罕见词：ID、函数名、文号、精确术语），去掉泛词（如「项目」「系统」「配置」）。\n" +
-                "2. 字面量（URL/端口/路径/命令）被分词器拆散，改用 read 工具直接读 ~/.dsh/memory/ 下文件。\n" +
-                "3. 要逐字原文（精确命令、用户原话）查最近会话摘要：memory_search 查 会话 / sessions。\n" +
+                _zStep2 +
+                "3. 要逐字原文（精确命令、用户原话、完整路径/ID/文号）→ 用 session_search 检索**原始会话日志**（命中后用 show 回看；日志被轮转时传 source:\"units\"）。\n" +
+                "4. 仍无结果 ⇒ 放宽范围（本会话笔记 → 项目主题 → 全局/跨项目），或确认确实没记过再问用户。\n" +
                 "可查主题清单：\n" + targets.map((t) => "  " + t.label + " → " + t.file).join("\n") + "\n或换关键词再试。";
             }
             // v12：相对分数下限（参考 mimocode top_score*0.15）：砍掉只命中泛词的噪音，
@@ -22840,6 +23241,23 @@ DREAM_ROUND_WROTE = null;   // v2.4.15(lesson-settle-hard): 证据缓冲同步�
       P4_TEST_HOOKS.subagentLabelWithTarget = subagentLabelWithTarget;   // [4.5.10] 门：所有记忆插件子代理 label 必须带目标 sid
       P4_TEST_HOOKS.sid8Of = sid8Of;
       P4_TEST_HOOKS.getWriterPreset = () => String(PLUGIN_CFG.writerPreset || "");
+      // [4.5.15] 每轮记忆检索提醒（RT）/ R3 兜底 / R2 learnings 测试钩子接线（只挂引用；生产零调用）
+      RECALL_TEST_HOOKS.text = (mode) => (String(mode) === "db" ? RECALL_TEXT_DB : RECALL_TEXT_MD);
+      RECALL_TEST_HOOKS.r3Text = recallR3Text;
+      RECALL_TEST_HOOKS.lastSkip = () => RECALL_LAST_SKIP;
+      RECALL_TEST_HOOKS.lastR3Skip = () => RECALL_LAST_R3_SKIP;
+      RECALL_TEST_HOOKS.lastInject = () => (RECALL_LAST_INJECT ? Object.assign({}, RECALL_LAST_INJECT) : null);
+      RECALL_TEST_HOOKS.dedupSize = () => RECALL_DEDUP.size;
+      RECALL_TEST_HOOKS.resetDedup = () => { try { RECALL_DEDUP.clear(); } catch (e) { /* 忽略 */ } };
+      RECALL_TEST_HOOKS.rowsFetches = () => RECALL_ROWS_FETCHES;
+      RECALL_TEST_HOOKS.resetRowsCache = () => { try { RECALL_ROWS_CACHE = { at: 0, rows: [] }; RECALL_ROWS_FETCHES = 0; } catch (e) { /* 忽略 */ } };
+      // [4.5.15 N-3] 内层链破坏性副作用计数（正常 1 / 双发 2；见 PRE_STEP_CHAIN_COUNTS 注释）
+      RECALL_TEST_HOOKS.chainCounts = () => Object.assign({}, PRE_STEP_CHAIN_COUNTS);
+      RECALL_TEST_HOOKS.resetChainCounts = () => { try { PRE_STEP_CHAIN_COUNTS.dequeue = 0; PRE_STEP_CHAIN_COUNTS.cmdEchoDrain = 0; PRE_STEP_CHAIN_COUNTS.maintSpawn = 0; } catch (e) { /* 忽略 */ } };
+      RECALL_TEST_HOOKS.handlerInfo = () => {
+        try { return { recallEveryN: RECALL_EVERY_N, dbMode: !!(TOPICDB && TOPICDB.enabled), rowsFetches: RECALL_ROWS_FETCHES, dedupSize: RECALL_DEDUP.size }; }
+        catch (e) { return null; }
+      };
       // [4.5.2][note-compact] 笔记收敛测试钩子（模块级纯函数引用 + 内部状态探针）
       NOTE_TEST_HOOKS.isNotePointerText = isNotePointerText;
       NOTE_TEST_HOOKS.isNoteTopicName = isNoteTopicName;
